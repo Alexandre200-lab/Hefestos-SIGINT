@@ -1,0 +1,12 @@
+Bibliotecas requeridas na IDE:
+- LoRa (Sandeep Mistry)
+- TinyGPSPlus (Mikal Hart)
+- Adafruit Si4713 Library (Adafruit)
+- PU2CLR SI4735 (Ricardo Lima Caratti)
+- ESPAsyncWebServer (Repositorio Github: me-no-dev)
+- AsyncTCP (Repositorio Github: me-no-dev)
+- ArduinoJson (Benoit Blanchon)
+- AESLib (Compativel com arquitetura ESP32)
+- SD (Nativa)
+- SoftwareSerial (Nativa)
+- SPI e Wire (Nativas)
