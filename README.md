@@ -28,6 +28,6 @@ O projeto opera com 3 nos fisicos independentes:
 
 ## Instrucoes de Operacao
 1. Energize os modulos. O Arduino (Node 3) e quem se conecta fisicamente ao PC.
-2. Acesse a rede Wi-Fi local gerada pelo Kernel: `Hefestos-Network` (Senha: `xdneo123`).
+2. Acesse a rede Wi-Fi local gerada pelo Kernel: `Hefestos-Network` (Senha: `*********`).
 3. Painel Grafico: Acesse `http://192.168.4.1` em seu navegador.
 4. Terminal Tatico: Em seu Linux, execute `telnet 192.168.4.1`. Digite `help` para listar os modulos de operacao SIGINT.
