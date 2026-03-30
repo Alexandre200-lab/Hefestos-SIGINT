@@ -175,11 +175,8 @@ tune FM 100.1  # Sintoniza FM
 ## Próximas Melhorias (v2.1+)
 
 - [ ] Compressão gzip em buffer circular
-- [ ] WebSocket para dashboard em tempo real
 - [ ] Suporte múltiplos alvos simultâneos
-- [ ] Cloud backup (Firebase/AWS)
 - [ ] Criptografia de dados em repouso
-- [ ] Mobile app (iOS/Android)
 
 ##  Versão
 
