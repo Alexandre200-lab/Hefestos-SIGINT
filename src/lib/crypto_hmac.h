@@ -1,37 +1,28 @@
-// crypto_hmac.h - HMAC-SHA256 Packet Authentication
-// Garante integridade e autenticidade dos pacotes LoRa
+// crypto_hmac.h - HMAC-SHA256 Real Packet Authentication
+// Garante integridade e autenticidade dos pacotes LoRa com HMAC-SHA256 verdadeiro
 
 #ifndef CRYPTO_HMAC_H
 #define CRYPTO_HMAC_H
 
 #include <stdint.h>
 #include <string.h>
+#include <mbedtls/md.h>
 
-#define HMAC_SIGNATURE_SIZE 8  // Use 8 bytes (64 bits) para economia de bandwidth
+#define HMAC_SIGNATURE_SIZE 32  // SHA-256 = 32 bytes
 
 class PacketAuthenticator {
 public:
-  // Cria assinatura rápida para pacote usando XOR+folding (adequado para embedded)
+  // Cria assinatura HMAC-SHA256 para pacote
   static void sign(const byte* key, int keylen, const byte* packet, int pktlen, byte* signature) {
-    uint32_t hash = 0x5A5A5A5A; // IV
-    
-    // Mix key
-    for (int i = 0; i < keylen; i++) {
-      hash ^= (key[i] << ((i % 4) * 8));
-      hash = rotate_left(hash, 7);
-    }
-    
-    // Mix packet
-    for (int i = 0; i < pktlen; i++) {
-      hash ^= (packet[i] << ((i % 4) * 8));
-      hash = rotate_left(hash, 13);
-    }
-    
-    // Output signature
-    for (int i = 0; i < HMAC_SIGNATURE_SIZE; i++) {
-      signature[i] = (hash >> ((i % 4) * 8)) & 0xFF;
-      hash = rotate_left(hash, 5);
-    }
+    mbedtls_md_context_t ctx;
+    mbedtls_md_type_t md_type = MBEDTLS_MD_SHA256;
+
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(md_type), 1);
+    mbedtls_md_hmac_starts(&ctx, key, keylen);
+    mbedtls_md_hmac_update(&ctx, packet, pktlen);
+    mbedtls_md_hmac_finish(&ctx, signature);
+    mbedtls_md_free(&ctx);
   }
 
   // Verifica se assinatura é válida (constant-time comparison)
@@ -40,16 +31,31 @@ public:
     sign(key, keylen, packet, pktlen, computed);
 
     // Constant-time comparison para evitar timing attacks
-    int result = 0;
+    volatile uint8_t result = 0;
     for (int i = 0; i < HMAC_SIGNATURE_SIZE; i++) {
-      result |= (computed[i] ^ signature[i]);
+      result |= computed[i] ^ signature[i];
     }
     return result == 0;
   }
 
-private:
-  static uint32_t rotate_left(uint32_t x, int n) {
-    return (x << n) | (x >> (32 - n));
+  // Version legacy (8 bytes only) para backward compatibility
+  static void signCompact(const byte* key, int keylen, const byte* packet, int pktlen, byte* signature) {
+    byte full_sig[HMAC_SIGNATURE_SIZE];
+    sign(key, keylen, packet, pktlen, full_sig);
+    // Usa apenas os primeiros 8 bytes
+    memcpy(signature, full_sig, 8);
+  }
+
+  static bool verifyCompact(const byte* key, int keylen, const byte* packet, int pktlen, const byte* signature) {
+    byte computed[HMAC_SIGNATURE_SIZE];
+    sign(key, keylen, packet, pktlen, computed);
+
+    // Constant-time comparison dos primeiros 8 bytes
+    volatile uint8_t result = 0;
+    for (int i = 0; i < 8; i++) {
+      result |= computed[i] ^ signature[i];
+    }
+    return result == 0;
   }
 };
 
