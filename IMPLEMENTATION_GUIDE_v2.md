@@ -1,32 +1,25 @@
-# HEFESTOS SIGINT v2.0 - Guia de Implementação e Segurança
+# HEFESTOS SIGINT v2.1 - Guia de Implementação e Segurança
 
 ## 📋 Sumário Executivo
 
-O projeto Hefestos SIGINT foi completamente refatorado com as seguintes melhorias críticas:
+O projeto Hefestos SIGINT foi atualizado para v2.1 com melhorias críticas de segurança:
 
-### ✅ Melhorias Implementadas (10 de 14)
+### ✅ Melhorias Implementadas v2.1
 
 #### **Segurança Crítica**
-- [x] **#1 - Chaves AES em EEPROM**: Removidas do source, armazenadas em EEPROM com padrão seguro
-- [x] **#2 - Senha WiFi Forte**: Alterada de `xdneo123` para `Hefestos2024!SecureNet` (22 caracteres)
-- [x] **#3 - Autenticação Telnet**: Implementado login de 2 fatores (user: `admin` / password via EEPROM)
-- [x] **#4 - Validação HMAC**: Pacotes LoRa agora assinados com HMAC-8 bytes (constant-time comparison)
+- [x] **#1 - HMAC-SHA256 Real**: Substituído HMAC custom XOR-based por HMAC-SHA256 via mbedtls
+- [x] **#2 - Verificação HMAC**: Node2 agora verifica assinaturas corretamente (antes não verificava)
+- [x] **#3 - Chaves Únicas**: Geração automática de chaves AES no primeiro boot (seed: MAC + RTC + heap)
+- [x] **#4 - Senhas Seguras**: Geração automática de senhas WiFi/CLI aleatórias
 
 #### **Confiabilidade**
-- [x] **#5 - CRC16 em UART**: Node2↔Node3 com frames estruturados, detecção de erros
-- [x] **#6 - Recuperação de Erro SD**: Retry logic (3 tentativas), fallback RAM buffer
-- [x] **#7 - Código Modular**: Refatoração em headers reutilizáveis (`config.h`, `crypto_hmac.h`, etc)
-- [x] **#8 - Rate Limiting**: CLI protegido contra DoS (30 cmd/min, cooldown 100ms)
+- [x] **#5 - GPS Validation**: Node1 só transmite se GPS com coordenadas válidas (não transmite "Buscando...")
+- [x] **#6 - Serial Protocol CRC**: UART usa frames CRC corretamente (antes enviava texto puro)
+- [x] **#7 - RAM Buffer Flush**: Sincroniza dados para SD quando volta a funcionar
+- [x] **#8 - EEPROM v2**: Magic bytes `0x4846` + flag keys_generated
 
-#### **Performance**
-- [x] **#10 - GPS Interval**: Reduzido de 3000ms para 1000ms (resposta mais rápida)
-- [x] **#11 - Pre-alocação Memória**: Arrays estáticos em vez de String dinâmicas
-
-#### **Em Progresso (4 de 14)**
-- [ ] **#9 - Buffer Circular**: Implementado circular buffer RAM com 50 slots (melhorar compressão)
-- [ ] **#12 - Documentação Completa**: Wiring diagrams, deployment guide (este arquivo em andamento)
-- [ ] **#13 - Modo Debug**: Implementado `#define DEBUG_MODE` (falta integração full)
-- [ ] **#14 - Versionamento Firmware**: FW_VERSION = "2.0.0" definido em `debug.h`
+#### **Documentação**
+- [x] **#9 - Versão Atualizada**: Documentação atualizada para v2.1
 
 ---
 
@@ -405,9 +398,9 @@ Pin 9  ──→ Buzzer (Audio alerts)
 
 ## 📄 Versão do Documento
 
-**Versão**: 2.0.0  
-**Data**: 2026-03-30  
-**Firmware Compatível**: v2.0.0+  
+**Versão**: 2.1.0  
+**Data**: 2026-04-01  
+**Firmware Compatível**: v2.1.0+  
 **Status**: Produção
 
 ---

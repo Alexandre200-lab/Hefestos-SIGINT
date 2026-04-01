@@ -1,4 +1,4 @@
-# HEFESTOS SIGINT v2.0 - Manual de Operação
+# HEFESTOS SIGINT v2.1 - Manual de Operação
 
 ## 🎯 Operação Rápida
 
@@ -428,12 +428,20 @@ Node3: Pronto para receber dados
 
 ---
 
-## 📝 Changelog v2.0
+## 📝 Changelog v2.1
 
-### Novidades
+### Novidades v2.1
+- ✅ HMAC-SHA256 Real via mbedtls
+- ✅ Verificação HMAC em Node2
+- ✅ Geração automática de chaves AES únicas
+- ✅ Geração automática de senhas WiFi/CLI
+- ✅ GPS Validation (só transmite se válido)
+- ✅ Serial Protocol CRC completo
+- ✅ RAM Buffer Flush quando SD retorna
+
+### Novidades v2.0 (mantidas)
 - ✅ EEPROM Configuration Manager
 - ✅ Autenticação Telnet CLI 2FA
-- ✅ HMAC-SHA256 para validação de pacotes
 - ✅ CRC16 em UART (Node2↔Node3)
 - ✅ Rate Limiter (DoS protection)
 - ✅ SD Card Error Recovery + RAM Fallback
@@ -447,12 +455,12 @@ Node3: Pronto para receber dados
 - Node3: Arduino Uno/Mega/Nano
 
 ### Próximas Versões
-- v2.1: Dashboard WebSocket em tempo real
-- v2.2: Suporte múltiplos alvos
-- v2.3: Compressão gzip em buffer circular
+- v2.2: WebSocket dashboard em tempo real
+- v2.3: Suporte múltiplos alvos
+- v2.4: Compressão gzip em buffer circular
 
 ---
 
-**Versão**: 2.0.0  
-**Data**: 2026-03-30  
+**Versão**: 2.1.0  
+**Data**: 2026-04-01  
 **Suporte**: https://github.com/Alexandre200-lab/Hefestos-SIGINT/issues

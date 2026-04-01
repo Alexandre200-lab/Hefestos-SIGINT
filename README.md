@@ -1,30 +1,32 @@
-# Projeto HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v2.0)
+# Projeto HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v2.1)
 
 Hefestos é um sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e telemetria com arquitetura Master-Slave distribuída. Realiza rastreamento GPS criptografado (AES-128+HMAC), transmissão via LoRa (915 MHz Sub-GHz), interceptação de RF (AM/FM/SW), e retenção forense em SD Card com autenticação 2FA.
 
-## Versão 2.0 - Melhorias Implementadas
+## Versão 2.1 - Melhorias de Segurança
 
-### Segurança (4 melhorias críticas)
+### Segurança (Melhorias Críticas v2.1)
+- **HMAC-SHA256 Real**: Substituído HMAC custom por HMAC-SHA256 via mbedtls
+- **Verificação HMAC**: Node2 agora verifica assinaturas corretamente
+- **Chaves Únicas**: Geração automática de chaves AES no primeiro boot
+- **Senhas Seguras**: Geração automática de senhas WiFi/CLI aleatórias
+- **EEPROM v2**: Magic bytes atualizados para `0x4846` + flag keys_generated
+
+### Segurança (Melhorias v2.0 mantidas)
 - **EEPROM Config Manager**: Chaves AES armazenadas em EEPROM, não em source
 - **WiFi Forte**: Senha alterada de `xdneo123` para `Hefestos2024!SecureNet` (22 chars)
 - **Autenticação Telnet**: Login 2FA (user: admin, password via EEPROM)
-- **HMAC Validation**: Pacotes LoRa assinados com HMAC-8 (constant-time)
-
-### Confiabilidade (4 melhorias críticas)
-- **CRC16 em UART**: Frames estruturados para Node2↔Node3 com checksum
-- **SD Card Recovery**: Retry logic (3x), fallback RAM buffer (50 slots)
-- **Código Modular**: Refatoração em headers: `config.h`, `crypto_hmac.h`, `serial_protocol.h`, `rate_limiter.h`, `debug.h`
 - **Rate Limiting**: CLI protegido contra DoS (30 cmd/min, 100ms cooldown)
 
-### Performance (2 melhorias)
-- **GPS Interval**: Reduzido de 3000ms para 1000ms (3x mais rápido)
-- **Pre-allocação**: Arrays estáticos em vez de String dinâmicas
+### Confiabilidade (Melhorias mantidas)
+- **CRC16 em UART**: Frames estruturados para Node2↔Node3 com checksum
+- **SD Card Recovery**: Retry logic (3x), fallback RAM buffer (50 slots)
+- **RAM Buffer Flush**: Sincronização automática quando SD volta online
+- **GPS Validation**: Node1 só transmite se GPS com coordenadas válidas
+- **Código Modular**: Headers: `config.h`, `crypto_hmac.h`, `serial_protocol.h`, `rate_limiter.h`, `debug.h`
 
-### Operacional (Parcial)
-- **Debug Mode**: `#define DEBUG_MODE` compilável
-- **Versionamento**: FW_VERSION = "2.0.0" em `debug.h`
-- **Buffer Circular**: RAM buffer com 50 slots para fallback
-- **Documentação Completa**: IMPLEMENTATION_GUIDE_v2.md + OPERATION_MANUAL_v2.md
+### Performance
+- **GPS Interval**: 1000ms (3x mais rápido que v1.0)
+- **Pre-allocação**: Arrays estáticos em vez de String dinâmicas
 
 ## 📋 Arquitetura do Sistema
 
@@ -180,7 +182,7 @@ tune FM 100.1  # Sintoniza FM
 
 ##  Versão
 
-- **Versão atual**: 2.0.0
-- **Data**: 2026-03-30
+- **Versão atual**: 2.1.0
+- **Data**: 2026-04-01
 - **Status**: Production-ready
 - **Compatibilidade**: ESP32, Arduino Uno/Mega, módulos conforme pinagem

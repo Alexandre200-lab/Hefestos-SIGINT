@@ -6,7 +6,7 @@
 
 #include <HardwareSerial.h>
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.1.0"
 #define FW_BUILD_DATE __DATE__
 #define FW_BUILD_TIME __TIME__
 

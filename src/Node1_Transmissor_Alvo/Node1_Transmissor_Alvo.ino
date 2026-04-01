@@ -1,4 +1,5 @@
-// Node 1: Transmissor Alvo Tatica (ESP32) - Refatorado v2.0
+// Node 1: Transmissor Alvo Tatica (ESP32) - v2.1
+// Melhorias: GPS validation, Serial Protocol CRC, HMAC real
 #include <SPI.h>
 #include <LoRa.h>
 #include <TinyGPSPlus.h>
@@ -7,9 +8,9 @@
 #include <Adafruit_SI4713.h>
 #include <AESLib.h>
 
-// Bibliotecas modulares
 #include "../lib/config.h"
 #include "../lib/crypto_hmac.h"
+#include "../lib/serial_protocol.h"
 #include "../lib/debug.h"
 
 #define LORA_SS 5
@@ -18,8 +19,8 @@
 #define FM_RST 32
 #define FM_FREQ 10010
 
-#define GPS_POLL_INTERVAL 1000  // Reduzido de 3000ms para 1000ms (melhoria #10)
-#define DEBUG_MODE 1            // Ativa logs (melhoria #13)
+#define GPS_POLL_INTERVAL 1000
+#define DEBUG_MODE 1
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
@@ -27,7 +28,7 @@ Adafruit_SI4713 radioTX = Adafruit_SI4713(FM_RST);
 
 ConfigManager config;
 DebugLogger debug;
-AESLib aesLib;
+SerialProtocol serialProto;
 
 char cleartext[256];
 char ciphertext[512];
@@ -36,12 +37,11 @@ byte aes_iv[16];
 
 unsigned long tempoAnterior = 0;
 uint32_t packet_counter = 0;
+bool gps_valid = false;
 
-String encriptarDados(String mensagem) {
-  mensagem.toCharArray(cleartext, 256);
-  uint16_t clen = String(cleartext).length();
-  aesLib.encrypt64((const byte*)cleartext, clen, (char*)ciphertext, aes_key, sizeof(aes_key), aes_iv);
-  return String(ciphertext);
+void encryptData(const char* input, char* output, int maxLen) {
+  int len = strlen(input);
+  aesLib.encrypt((byte*)input, len, (byte*)output, aes_key, aes_iv);
 }
 
 void setup() {
@@ -49,7 +49,6 @@ void setup() {
   debug.begin(115200);
   debug.log("Node1: Inicializando...");
 
-  // Carrega configuração de EEPROM (melhoria #1)
   config.begin();
   memcpy(aes_key, config.getAESKey(), 16);
   memcpy(aes_iv, config.getAESIV(), 16);
@@ -78,25 +77,35 @@ void loop() {
 
   if (millis() - tempoAnterior >= GPS_POLL_INTERVAL) {
     tempoAnterior = millis();
-    String lat = gps.location.isValid() ? String(gps.location.lat(), 6) : "Buscando...";
-    String lon = gps.location.isValid() ? String(gps.location.lng(), 6) : "Buscando...";
 
-    String pacoteOriginal = "ID:ALVO_01|Lat:" + lat + "|Lon:" + lon;
-    String pacoteSeguro = encriptarDados(pacoteOriginal);
+    gps_valid = gps.location.isValid() && gps.location.lat() != 0.0 && gps.location.lng() != 0.0;
 
-    // Calcula assinatura HMAC para autenticidade (melhoria #4)
+    if (!gps_valid) {
+      debug.logWarning("GPS: Sem sinal valido, aguardando...");
+      return;
+    }
+
+    char latStr[16];
+    char lonStr[16];
+    dtostrf(gps.location.lat(), 10, 6, latStr);
+    dtostrf(gps.location.lng(), 10, 6, lonStr);
+
+    char pacoteOriginal[128];
+    snprintf(pacoteOriginal, sizeof(pacoteOriginal), "ID:ALVO_01|Lat:%s|Lon:%s", latStr, lonStr);
+
+    encryptData(pacoteOriginal, ciphertext, sizeof(ciphertext));
+
     byte signature[8];
-    PacketAuthenticator::sign(aes_key, 16, (byte*)pacoteSeguro.c_str(), pacoteSeguro.length(), signature);
+    PacketAuthenticator::signCompact(aes_key, 16, (byte*)ciphertext, strlen(ciphertext), signature);
 
-    // Transmite com HMAC
     LoRa.beginPacket();
-    LoRa.print(pacoteSeguro);
+    LoRa.print(ciphertext);
     LoRa.write(signature, 8);
     LoRa.endPacket();
 
     packet_counter++;
     if (DEBUG_MODE) {
-      debug.logf("TX Packet #%u: %s (HMAC OK)", packet_counter, lat.c_str());
+      debug.logf("TX #%u: %s,%s (HMAC OK)", packet_counter, latStr, lonStr);
       debug.printMemory();
     }
   }
