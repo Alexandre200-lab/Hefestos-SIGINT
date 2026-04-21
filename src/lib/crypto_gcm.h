@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <esp_timer.h>
 #include <mbedtls/gcm.h>
 #include <mbedtls/cipher.h>
 
@@ -42,9 +43,10 @@ public:
         byte nonce[GCM_IV_SIZE];
         byte iv[GCM_IV_SIZE + 4];
 
-        // Gera nonce único: timestamp || counter
-        uint32_t ts = millis();
-        memcpy(nonce, &ts, 4);
+        // Gera nonce único: epoch_seconds || counter (uptime-free)
+        int64_t us = esp_timer_get_time();
+        uint32_t epoch = (uint32_t)(us / 1000000);
+        memcpy(nonce, &epoch, 4);
         memcpy(nonce + 4, &counter, 4);
 
         // Copia counter para output (para receptor verificar)
@@ -100,10 +102,11 @@ public:
 
         byte nonce[GCM_IV_SIZE];
         byte iv[GCM_IV_SIZE + 4];
-        uint32_t ts = millis();
+        int64_t us = esp_timer_get_time();
+        uint32_t epoch = (uint32_t)(us / 1000000);
 
-        // Reconstrui nonce (usa timestamp atual como aproximacao)
-        memcpy(nonce, &ts, 4);
+        // Reconstrui nonce (usa epoch atual)
+        memcpy(nonce, &epoch, 4);
         memcpy(nonce + 4, &packet_counter, 4);
 
         // Prepara IV

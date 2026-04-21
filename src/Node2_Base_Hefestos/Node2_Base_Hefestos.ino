@@ -1,6 +1,7 @@
 // Node 2: Servidor Base Hefestos (ESP32) - v3.0
 // Segurança: AES-GCM + Nonce/Counter + Rate Limit com IP real
 #include <WiFi.h>
+#include <sys/time.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <LoRa.h>
@@ -67,6 +68,7 @@ void setup() {
 
   const char* wifi_pass = config.getWiFiPassword();
   WiFi.softAP("Hefestos-SIGINT", wifi_pass, 1, false, 4);
+  configTime("<-03", 0, "pool.ntp.org", "time.nist.gov");
   debug.log("WiFi: Hefestos-SIGINT (v3.0)");
 
   shellServer.begin();
@@ -202,7 +204,7 @@ void processCommand() {
           const char* stored_user = config.getCLIUsername();
           const char* stored_pass = config.getCLIPassword();
           
-          if (input == password) {
+          if (password == config.getCLIPassword()) {
             telnet_state.authenticated = true;
             shellClient.println("\n[+] OK");
           } else {

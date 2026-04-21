@@ -7,9 +7,11 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <esp_timer.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/ctr_drbg.h>
+#include <mbedtls/ccm.h>
 
 #define SECURE_STORAGE_KEY_SIZE 32  // 256-bit key
 #define SECURE_STORAGE_BLOCK 16       // AES block size
@@ -25,14 +27,18 @@ private:
 
     // Deriva chave de uma senha usando PBKDF2-like
     void deriveKey(const char* password, byte* output) {
+        int64_t us = esp_timer_get_time();
         uint32_t seed = 0;
+        
         for (int i = 0; password[i]; i++) {
             seed = (seed * 31 + password[i]) & 0xFFFFFFFF;
+            output[i % SECURE_STORAGE_KEY_SIZE] ^= password[i];
         }
-        seed ^= millis();
+        seed ^= (uint32_t)(us >> 32);
+        seed ^= (uint32_t)us;
 
-        // Iterações simples (替代 PBKDF2 por limitação de memória)
-        for (int round = 0; round < 1000; round++) {
+        // 5000 rounds para resistencia a brute-force
+        for (int round = 0; round < 5000; round++) {
             uint32_t s = seed ^ round;
             for (int i = 0; i < SECURE_STORAGE_KEY_SIZE; i++) {
                 output[i] ^= ((s >> (i % 4)) & 0xFF);

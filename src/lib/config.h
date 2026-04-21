@@ -90,7 +90,7 @@ public:
     
     uint16_t magic = (EEPROM.read(EEPROM_ADDR_MAGIC) << 8) | EEPROM.read(EEPROM_ADDR_MAGIC + 1);
     
-    if (magic != EEPROM_MAGIC && magic != EEPROM_MAGIC_V2) {
+    if (magic != EEPROM_MAGIC && magic != EEPROM_MAGIC_V2 && magic != EEPROM_MAGIC_V3) {
       loadDefaults();
       if ((config.flags & FLAG_KEYS_GENERATED) == 0) {
         generateUniqueKeys();
