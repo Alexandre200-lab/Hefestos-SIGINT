@@ -112,6 +112,7 @@ public:
   void removeClient(uint32_t client_hash) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
       if (clients[i].active && clients[i].ip_hash == client_hash) {
+        memset(clients[i].ip_string, 0, IP_STRING_SIZE);
         clients[i].active = false;
         break;
       }

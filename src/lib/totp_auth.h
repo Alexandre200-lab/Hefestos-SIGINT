@@ -7,8 +7,8 @@
 
 #include <stdint.h>
 #include <string.h>
-#include <mbedtls/hmac.h>
-#include <mbedtls/sha1.h>
+#include <time.h>
+#include <mbedtls/md.h>
 
 #define TOTP_SECRET_MAX 32
 #define TOTP_DIGITS 6       // 6 dígitos (padrão)
@@ -55,6 +55,14 @@ private:
     int secret_len;
     uint8_t hash[20];  // SHA1 output
 
+    static uint32_t getUnixTime() {
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        return (uint32_t)now;
+    }
+
 public:
     TOTPAuth() : secret_len(0) {
         memset(secret, 0, TOTP_SECRET_MAX);
@@ -78,7 +86,7 @@ public:
         if (secret_len == 0) return 0;
 
         if (timestamp == 0) {
-            timestamp = millis() / 1000;
+            timestamp = getUnixTime();
         }
 
         uint32_t counter = timestamp / TOTP_PERIOD;
@@ -104,7 +112,7 @@ public:
 
         // Verifica janela anterior
         for (int i = 1; i <= TOTP_WINDOW; i++) {
-            valid_code = generate((millis() / 1000 - i * TOTP_PERIOD));
+            valid_code = generate(getUnixTime() - i * TOTP_PERIOD);
             if (input_code == valid_code) {
                 return true;
             }
@@ -141,7 +149,14 @@ private:
         counter_bytes[6] = (counter >> 8) & 0xFF;
         counter_bytes[7] = counter & 0xFF;
 
-        mbedtls_hmac_sha1(secret, secret_len, counter_bytes, 8, hash);
+        mbedtls_md_context_t md_ctx;
+        mbedtls_md_type_t md_type = MBEDTLS_MD_SHA1;
+        mbedtls_md_init(&md_ctx);
+        mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(md_type), 1);
+        mbedtls_md_hmac_starts(&md_ctx, secret, secret_len);
+        mbedtls_md_hmac_update(&md_ctx, counter_bytes, 8);
+        mbedtls_md_hmac_finish(&md_ctx, hash);
+        mbedtls_md_free(&md_ctx);
 
         int offset = hash[19] & 0x0F;
         uint32_t code = ((hash[offset] & 0x7F) << 24) |
