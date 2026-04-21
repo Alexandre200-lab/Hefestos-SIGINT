@@ -1,16 +1,20 @@
 // rate_limiter.h - Command rate limiting for CLI and API endpoints
 // Protege contra DoS e abusos
+// CORRIGIDO v3.0: Suporta IP real do cliente
 
 #ifndef RATE_LIMITER_H
 #define RATE_LIMITER_H
 
 #include <stdint.h>
+#include <string.h>
 
-#define MAX_CLIENTS 5
+#define MAX_CLIENTS 8            // Aumentado de 5 para 8
 #define MAX_COMMANDS_PER_MINUTE 30
 #define COMMAND_COOLDOWN_MS 100
+#define IP_STRING_SIZE 16      // Tamanho max para string IP
 
 struct ClientQuota {
+  char ip_string[IP_STRING_SIZE];  // IP real como string (IPv4)
   uint32_t ip_hash;
   uint32_t command_count;
   unsigned long last_reset;
@@ -27,20 +31,30 @@ public:
   RateLimiter() {
     for (int i = 0; i < MAX_CLIENTS; i++) {
       clients[i].active = false;
+      memset(clients[i].ip_string, 0, IP_STRING_SIZE);
     }
   }
 
-  // Registra cliente novo ou atualiza existente
+  // Registra cliente novo ou atualiza existente - VERSÃO CORRIGIDA v3.0
+  // Aceita string IP real ou hash
   uint32_t hashIP(const char* ip) {
+    if (!ip) return 0;
+    
     uint32_t hash = 5381;
-    for (int i = 0; ip[i] != '\0'; i++) {
+    for (int i = 0; ip[i] != '\0' && i < IP_STRING_SIZE - 1; i++) {
       hash = ((hash << 5) + hash) + ip[i];
     }
     return hash;
   }
 
-  // Verifica se cliente pode executar comando
-  bool allowCommand(uint32_t client_hash) {
+  // NOVO v3.0: Versão que aceita string IP diretamente
+  bool allowCommand(const char* client_ip) {
+    if (!client_ip) return false;
+    return allowCommandByHash(hashIP(client_ip), client_ip);
+  }
+
+  // Overload com IP string - VERSÃO CORRIGIDA v3.0
+  bool allowCommandByHash(uint32_t client_hash, const char* ip_string = NULL) {
     unsigned long now = millis();
     int slot = -1;
     
