@@ -1,6 +1,7 @@
-// config.h - EEPROM Configuration Manager - v2.1
+// config.h - EEPROM Configuration Manager - v3.0
 // Gerencia credenciais, chaves criptográficas e parâmetros operacionais
 // Suporta geração de chaves únicas no primeiro boot
+// CORRIGIDO v3.0: Username configurável (não mais hardcoded)
 
 #ifndef CONFIG_H
 #define CONFIG_H
@@ -13,18 +14,21 @@
 #define EEPROM_SIZE 512
 #define EEPROM_MAGIC 0x4845
 #define EEPROM_MAGIC_V2 0x4846
+#define EEPROM_MAGIC_V3 0x4847  // Nova versão v3.0
 #define EEPROM_ADDR_MAGIC 0
 #define EEPROM_ADDR_VERSION 2
 #define EEPROM_ADDR_AES_KEY 4
 #define EEPROM_ADDR_AES_IV 20
 #define EEPROM_ADDR_WIFI_PASS 36
 #define EEPROM_ADDR_CLI_PASS 68
-#define EEPROM_ADDR_FLAGS 100
+#define EEPROM_ADDR_CLI_USER 100  // NOVO v3.0: Username
+#define EEPROM_ADDR_FLAGS 132
 
 #define AES_KEY_SIZE 16
 #define AES_IV_SIZE 16
 #define WIFI_PASS_SIZE 32
 #define CLI_PASS_SIZE 32
+#define CLI_USER_SIZE 16         // NOVO v3.0
 
 #define FLAG_DEBUG_MODE 0x01
 #define FLAG_FACTORY_RESET 0x02
@@ -38,6 +42,7 @@ struct HefestosConfig {
   byte aes_iv[AES_IV_SIZE];
   char wifi_pass[WIFI_PASS_SIZE];
   char cli_pass[CLI_PASS_SIZE];
+  char cli_user[CLI_USER_SIZE];  // NOVO v3.0
 };
 
 class ConfigManager {
@@ -106,8 +111,8 @@ public:
   }
 
   void loadDefaults() {
-    config.magic = EEPROM_MAGIC_V2;
-    config.version = 2;
+    config.magic = EEPROM_MAGIC_V3;  // v3.0
+    config.version = 3;
     config.flags = 0;
     
     const byte default_key[] = {0x48, 0x65, 0x66, 0x65, 0x73, 0x74, 0x6F, 0x73,
@@ -119,6 +124,7 @@ public:
     memcpy(config.aes_iv, default_iv, AES_IV_SIZE);
     strncpy(config.wifi_pass, "Hefestos2024!SecureNet", WIFI_PASS_SIZE - 1);
     strncpy(config.cli_pass, "HefestosTactical@2024", CLI_PASS_SIZE - 1);
+    strncpy(config.cli_user, "admin", CLI_USER_SIZE - 1);  // v3.0: Default user
   }
 
   void load() {
@@ -139,6 +145,10 @@ public:
     
     for (int i = 0; i < CLI_PASS_SIZE; i++) {
       config.cli_pass[i] = EEPROM.read(EEPROM_ADDR_CLI_PASS + i);
+    }
+    
+    for (int i = 0; i < CLI_USER_SIZE; i++) {  // v3.0
+      config.cli_user[i] = EEPROM.read(EEPROM_ADDR_CLI_USER + i);
     }
   }
 
@@ -161,6 +171,9 @@ public:
     for (int i = 0; i < CLI_PASS_SIZE; i++) {
       EEPROM.write(EEPROM_ADDR_CLI_PASS + i, config.cli_pass[i]);
     }
+    for (int i = 0; i < CLI_USER_SIZE; i++) {  // v3.0
+      EEPROM.write(EEPROM_ADDR_CLI_USER + i, config.cli_user[i]);
+    }
     
     EEPROM.commit();
   }
@@ -169,6 +182,7 @@ public:
   byte* getAESIV() { return config.aes_iv; }
   const char* getWiFiPassword() { return config.wifi_pass; }
   const char* getCLIPassword() { return config.cli_pass; }
+  const char* getCLIUsername() { return config.cli_user; }  // NOVO v3.0
   uint8_t getFlags() { return config.flags; }
   
   bool isDebugMode() { return config.flags & FLAG_DEBUG_MODE; }
@@ -196,6 +210,13 @@ public:
     }
   }
 
+  void setCLIUsername(const char* user) {  // NOVO v3.0
+    if (strlen(user) >= 3 && strlen(user) < CLI_USER_SIZE) {
+      strncpy(config.cli_user, user, CLI_USER_SIZE - 1);
+      save();
+    }
+  }
+
   void setDebugMode(bool enabled) {
     if (enabled) config.flags |= FLAG_DEBUG_MODE;
     else config.flags &= ~FLAG_DEBUG_MODE;
@@ -204,11 +225,12 @@ public:
 
   void factoryReset() {
     memset(&config, 0, sizeof(config));
-    config.magic = EEPROM_MAGIC_V2;
-    config.version = 2;
+    config.magic = EEPROM_MAGIC_V3;  // v3.0
+    config.version = 3;
     generateUniqueKeys();
     generateSecurePassword(config.wifi_pass, WIFI_PASS_SIZE);
     generateSecurePassword(config.cli_pass, CLI_PASS_SIZE);
+    strncpy(config.cli_user, "hefestos", CLI_USER_SIZE - 1);  // v3.0: Novo user diferente
     save();
   }
 
