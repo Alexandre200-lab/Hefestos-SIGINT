@@ -29,7 +29,7 @@ DebugLogger debug;
 SecureProtocol secProto;
 AESGCM aesgcm;
 
-byte aes_key[16];
+uint8_t aes_key[16];
 uint8_t iv[12];
 
 unsigned long tempoAnterior = 0;
@@ -88,7 +88,7 @@ void loop() {
 
     uint32_t counter = secProto.getNextCounter();
     uint8_t output[256];
-    int outLen = aesgcm.encrypt((byte*)payload, strlen(payload), output, counter);
+    int outLen = aesgcm.encrypt((uint8_t*)payload, strlen(payload), output, counter);
 
     if (outLen > 0) {
       LoRa.beginPacket();

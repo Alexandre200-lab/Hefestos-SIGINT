@@ -40,7 +40,7 @@ RateLimiter rateLimiter;
 SecureProtocol secProto;
 AESGCM aesgcm;
 
-byte aes_key[16];
+uint8_t aes_key[16];
 SI4735 radioRX;
 AsyncWebServer server(80);
 HardwareSerial SerialArduino(2);
