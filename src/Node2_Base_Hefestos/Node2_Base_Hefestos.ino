@@ -2,12 +2,14 @@
 // Segurança: AES-GCM + Nonce/Counter + Rate Limit com IP real
 #include <WiFi.h>
 #include <sys/time.h>
+
+void processCommand();
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <LoRa.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <PU2CLR_SI4735.h>
+#include <SI4735.h>
 #include <HardwareSerial.h>
 
 #include "../lib/config.h"
@@ -68,7 +70,7 @@ void setup() {
 
   const char* wifi_pass = config.getWiFiPassword();
   WiFi.softAP("Hefestos-SIGINT", wifi_pass, 1, false, 4);
-  configTime("<-03", 0, "pool.ntp.org", "time.nist.gov");
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
   debug.log("WiFi: Hefestos-SIGINT (v3.0)");
 
   shellServer.begin();

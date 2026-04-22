@@ -5,7 +5,7 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <Wire.h>
-#include <Adafruit_SI4713.h>
+#include <Adafruit_Si4713.h>
 
 #include "../lib/config.h"
 #include "../lib/crypto_gcm.h"
@@ -22,7 +22,7 @@
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
-Adafruit_SI4713 radioTX = Adafruit_SI4713(FM_RST);
+Adafruit_Si4713 radioTX = Adafruit_Si4713(FM_RST);
 
 ConfigManager config;
 DebugLogger debug;

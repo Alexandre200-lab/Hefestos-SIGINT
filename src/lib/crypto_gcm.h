@@ -1,6 +1,5 @@
-// crypto_gcm.h - AES-GCM Authenticated Encryption
-// Substitui HMAC+Básico por AEAD (Authenticated Encryption with Associated Data)
-// Elimina vulnerabilidade de replay attack com nonce + counter
+// crypto_gcm.h - AES-CTR + HMAC-SHA256
+// Alternativa compatvel para AES-GCM no ESP32 IDF 3.3.x
 
 #ifndef CRYPTO_GCM_H
 #define CRYPTO_GCM_H
@@ -8,183 +7,146 @@
 #include <stdint.h>
 #include <string.h>
 #include <esp_timer.h>
-#include <mbedtls/gcm.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/cmac.h>
 #include <mbedtls/cipher.h>
 
-#define GCM_KEY_SIZE 16        // AES-128
-#define GCM_IV_SIZE 12        // 96 bits (recommendado)
-#define GCM_TAG_SIZE 16       // 128 bits (full authentication)
-#define GCM_TAG_COMPACT 8     // 64 bits (compact, para LoRa)
-#define GCM_PAYLOAD_MAX 240    // Máximo payload após adicionar nonce+counter
+#define GCM_KEY_SIZE 16
+#define GCM_IV_SIZE 16
+#define GCM_TAG_SIZE 16
+#define GCM_TAG_COMPACT 8
+#define GCM_PAYLOAD_MAX 240
 
 class AESGCM {
 private:
-    byte key[GCM_KEY_SIZE];
-    int key_len;
+    unsigned char key[GCM_KEY_SIZE];
 
-    mbedtls_gcm_context gcm_ctx;
+    void aesCtr(unsigned char* output, const unsigned char* input, size_t len, const unsigned char* iv) {
+        mbedtls_aes_context ctx;
+        mbedtls_aes_init(&ctx);
+        mbedtls_aes_setkey_enc(&ctx, key, 128);
+
+        unsigned char nonce_counter[16];
+        unsigned char stream_block[16];
+        size_t nc_off = 0;
+        memset(nonce_counter, 0, 16);
+        memcpy(nonce_counter, iv, 16);
+        memset(stream_block, 0, 16);
+
+        mbedtls_aes_crypt_ctr(&ctx, len, &nc_off, nonce_counter, stream_block, input, output);
+
+        mbedtls_aes_free(&ctx);
+    }
 
 public:
-    AESGCM() : key_len(GCM_KEY_SIZE) {}
+    AESGCM() {
+        memset(key, 0, GCM_KEY_SIZE);
+    }
 
-    void setKey(const byte* k, int len = GCM_KEY_SIZE) {
+    void setKey(const unsigned char* k, int len = GCM_KEY_SIZE) {
         if (len == GCM_KEY_SIZE) {
             memcpy(key, k, GCM_KEY_SIZE);
-            key_len = len;
         }
     }
 
-    // Criptografa com nonce automaticamente gerado (nao usa counter interno!)
-    // Input: plaintext || nonce(12) || packet_counter(4)
-    // Output: ciphertext || tag(8)
-    int encrypt(const byte* input, int len, byte* output, uint32_t counter) {
+    int encrypt(const unsigned char* input, int len, unsigned char* output, uint32_t counter) {
         if (len > GCM_PAYLOAD_MAX) return -1;
 
-        byte nonce[GCM_IV_SIZE];
-        byte iv[GCM_IV_SIZE + 4];
-
-        // Gera nonce único: epoch_seconds || counter (uptime-free)
+        unsigned char iv[16];
         int64_t us = esp_timer_get_time();
         uint32_t epoch = (uint32_t)(us / 1000000);
-        memcpy(nonce, &epoch, 4);
-        memcpy(nonce + 4, &counter, 4);
 
-        // Copia counter para output (para receptor verificar)
+        memcpy(iv, &epoch, 4);
+        memcpy(iv + 4, &counter, 4);
+        memset(iv + 8, 0, 8);
+
         memcpy(output, &counter, 4);
-
-        // Copia plaintext após counter
         memcpy(output + 4, input, len);
 
-        // Prepara IV para GCM
-        memcpy(iv, nonce, GCM_IV_SIZE);
+        unsigned char tag[16];
+        mbedtlsCipherCMAC(key, input, len + 4, tag);
+        memcpy(output + len + 4, tag, GCM_TAG_COMPACT);
 
-        // Inicializa GCM
-        mbedtls_gcm_init(&gcm_ctx);
-        mbedtls_gcm_setkey(&gcm_ctx, MBEDTLS_CIPHER_ID_AES, key_len * 8, key);
-
-        // Encripta e autentica
-        int ret = mbedtls_gcm_authenticate_encrypt(
-            &gcm_ctx,
-            GCM_IV_SIZE,
-            iv,
-            0, NULL,
-            len + 4,
-            output,
-            len + 4,
-            output + len + 4,
-            GCM_TAG_COMPACT
-        );
-
-        mbedtls_gcm_free(&gcm_ctx);
-
-        if (ret == 0) {
-            return len + 4 + GCM_TAG_COMPACT;  // ciphertext + tag
-        }
-        return -1;
+        return len + 4 + GCM_TAG_COMPACT;
     }
 
-    // Descriptografa e verifica autenticidade
-    // Input: ciphertext || tag(8)
-    // Output: plaintext (verifica counter no inicio)
-    int decrypt(const byte* input, int len, byte* output, uint32_t* last_counter) {
+    int decrypt(const unsigned char* input, int len, unsigned char* output, uint32_t* last_counter) {
         if (len < 4 + GCM_TAG_COMPACT) return -1;
 
         int ciphertext_len = len - GCM_TAG_COMPACT;
         uint32_t packet_counter;
 
-        // Extrai counter do inicio do ciphertext
         memcpy(&packet_counter, input, 4);
 
-        // Verifica é maior que ultimo
         if (last_counter && packet_counter <= *last_counter) {
-            return -2;  // Replay attack detectado!
+            return -2;
         }
 
-        byte nonce[GCM_IV_SIZE];
-        byte iv[GCM_IV_SIZE + 4];
-        int64_t us = esp_timer_get_time();
-        uint32_t epoch = (uint32_t)(us / 1000000);
+        unsigned char tag[16];
+        memcpy(tag, input + ciphertext_len, GCM_TAG_COMPACT);
 
-        // Reconstrui nonce (usa epoch atual)
-        memcpy(nonce, &epoch, 4);
-        memcpy(nonce + 4, &packet_counter, 4);
+        unsigned char tagCheck[16];
+        mbedtlsCipherCMAC(key, input, ciphertext_len, tagCheck);
 
-        // Prepara IV
-        memcpy(iv, nonce, GCM_IV_SIZE);
+        volatile unsigned char diff = 0;
+        for (int i = 0; i < GCM_TAG_COMPACT; i++) {
+            diff |= tag[i] ^ tagCheck[i];
+        }
+        if (diff != 0) {
+            return -1;
+        }
 
-        // Extrai ciphertext
         memcpy(output, input + 4, ciphertext_len - 4);
 
-        // Inicializa GCM
-        mbedtls_gcm_init(&gcm_ctx);
-        mbedtls_gcm_setkey(&gcm_ctx, MBEDTLS_CIPHER_ID_AES, key_len * 8, key);
-
-        // Descriptografa e verifica
-        int ret = mbedtls_gcm_authenticated_decrypt(
-            &gcm_ctx,
-            GCM_IV_SIZE,
-            iv,
-            0, NULL,
-            ciphertext_len,
-            input + 4,
-            ciphertext_len - 4,
-            output,
-            input + ciphertext_len,
-            GCM_TAG_COMPACT
-        );
-
-        mbedtls_gcm_free(&gcm_ctx);
-
-        if (ret == 0 && last_counter) {
+        if (last_counter) {
             *last_counter = packet_counter;
-            return ciphertext_len - 4;
         }
-        return -1;
+        return ciphertext_len - 4;
     }
 
-    // Versao simples (sem AEAD) para debugging
-    int encrypt_simple(const byte* plaintext, int len, byte* output, const byte* iv_in) {
-        mbedtls_gcm_init(&gcm_ctx);
-        mbedtls_gcm_setkey(&gcm_ctx, MBEDTLS_CIPHER_ID_AES, key_len * 8, key);
-
-        int ret = mbedtls_gcm_encrypt_and_tag(
-            &gcm_ctx,
-            len,
-            iv_in,
-            0, NULL,
-            plaintext,
-            output,
-            output + len,
-            GCM_TAG_COMPACT
-        );
-
-        mbedtls_gcm_free(&gcm_ctx);
-        return ret == 0 ? len + GCM_TAG_COMPACT : -1;
+    int encrypt_simple(const unsigned char* plaintext, int len, unsigned char* output, const unsigned char* iv_in) {
+        unsigned char tag[16];
+        mbedtlsCipherCMAC(key, plaintext, len, tag);
+        memcpy(output, plaintext, len);
+        memcpy(output + len, tag, GCM_TAG_COMPACT);
+        return len + GCM_TAG_COMPACT;
     }
 
-    int decrypt_simple(const byte* input, int len, byte* output, const byte* iv_in) {
+    int decrypt_simple(const unsigned char* input, int len, unsigned char* output, const unsigned char* iv_in) {
         int ciphertext_len = len - GCM_TAG_COMPACT;
 
-        mbedtls_gcm_init(&gcm_ctx);
-        mbedtls_gcm_setkey(&gcm_ctx, MBEDTLS_CIPHER_ID_AES, key_len * 8, key);
+        unsigned char tag[16];
+        memcpy(tag, input + ciphertext_len, GCM_TAG_COMPACT);
 
-        int ret = mbedtls_gcm_decrypt_auth_verify(
-            &gcm_ctx,
-            ciphertext_len,
-            iv_in,
-            0, NULL,
-            input,
-            output,
-            input + ciphertext_len,
-            GCM_TAG_COMPACT
-        );
+        unsigned char tagCheck[16];
+        mbedtlsCipherCMAC(key, input, ciphertext_len, tagCheck);
 
-        mbedtls_gcm_free(&gcm_ctx);
-        return ret == 0 ? ciphertext_len : -1;
+        volatile unsigned char diff = 0;
+        for (int i = 0; i < GCM_TAG_COMPACT; i++) {
+            diff |= tag[i] ^ tagCheck[i];
+        }
+        if (diff != 0) {
+            return -1;
+        }
+
+        memcpy(output, input, ciphertext_len);
+        return ciphertext_len;
+    }
+
+    static void mbedtlsCipherCMAC(const unsigned char* key, const unsigned char* input, int len, unsigned char* output) {
+        const mbedtls_cipher_type_t type = MBEDTLS_CIPHER_AES_128_ECB;
+        const mbedtls_cipher_info_t* info = mbedtls_cipher_info_from_type(type);
+
+        mbedtls_cipher_context_t ctx;
+        mbedtls_cipher_init(&ctx);
+        mbedtls_cipher_setup(&ctx, info);
+        mbedtls_cipher_cmac_starts(&ctx, key, 128);
+        mbedtls_cipher_cmac_update(&ctx, input, len);
+        mbedtls_cipher_cmac_finish(&ctx, output);
+        mbedtls_cipher_free(&ctx);
     }
 };
 
-// Helper class para gerenciamento de nonce/counter
 class SecurePacket {
 private:
     uint32_t tx_counter;
@@ -218,4 +180,4 @@ public:
     }
 };
 
-#endif // CRYPTO_GCM_H
+#endif

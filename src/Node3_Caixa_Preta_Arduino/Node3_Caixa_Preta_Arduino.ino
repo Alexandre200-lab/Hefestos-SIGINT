@@ -4,8 +4,8 @@
 #include <SPI.h>
 #include <SD.h>
 
-#include "../lib/serial_protocol.h"
-#include "../lib/debug.h"
+#include "src/serial_protocol.h"
+#include "src/debug.h"
 
 SoftwareSerial SerialESP(2, 3);
 
@@ -27,11 +27,11 @@ uint32_t failed_writes = 0;
 unsigned long last_sd_check = 0;
 bool sd_ok = false;
 
-#define LOG_BUFFER_SIZE 50
+#define LOG_BUFFER_SIZE 8
 struct LogEntry {
   uint32_t timestamp;
-  char tipo[16];
-  char dados[128];
+  char tipo[8];
+  char dados[32];
 };
 LogEntry log_buffer[LOG_BUFFER_SIZE];
 int log_buffer_idx = 0;
@@ -168,7 +168,7 @@ void loop() {
         if (serialProto.decodeFrame(buffer, buffer_idx, &frame)) {
           if (frame.type == FRAME_DATA) {
             char tipo[16];
-            char dados[128];
+char dados[64];
 
             int pipe_pos = 0;
             for (int i = 0; i < frame.len && pipe_pos == 0; i++) {

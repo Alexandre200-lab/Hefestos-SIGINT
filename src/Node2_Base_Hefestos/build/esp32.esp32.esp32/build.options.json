@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/neo-xd/.arduino15/packages/esp32/hardware/esp32/3.3.8,/home/neo-xd/.arduino15/packages/esp32/hardware/esp32/3.3.8",
+  "otherLibrariesFolders": "/home/neo-xd/Arduino/libraries",
+  "sketchLocation": "/home/neo-xd/repo-local/Hefestos-SIGINT/src/Node2_Base_Hefestos"
+}
