@@ -27,11 +27,11 @@ uint32_t failed_writes = 0;
 unsigned long last_sd_check = 0;
 bool sd_ok = false;
 
-#define LOG_BUFFER_SIZE 8
+#define LOG_BUFFER_SIZE 16
 struct LogEntry {
   uint32_t timestamp;
-  char tipo[8];
-  char dados[32];
+  char tipo[10];
+  char dados[48];
 };
 LogEntry log_buffer[LOG_BUFFER_SIZE];
 int log_buffer_idx = 0;

@@ -1,5 +1,5 @@
 // crypto_gcm.h - AES-CTR + HMAC-SHA256
-// Alternativa compatvel para AES-GCM no ESP32 IDF 3.3.x
+// Criptografia autenticada com anti-replay
 
 #ifndef CRYPTO_GCM_H
 #define CRYPTO_GCM_H
@@ -33,6 +33,23 @@ private:
         mbedtls_md_free(&ctx);
     }
 
+    void aesCrypt(unsigned char* output, const unsigned char* input, size_t len, const unsigned char* iv) {
+        mbedtls_aes_context ctx;
+        unsigned char counter[16];
+        unsigned char stream_block[16];
+        size_t nc_off = 0;
+        
+        mbedtls_aes_init(&ctx);
+        mbedtls_aes_setkey_enc(&ctx, key, 128);
+        
+        memcpy(counter, iv, 16);
+        memset(stream_block, 0, 16);
+        
+        mbedtls_aes_crypt_ctr(&ctx, len, &nc_off, counter, stream_block, input, output);
+        
+        mbedtls_aes_free(&ctx);
+    }
+
 public:
     AESGCM() {
         memset(key, 0, GCM_KEY_SIZE);
@@ -61,7 +78,10 @@ public:
         memset(iv + 8, 0, 8);
 
         memcpy(output, &counter, 4);
-        memcpy(output + 4, input, len);
+        
+        unsigned char ciphertext[256];
+        aesCrypt(ciphertext, input, len, iv);
+        memcpy(output + 4, ciphertext, len);
 
         unsigned char hash[32];
         computeHmac(hmac_key, output, len + 4, hash);
@@ -96,7 +116,14 @@ public:
             return -1;
         }
 
-        memcpy(output, input + 4, ciphertext_len - 4);
+        unsigned char iv[16];
+        memcpy(iv, input, 4);
+        memcpy(iv + 4, &packet_counter, 4);
+        memset(iv + 8, 0, 8);
+
+        unsigned char plaintext[256];
+        aesCrypt(plaintext, input + 4, ciphertext_len - 4, iv);
+        memcpy(output, plaintext, ciphertext_len - 4);
 
         if (last_counter) {
             *last_counter = packet_counter;
@@ -105,9 +132,12 @@ public:
     }
 
     int encrypt_simple(const unsigned char* plaintext, int len, unsigned char* output, const unsigned char* iv_in) {
+        unsigned char ciphertext[256];
+        aesCrypt(ciphertext, plaintext, len, iv_in);
+        memcpy(output, ciphertext, len);
+        
         unsigned char hash[32];
-        computeHmac(hmac_key, plaintext, len, hash);
-        memcpy(output, plaintext, len);
+        computeHmac(hmac_key, output, len, hash);
         memcpy(output + len, hash, GCM_TAG_COMPACT);
         return len + GCM_TAG_COMPACT;
     }
@@ -129,7 +159,9 @@ public:
             return -1;
         }
 
-        memcpy(output, input, ciphertext_len);
+        unsigned char plaintext[256];
+        aesCrypt(plaintext, input, ciphertext_len, iv_in);
+        memcpy(output, plaintext, ciphertext_len);
         return ciphertext_len;
     }
 };

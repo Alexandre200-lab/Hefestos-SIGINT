@@ -7,6 +7,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 
 #define SECURE_PROTOCOL_MAX_PAYLOAD 256
 #define SECURE_PROTOCOL_MAGIC 0xHEF3  // Magic para v3.0
@@ -35,7 +36,9 @@ public:
     // Inicializa counter - deve ser chamado nos 2 nós com mesmo seed!
     void begin(uint32_t seed = 0) {
         if (seed == 0) {
-            seed = millis() ^ 0xDEADBEEF;
+            time_t now;
+            time(&now);
+            seed = (now > 0) ? (uint32_t)now : (millis() ^ 0xDEADBEEF);
         }
         tx_counter = seed;
         rx_counter = seed;

@@ -18,7 +18,7 @@
 
 class SecureStorage {
 private:
-    byte master_key[SECURE_STORAGE_KEY_SIZE];
+    unsigned char master_key[SECURE_STORAGE_KEY_SIZE];
     bool initialized;
 
     mbedtls_aes_context aes_ctx;
@@ -26,7 +26,7 @@ private:
     mbedtls_ctr_drbg_context drbg;
 
     // Deriva chave de uma senha usando PBKDF2-like
-    void deriveKey(const char* password, byte* output) {
+    void deriveKey(const char* password, unsigned char* output) {
         int64_t us = esp_timer_get_time();
         uint32_t seed = 0;
         
@@ -60,7 +60,7 @@ public:
     }
 
     // Inicializa com chave raw
-    bool beginRaw(const byte* key) {
+    bool beginRaw(const unsigned char* key) {
         if (!key) return false;
         memcpy(master_key, key, SECURE_STORAGE_KEY_SIZE);
         initialized = true;
@@ -68,7 +68,7 @@ public:
     }
 
     // Criptografa dados (CTR mode)
-    int encrypt(const uint8_t* input, int len, uint8_t* output, const uint8_t* iv) {
+    int encrypt(const unsigned char* input, int len, uint8_t* output, const unsigned char* iv) {
         if (!initialized) return -1;
 
         size_t olen = 0;
@@ -89,12 +89,12 @@ public:
     }
 
     // Descriptografa dados
-    int decrypt(const uint8_t* input, int len, uint8_t* output, const uint8_t* iv) {
+    int decrypt(const unsigned char* input, int len, uint8_t* output, const unsigned char* iv) {
         return encrypt(input, len, output, iv);  // CTR is symmetric
     }
 
     // Versão simples XOR+rot13 para Arduino (memória limitada)
-    int encryptSimple(const uint8_t* input, int len, uint8_t* output) {
+    int encryptSimple(const unsigned char* input, int len, uint8_t* output) {
         if (!initialized) return -1;
 
         for (int i = 0; i < len; i++) {
@@ -104,7 +104,7 @@ public:
         return len;
     }
 
-    int decryptSimple(const uint8_t* input, int len, uint8_t* output) {
+    int decryptSimple(const unsigned char* input, int len, uint8_t* output) {
         if (!initialized) return -1;
 
         for (int i = 0; i < len; i++) {
@@ -120,7 +120,7 @@ public:
 // Helper para limpar dados sensíveis da memória
 class SecureMem {
 public:
-    static void wipe(byte* data, int len) {
+    static void wipe(unsigned char* data, int len) {
         if (!data) return;
         for (int i = 0; i < len; i++) {
             data[i] = 0;
