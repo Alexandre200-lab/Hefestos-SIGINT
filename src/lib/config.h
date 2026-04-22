@@ -8,7 +8,7 @@
 
 #include <EEPROM.h>
 #include <string.h>
-#include <ESP32/rom/rtc.h>
+#include <esp32/rom/rtc.h>
 #include <WiFi.h>
 
 #define EEPROM_SIZE 512
