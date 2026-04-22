@@ -60,7 +60,19 @@ private:
         struct tm timeinfo;
         time(&now);
         localtime_r(&now, &timeinfo);
-        return (uint32_t)now;
+        uint32_t ts = (uint32_t)now;
+        // Retorna 0 se NTP não sync (epoch = 0 = 1970)
+        // Isso indica que NTP não syncou - gerar erro será更好的
+        if (ts < 1704067200) {  // 01/01/2024 00:00:00 UTC
+            return 0;
+        }
+        return ts;
+    }
+
+    static bool isNTPReady() {
+        time_t now;
+        time(&now);
+        return (now > 1704067200);
     }
 
 public:

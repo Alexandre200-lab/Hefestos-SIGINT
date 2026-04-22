@@ -38,8 +38,8 @@ struct HefestosConfig {
   uint16_t magic;
   uint8_t version;
   uint8_t flags;
-  byte aes_key[AES_KEY_SIZE];
-  byte aes_iv[AES_IV_SIZE];
+  uint8_t aes_key[AES_KEY_SIZE];
+  uint8_t aes_iv[AES_IV_SIZE];
   char wifi_pass[WIFI_PASS_SIZE];
   char cli_pass[CLI_PASS_SIZE];
   char cli_user[CLI_USER_SIZE];  // NOVO v3.0
@@ -115,9 +115,9 @@ public:
     config.version = 3;
     config.flags = 0;
     
-    const byte default_key[] = {0x48, 0x65, 0x66, 0x65, 0x73, 0x74, 0x6F, 0x73,
+    const uint8_t default_key[] = {0x48, 0x65, 0x66, 0x65, 0x73, 0x74, 0x6F, 0x73,
                                 0x54, 0x61, 0x63, 0x74, 0x69, 0x63, 0x61, 0x00};
-    const byte default_iv[] = {0x56, 0x65, 0x74, 0x6F, 0x72, 0x49, 0x6E, 0x69,
+    const uint8_t default_iv[] = {0x56, 0x65, 0x74, 0x6F, 0x72, 0x49, 0x6E, 0x69,
                                0x63, 0x69, 0x61, 0x6C, 0x69, 0x7A, 0x61, 0x64};
     
     memcpy(config.aes_key, default_key, AES_KEY_SIZE);
@@ -178,8 +178,8 @@ public:
     EEPROM.commit();
   }
 
-  byte* getAESKey() { return config.aes_key; }
-  byte* getAESIV() { return config.aes_iv; }
+  uint8_t* getAESKey() { return config.aes_key; }
+  uint8_t* getAESIV() { return config.aes_iv; }
   const char* getWiFiPassword() { return config.wifi_pass; }
   const char* getCLIPassword() { return config.cli_pass; }
   const char* getCLIUsername() { return config.cli_user; }  // NOVO v3.0
@@ -188,7 +188,7 @@ public:
   bool isDebugMode() { return config.flags & FLAG_DEBUG_MODE; }
   bool keysGenerated() { return config.flags & FLAG_KEYS_GENERATED; }
 
-  void setAESKey(byte* key, int len) {
+  void setAESKey(uint8_t* key, int len) {
     if (len == AES_KEY_SIZE) {
       memcpy(config.aes_key, key, AES_KEY_SIZE);
       config.flags |= FLAG_KEYS_GENERATED;

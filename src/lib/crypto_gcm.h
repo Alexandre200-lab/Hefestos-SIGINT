@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <esp_timer.h>
+#include <esp_random.h>
 #include <mbedtls/aes.h>
 #include <mbedtls/md.h>
 
@@ -71,7 +72,15 @@ public:
 
         unsigned char iv[16];
         int64_t us = esp_timer_get_time();
-        uint32_t epoch = us > 0 ? (uint32_t)(us / 1000000) : counter;
+        uint32_t epoch;
+        
+        // Fallback mais seguro: usa counter + random se esp_timer_get_time() falhar
+        if (us > 0) {
+            epoch = (uint32_t)(us / 1000000);
+        } else {
+            // Usa counter + random para garantir unicidade
+            epoch = counter ^ (uint32_t)(esp_random() & 0xFFFFFFFF);
+        }
 
         memcpy(iv, &epoch, 4);
         memcpy(iv + 4, &counter, 4);
