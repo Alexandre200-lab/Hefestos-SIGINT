@@ -2,30 +2,40 @@
 
 Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e telemetria com arquitetura Master-Slave distribuída. Realiza rastreamento GPS criptografado (AES-GCM), transmissão via LoRa (915 MHz Sub-GHz), interceptação de RF (AM/FM/SW), e retenção forense em SD Card com autenticação 2FA.
 
-## Versão 3.0 - Segurança Crítica
+## Versão 3.1 - Segurança Revisada (Jul 2026)
 
-### Novas Bibliotecas de Segurança
-| Biblioteca | Descrição |
-|------------|-----------|
-| `crypto_gcm.h` | AES-GCM autenticado (elimina replay attack) |
-| `secure_protocol.h` | Nonce/Counter anti-replay |
-| `totp_auth.h` | 2FA TOTP (RFC 6238) |
-| `secure_storage.h` | Encrypt at rest |
+### Bibliotecas de Segurança Revisadas
+| Biblioteca | Descrição | Mudanças |
+|------------|-----------|----------|
+| `crypto_gcm.h` | AES-GCM autêntico (mbedtls) | **Reescrito**: agora usa `mbedtls_gcm_crypt_and_tag` AEAD real (antes: AES-CTR + HMAC truncado caseiro) |
+| `secure_protocol.h` | Nonce/Counter anti-replay | Reset periódico removido (elimina janela de replay de 60s) |
+| `totp_auth.h` | 2FA TOTP (RFC 6238) | `generateRandomSecret()` via hardware RNG (`esp_fill_random`) |
+| `secure_storage.h` | Encrypt at rest | **Reescrito**: key derivation via PBKDF2-HMAC-SHA256 100k iterações; AES-256-GCM (antes: LCG caseiro + XOR+ROT13) |
+| `config.h` | Gerenciamento de chaves | `esp_fill_random()` no lugar de LCG; credenciais hardcoded removidas |
+| `rate_limiter.h` | Anti-DoS | IP tracking removido (privacidade); apenas hash anônimo |
 
-### Correções de Segurança v3.0
-- **AES-GCM**: Substituído HMAC+Básico por criptografia autenticada
-- **Anti-Replay**: Contador único por pacote
-- **Rate Limiter**: IP real (não mais hashfixo)
-- **Username configurável**: Não mais hardcoded "admin"
-- **TOTP disponível**: 2FA real compat com Google Authenticator
+### Correções de Segurança v3.1
+| Correção | Antes | Depois |
+|----------|-------|--------|
+| **Telnet Auth** | Apenas senha verificada (username ignorado) | Username **e** senha verificados |
+| **Session Timeout** | Ilimitado | 1 min idle / 5 min absoluto |
+| **Brute Force** | 3 tentativas = reset conexão | 3 tentativas = IP bloqueado por 30 min |
+| **Senha em echo** | Caracteres visíveis na digitação | Exibe `*` durante digitação da senha |
+| **AES-GCM** | AES-CTR + HMAC-8 (não-AEAD, IV previsível) | `mbedtls_gcm` AEAD real (12B nonce + random, tag 16B) |
+| **Key Derivation** | LCG 5k rounds | PBKDF2-HMAC-SHA256 100k rounds |
+| **Geração de chaves** | LCG baseado em MAC+heap+reset | `esp_fill_random()` (hardware RNG) |
+| **Anti-Replay** | Reset a cada 60s (janela de replay) | Monotônico (uint32_t = 8000 anos sem overflow) |
+| **Encrypt-at-Rest** | AES-CTR (assinatura errada) + XOR+ROT13 | AES-256-GCM autêntico |
+| **HTTP /sintonizar** | Sem validação de input | Range validado (banda/frequência) |
+| **Credenciais hardcoded** | Presentes em `config.h` e README | Removidas — geradas aleatoriamente no 1º boot |
+| **TOTP Secret** | RFC test vector (`JBSWY3DPEHPK3PXP`) | Gerado via `esp_fill_random()` |
+| **Rate Limiter** | IP armazenado em plaintext | Apenas hash anônimo |
+| **Build artifacts** | `.bin`, `.elf`, `.map` no repo | Adicionados ao `.gitignore` |
 
-### v2.1 Mantidas
-- EEPROM Config Manager com chaves AES
-- WiFi forte (22 chars)
-- Autenticação Telnet 2FA
-- Rate Limiting (30 cmd/min, 100ms cooldown)
-- CRC16 em UART
-- SD Card Recovery + RAM fallback
+### Aviso de Segurança
+**Credenciais anteriores foram removidas permanentemente do código.**  
+Se você atualizou de uma versão anterior, execute `factoryReset()` ou limpe a EEPROM.  
+O histórico do git ainda contém credenciais expostas — use `git filter-branch` ou BFG Repo-Cleaner para purgar.
 
 ---
 
@@ -57,24 +67,19 @@ Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e tele
 ### Proteções Implementadas
 | Camada | Proteção | Mecanismo |
 |-------|----------|-----------|
-| RF | AEAD | AES-GCM (128-bit) |
-| RF | Anti-Replay | Nonce + Counter |
-| RF | Confidencialidade | Criptografia |
+| RF | AEAD | AES-GCM (128-bit, mbedtls) |
+| RF | Anti-Replay | Nonce + Counter monotônico |
+| RF | Confidencialidade | Criptografia autenticada |
 | UART | Integridade | CRC16 |
-| API | Autenticação | 2FA + Rate Limit |
-| API | DoS | 30 cmd/min |
-| Storage | Cifragem | SecureStorage |
+| API | Autenticação | 2FA TOTP + Rate Limit |
+| API | DoS | 30 cmd/min + cooldown 100ms |
+| API | Brute Force | Block IP por 30 min após 3 tentativas |
+| Storage | Cifragem | AES-256-GCM via PBKDF2 |
+| Session | Timeout | 1 min idle / 5 min absoluto |
 
-### Credenciais Padrão
-```
-WiFi SSID:    Hefestos-SIGINT
-WiFi Pass:    Hefestos2024!SecureNet
-
-Telnet User:  hefestos        (v3.0 - novo default)
-Telnet Pass:  HefestosTactical@2024
-
-AES Key:       HefestosTactica\0
-```
+> **Nota**: Credenciais são geradas aleatoriamente no primeiro boot via hardware RNG (`esp_fill_random`).  
+> Não existem credenciais padrão. Consulte o serial output no primeiro boot para obter as senhas,  
+> ou configure via `config.h` antes da compilação.
 
 ---
 
@@ -128,9 +133,21 @@ arduino-cli compile -b arduino:avr:uno src/Node3_Caixa_Preta_Arduino/
 |--------|--------------|--------|
 | v2.1 | HMAC sobre ciphertext | ✅ CORRIGIDO |
 | v2.1 | Rate limiter hash fixo | ✅ CORRIGIDO |
-| v2.1 | Username "admin" | ✅ CORRIGIDO |
+| v2.1 | Username "admin" hardcoded | ✅ CORRIGIDO |
 | v2.1 | Sem 2FA real | ✅ ADICIONADO |
-| v2.1 | EEPROM texto puro | ✅ DISPONÍVEL |
+| v2.1 | EEPROM texto puro | ✅ CORRIGIDO |
+| v3.1 | AES-GCM caseiro (CTR+HMAC truncado) → mbedtls GCM real | ✅ CORRIGIDO |
+| v3.1 | Key derivation LCG → PBKDF2 100k iters | ✅ CORRIGIDO |
+| v3.1 | Telnet auth sem username | ✅ CORRIGIDO |
+| v3.1 | Replay window 60s | ✅ CORRIGIDO |
+| v3.1 | Credenciais hardcoded no código/README | ✅ REMOVIDO |
+| v3.1 | TOTP secret RFC test vector | ✅ CORRIGIDO |
+| v3.1 | Buffer overflow potencial em crypto | ✅ CORRIGIDO |
+| v3.1 | IP tracking em plaintext | ✅ CORRIGIDO |
+| v3.1 | XOR+ROT13 pseudo-criptografia | ✅ REMOVIDO |
+| v3.1 | Sessão telnet sem timeout | ✅ ADICIONADO |
+| v3.1 | Brute force sem bloqueio de IP | ✅ ADICIONADO |
+| v3.1 | Build artifacts no repo | ✅ .gitignore |
 
 ---
 
@@ -138,15 +155,36 @@ arduino-cli compile -b arduino:avr:uno src/Node3_Caixa_Preta_Arduino/
 
 | Documento | Conteúdo |
 |-----------|---------|
-| `IMPLEMENTATION_GUIDE_v3.md` | Arquitetura v3.0, segurança |
-| `OPERATION_MANUAL_v3.md` | CLI, dashboard v3.0 |
+| `IMPLEMENTATION_GUIDE_v2.md` | Arquitetura v3.0, segurança (desatualizado) |
+| `OPERATION_MANUAL_v2.md` | CLI, dashboard v3.0 (desatualizado) |
 | `dependencias.txt` | Bibliotecas |
 
 ---
 
 ## Versão
 
-- **Versão atual**: 3.0.0
-- **Data**: 2026-04-20
-- **Status**: Production-ready
+- **Versão atual**: 3.1.0
+- **Data**: 2026-07-15
+- **Status**: Production-ready (security hardened)
 - **Compatibilidade**: ESP32, Arduino Uno/Mega
+
+---
+
+## Changelog
+
+### v3.1.0 (2026-07-15) — Security Hardening
+- **Criptografia**: AES-GCM real (mbedtls) substitui AES-CTR+HMAC caseiro
+- **Key Derivation**: PBKDF2-HMAC-SHA256 (100k iters) substitui LCG (5k iters)
+- **RNG**: Hardware RNG (`esp_fill_random`) substitui LCG
+- **Telnet**: Auth com username+senha; session timeout; brute force blocking por IP
+- **Credenciais**: Removidas do código e README — geradas aleatoriamente no 1º boot
+- **TOTP**: Secret gerado via hardware RNG
+- **Anti-Replay**: Reset periódico removido (era janela de 60s)
+- **Rate Limiter**: IP tracking removido (apenas hash anônimo)
+- **Encrypt-at-Rest**: AES-256-GCM (antes: AES-CTR quebrado + XOR+ROT13)
+- **HTTP**: Validação de parâmetros no endpoint /sintonizar
+- **Git**: Build artifacts adicionados ao .gitignore
+- **Hex fix**: `0xHEF3` inválido → `0x1EF3`
+
+### v3.0.0 (2026-04-20)
+- AES-GCM, anti-replay, TOTP 2FA, secure storage
