@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <esp_random.h>
 #include <mbedtls/md.h>
 
 #define TOTP_SECRET_MAX 32
@@ -78,6 +79,13 @@ private:
 public:
     TOTPAuth() : secret_len(0) {
         memset(secret, 0, TOTP_SECRET_MAX);
+    }
+
+    // Gera segredo aleatório via hardware RNG
+    void generateRandomSecret() {
+        uint8_t raw[20];
+        esp_fill_random(raw, sizeof(raw));
+        setSecretRaw(raw, sizeof(raw));
     }
 
     // Configura segredo (base32 encoded)

@@ -8,13 +8,11 @@
 #include <stdint.h>
 #include <string.h>
 
-#define MAX_CLIENTS 8            // Aumentado de 5 para 8
+#define MAX_CLIENTS 8
 #define MAX_COMMANDS_PER_MINUTE 30
 #define COMMAND_COOLDOWN_MS 100
-#define IP_STRING_SIZE 16      // Tamanho max para string IP
 
 struct ClientQuota {
-  char ip_string[IP_STRING_SIZE];  // IP real como string (IPv4)
   uint32_t ip_hash;
   uint32_t command_count;
   unsigned long last_reset;
@@ -31,7 +29,6 @@ public:
   RateLimiter() {
     for (int i = 0; i < MAX_CLIENTS; i++) {
       clients[i].active = false;
-      memset(clients[i].ip_string, 0, IP_STRING_SIZE);
     }
   }
 
@@ -41,7 +38,7 @@ public:
     if (!ip) return 0;
     
     uint32_t hash = 5381;
-    for (int i = 0; ip[i] != '\0' && i < IP_STRING_SIZE - 1; i++) {
+    for (int i = 0; ip[i] != '\0' && i < 15; i++) {
       hash = ((hash << 5) + hash) + ip[i];
     }
     return hash;
@@ -50,11 +47,11 @@ public:
   // NOVO v3.0: Versão que aceita string IP diretamente
   bool allowCommand(const char* client_ip) {
     if (!client_ip) return false;
-    return allowCommandByHash(hashIP(client_ip), client_ip);
+    return allowCommandByHash(hashIP(client_ip));
   }
 
   // Overload com IP string - VERSÃO CORRIGIDA v3.0
-  bool allowCommandByHash(uint32_t client_hash, const char* ip_string = NULL) {
+  bool allowCommandByHash(uint32_t client_hash) {
     unsigned long now = millis();
     int slot = -1;
     
@@ -112,7 +109,6 @@ public:
   void removeClient(uint32_t client_hash) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
       if (clients[i].active && clients[i].ip_hash == client_hash) {
-        memset(clients[i].ip_string, 0, IP_STRING_SIZE);
         clients[i].active = false;
         break;
       }
