@@ -8,7 +8,7 @@
 
 #include <EEPROM.h>
 #include <string.h>
-#include <esp32/rom/rtc.h>
+#include <esp_random.h>
 #include <WiFi.h>
 
 #define EEPROM_SIZE 512
@@ -51,33 +51,24 @@ private:
   bool initialized = false;
 
   void generateUniqueKeys() {
-    uint32_t seed = 0;
-    seed |= (ESP.getEfuseMac() >> 32) & 0xFFFFFFFF;
-    seed ^= rtc_get_reset_reason(0);
-    seed ^= ESP.getFreeHeap();
-    seed ^= millis();
-
-    for (int i = 0; i < AES_KEY_SIZE; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
-      config.aes_key[i] = (seed >> (i % 8)) & 0xFF;
-    }
-
-    for (int i = 0; i < AES_IV_SIZE; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
-      config.aes_iv[i] = (seed >> (i % 8)) & 0xFF;
-    }
-
+    esp_fill_random(config.aes_key, AES_KEY_SIZE);
+    esp_fill_random(config.aes_iv, AES_IV_SIZE);
     config.flags |= FLAG_KEYS_GENERATED;
   }
 
   void generateSecurePassword(char* dest, int size) {
     const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
-    uint32_t seed = ESP.getEfuseMac();
-    seed ^= millis();
-
-    for (int i = 0; i < size - 1; i++) {
-      seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
-      dest[i] = charset[seed % strlen(charset)];
+    int charset_len = strlen(charset);
+    uint8_t rand_buf[64];
+    int needed = size - 1;
+    int offset = 0;
+    while (needed > 0) {
+      int chunk = needed < (int)sizeof(rand_buf) ? needed : (int)sizeof(rand_buf);
+      esp_fill_random(rand_buf, chunk);
+      for (int i = 0; i < chunk; i++) {
+        dest[offset++] = charset[rand_buf[i] % charset_len];
+      }
+      needed -= chunk;
     }
     dest[size - 1] = '\0';
   }
@@ -111,20 +102,13 @@ public:
   }
 
   void loadDefaults() {
-    config.magic = EEPROM_MAGIC_V3;  // v3.0
+    config.magic = EEPROM_MAGIC_V3;
     config.version = 3;
     config.flags = 0;
-    
-    const uint8_t default_key[] = {0x48, 0x65, 0x66, 0x65, 0x73, 0x74, 0x6F, 0x73,
-                                0x54, 0x61, 0x63, 0x74, 0x69, 0x63, 0x61, 0x00};
-    const uint8_t default_iv[] = {0x56, 0x65, 0x74, 0x6F, 0x72, 0x49, 0x6E, 0x69,
-                               0x63, 0x69, 0x61, 0x6C, 0x69, 0x7A, 0x61, 0x64};
-    
-    memcpy(config.aes_key, default_key, AES_KEY_SIZE);
-    memcpy(config.aes_iv, default_iv, AES_IV_SIZE);
-    strncpy(config.wifi_pass, "Hefestos2024!SecureNet", WIFI_PASS_SIZE - 1);
-    strncpy(config.cli_pass, "HefestosTactical@2024", CLI_PASS_SIZE - 1);
-    strncpy(config.cli_user, "admin", CLI_USER_SIZE - 1);  // v3.0: Default user
+    generateUniqueKeys();
+    generateSecurePassword(config.wifi_pass, WIFI_PASS_SIZE);
+    generateSecurePassword(config.cli_pass, CLI_PASS_SIZE);
+    strncpy(config.cli_user, "admin", CLI_USER_SIZE - 1);
   }
 
   void load() {

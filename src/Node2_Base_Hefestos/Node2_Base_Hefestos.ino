@@ -3,7 +3,8 @@
 #include <WiFi.h>
 #include <sys/time.h>
 
-void processCommand();
+void processCommand(String cmd);
+void processAuth();
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <LoRa.h>
@@ -51,7 +52,43 @@ struct TelnetState {
   bool authenticated;
   int auth_attempts;
   String username;
-} telnet_state = {false, 0, ""};
+  unsigned long last_activity;
+  unsigned long session_start;
+} telnet_state = {false, 0, "", 0, 0};
+
+#define SESSION_IDLE_TIMEOUT 60000
+#define SESSION_ABSOLUTE_TIMEOUT 300000
+#define MAX_AUTH_ATTEMPTS 3
+#define BLOCK_DURATION 1800000
+
+struct BlockedIP {
+  IPAddress ip;
+  unsigned long blocked_since;
+};
+BlockedIP blocked_ips[8];
+int blocked_count = 0;
+
+bool isIPBlocked(IPAddress ip) {
+  unsigned long now = millis();
+  for (int i = 0; i < blocked_count; i++) {
+    if (blocked_ips[i].ip == ip) {
+      if (now - blocked_ips[i].blocked_since > BLOCK_DURATION) {
+        blocked_ips[i] = blocked_ips[--blocked_count];
+        return false;
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+void blockIP(IPAddress ip) {
+  if (blocked_count < 8) {
+    blocked_ips[blocked_count].ip = ip;
+    blocked_ips[blocked_count].blocked_since = millis();
+    blocked_count++;
+  }
+}
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head><title>HEFESTOS SIGINT v3.0</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:monospace;background:#050505;color:#0f0;text-align:center;padding:10px}.card{background:#111;border:1px solid #0f0;padding:15px;margin:10px auto;width:90%;max-width:700px;border-radius:8px;text-align:left}.terminal{background:#000;color:#0f0;border:1px solid #333;padding:10px;height:150px;overflow-y:scroll;font-size:0.9em;margin-top:10px}.bar-bg{background:#333;height:20px;width:100%;border-radius:5px;margin-top:5px}.bar-fill{background:#0f0;height:100%;width:0%;transition:0.3s}button,select,input{background:#000;color:#0f0;border:1px solid #0f0;padding:8px;margin:5px}button{cursor:pointer;font-weight:bold}button:hover{background:#0f0;color:#000}.alert{color:#ff3333;font-weight:bold}.stats{color:#ffff00;font-size:0.8em}</style></head><body><h2>[ HEFESTOS SIGINT v3.0 ]</h2><div class="card"><h3>[+] Status Operacional</h3><p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p><p>Alvo: <span id="msg">--</span></p><p>RSSI: <span id="rssi">0</span> dBm</p><div class="bar-bg"><div id="rssi-bar" class="bar-fill"></div></div><button onclick="abrirMapa()">MAPEAR COORDENADAS</button></div><div class="card"><h3>[!] Sniffer RF</h3><div class="terminal" id="terminal-log">Aguardando...<br></div></div><div class="card"><h3>[*] Interceptacao Audio</h3><select id="band-input"><option value="FM">FM</option><option value="AM">AM</option><option value="SW">SW</option></select><input type="number" id="freq-input" step="0.1" value="100.1"><button onclick="sintonizar()">SINTONIZAR</button></div><script>setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{document.getElementById("msg").innerText=d.mensagem;document.getElementById("rssi").innerText=d.rssi;document.getElementById("rx-count").innerText=d.rx_count;document.getElementById("gcm-ok").innerText=d.gcm_ok;document.getElementById("gcm-fail").innerText=d.gcm_fail;document.getElementById("replay").innerText=d.replay_count;var p=Math.min(100,Math.max(0,(d.rssi+100)*2));document.getElementById("rssi-bar").style.width=p+"%";if(d.log){document.getElementById("terminal-log").innerHTML=d.log}})});setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{if(d.log){document.getElementById("terminal-log").innerHTML=d.log}})},2000);function abrirMapa(){var m=document.getElementById("msg").innerText.match(/Lat:([^|]+).*Lon:([^|]+)/);if(m)window.open("https://maps.google.com/maps?q="+m[1]+","+m[2])}function sintonizar(){var b=document.getElementById("band-input").value;var f=document.getElementById("freq-input").value;fetch("/sintonizar?b="+b+"&f="+f).then(r=>r.text()).then(alert)}
@@ -109,6 +146,14 @@ void setup() {
     if (request->hasParam("b") && request->hasParam("f")) {
       String b = request->getParam("b")->value();
       float f = request->getParam("f")->value().toFloat();
+      if (b != "FM" && b != "AM" && b != "SW") {
+        request->send(400, "text/plain", "Banda invalida");
+        return;
+      }
+      if (f < 0.1 || f > 30000.0) {
+        request->send(400, "text/plain", "Frequencia invalida");
+        return;
+      }
       currentBand = b;
       currentFreq = f;
       if (b == "FM") radioRX.setFM(8400, 10800, f * 100, 10);
@@ -128,10 +173,22 @@ void loop() {
   if (shellServer.hasClient()) {
     if (!shellClient || !shellClient.connected()) {
       if (shellClient) shellClient.stop();
-      shellClient = shellServer.available();
+      WiFiClient newClient = shellServer.available();
+
+      if (isIPBlocked(newClient.remoteIP())) {
+        newClient.println("\r\n=== HEFESTOS SIGINT v3.0 ===");
+        newClient.println("IP temporariamente bloqueado.");
+        delay(100);
+        newClient.stop();
+        return;
+      }
+
+      shellClient = newClient;
       telnet_state.authenticated = false;
       telnet_state.auth_attempts = 0;
-      
+      telnet_state.last_activity = millis();
+      telnet_state.session_start = 0;
+
       shellClient.println("\r\n=== HEFESTOS SIGINT v3.0 ===");
       shellClient.println("Seguranca: AES-GCM + Anti-Replay");
       shellClient.println("Usuario:");
@@ -139,17 +196,33 @@ void loop() {
     }
   }
 
-  if (shellClient && shellClient.connected() && shellClient.available()) {
-    char c = shellClient.read();
-    if (c == '\n' || c == '\r') {
-      processCommand();
-      if (shellClient.connected()) {
-        shellClient.print("hefestos@base:~# ");
+  if (shellClient && shellClient.connected()) {
+    unsigned long now = millis();
+
+    if (telnet_state.authenticated) {
+      if (now - telnet_state.last_activity > SESSION_IDLE_TIMEOUT ||
+          now - telnet_state.session_start > SESSION_ABSOLUTE_TIMEOUT) {
+        shellClient.println("\r\n[SESSION EXPIRED]");
+        shellClient.stop();
+        telnet_state.authenticated = false;
+        return;
       }
-    } else if (c >= 32) {
-      static String cmd = "";
-      cmd += c;
-      if (cmd.length() > 64) cmd = "";
+    }
+
+    if (shellClient.available()) {
+      if (!telnet_state.authenticated) {
+        processAuth();
+      } else {
+        String cmdLine = shellClient.readStringUntil('\n');
+        cmdLine.trim();
+        if (cmdLine.length() > 0) {
+          telnet_state.last_activity = millis();
+          processCommand(cmdLine);
+        }
+        if (shellClient.connected()) {
+          shellClient.print("hefestos@base:~# ");
+        }
+      }
     }
   }
 
@@ -186,45 +259,74 @@ void loop() {
   }
 }
 
-void processCommand() {
+void processAuth() {
   static String input = "";
   static String password = "";
   static bool waiting_password = false;
-  
-  if (!shellClient.available()) return;
-  
+
   while (shellClient.available()) {
     char c = shellClient.read();
     if (c == '\n' || c == '\r') {
-      if (!telnet_state.authenticated) {
-        if (!waiting_password) {
-          telnet_state.username = input;
-          waiting_password = true;
-          shellClient.print("Senha: ");
+      if (!waiting_password) {
+        telnet_state.username = input;
+        waiting_password = true;
+        shellClient.print("Senha: ");
+      } else {
+        password = input;
+        const char* stored_user = config.getCLIUsername();
+        const char* stored_pass = config.getCLIPassword();
+
+        if (telnet_state.username == config.getCLIUsername() && password == config.getCLIPassword()) {
+          telnet_state.authenticated = true;
+          telnet_state.session_start = millis();
+          telnet_state.last_activity = millis();
+          shellClient.println("\n[+] OK");
         } else {
-          password = input;
-          const char* stored_user = config.getCLIUsername();
-          const char* stored_pass = config.getCLIPassword();
-          
-          if (password == config.getCLIPassword()) {
-            telnet_state.authenticated = true;
-            shellClient.println("\n[+] OK");
+          telnet_state.auth_attempts++;
+          if (telnet_state.auth_attempts >= MAX_AUTH_ATTEMPTS) {
+            shellClient.println("BLOQUEADO");
+            blockIP(shellClient.remoteIP());
+            shellClient.stop();
           } else {
-            telnet_state.auth_attempts++;
-            if (telnet_state.auth_attempts >= 3) {
-              shellClient.println("BLOQUEADO");
-              shellClient.stop();
-            } else {
-              shellClient.println("NOVO");
-              shellClient.print("Usuario: ");
-            }
+            shellClient.println("NOVO");
+            shellClient.print("Usuario: ");
           }
         }
+        waiting_password = false;
       }
       input = "";
-    } else if (c >= 32) {
+    } else if (c >= 32 && c <= 126) {
       input += c;
-      shellClient.print(c);
+      if (waiting_password) {
+        shellClient.print("*");
+      } else {
+        shellClient.print(c);
+      }
     }
+  }
+}
+
+void processCommand(String cmd) {
+  if (cmd == "help") {
+    shellClient.println("Comandos: help, status, freq, band, sair");
+  } else if (cmd == "status") {
+    shellClient.printf("RX: %u | GCM OK: %u | FAIL: %u | REPLAY: %u\r\n",
+      packet_rx_count, gcm_valid_count, gcm_invalid_count, replay_count);
+    shellClient.printf("RSSI: %d dBm | Banda: %s | Freq: %.1f\r\n",
+      rssiLoRa, currentBand.c_str(), currentFreq);
+  } else if (cmd == "sair") {
+    shellClient.println("Encerrando sessao...");
+    shellClient.stop();
+    telnet_state.authenticated = false;
+  } else if (cmd.startsWith("freq ")) {
+    float f = cmd.substring(5).toFloat();
+    if (f > 0) { currentFreq = f; shellClient.printf("Freq: %.1f\r\n", f); }
+    else shellClient.println("Frequencia invalida");
+  } else if (cmd.startsWith("band ")) {
+    String b = cmd.substring(5);
+    if (b == "FM" || b == "AM" || b == "SW") { currentBand = b; shellClient.println("Banda: " + b); }
+    else shellClient.println("Banda invalida (FM/AM/SW)");
+  } else if (cmd.length() > 0) {
+    shellClient.println("Comando desconhecido. Digite 'help'.");
   }
 }

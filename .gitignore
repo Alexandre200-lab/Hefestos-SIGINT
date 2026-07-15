@@ -39,3 +39,13 @@
 
 # debug information files
 *.dwo
+
+# Build artifacts (ESP32/Arduino)
+**/build/
+*.bin
+*.elf
+*.map
+*.merged.bin
+sdkconfig
+partitions.csv
+flash_args

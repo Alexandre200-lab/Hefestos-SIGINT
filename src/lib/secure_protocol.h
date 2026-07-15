@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define SECURE_PROTOCOL_MAX_PAYLOAD 256
-#define SECURE_PROTOCOL_MAGIC 0xHEF3  // Magic para v3.0
+#define SECURE_PROTOCOL_MAGIC 0x1EF3  // Magic para v3.0
 
 // Estrutura do pacote seguro
 // [MAGIC(2)] [COUNTER(4)] [PAYLOAD(N)] [HMAC(8)]
@@ -52,13 +52,8 @@ public:
     }
 
     // Verifica se counter é válido (maior que último válido)
+    // Sem reset periódico — uint32_t não overflowa em uso real (2^32 a 1/min = 8000 anos)
     bool isValidCounter(uint32_t counter) {
-        // Reset periódico para previnir overflow
-        if (millis() - last_counter_reset > COUNTER_WINDOW) {
-            last_valid_counter = rx_counter - 1;
-            last_counter_reset = millis();
-        }
-
         return counter > last_valid_counter;
     }
 

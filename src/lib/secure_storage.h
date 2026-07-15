@@ -1,7 +1,3 @@
-// secure_storage.h - Secure Storage com Encrypt at Rest
-// Criptografa dados antes de gravar em SD Card ou EEPROM
-// Alternativa ao secure element (ATECC608A)
-
 #ifndef SECURE_STORAGE_H
 #define SECURE_STORAGE_H
 
@@ -9,57 +5,43 @@
 #include <string.h>
 #include <esp_timer.h>
 #include <mbedtls/aes.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/ccm.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
+#include <mbedtls/pkcs5.h>
 
-#define SECURE_STORAGE_KEY_SIZE 32  // 256-bit key
-#define SECURE_STORAGE_BLOCK 16       // AES block size
+#define SECURE_STORAGE_KEY_SIZE 32
+#define SECURE_STORAGE_IV_SIZE 12
+#define SECURE_STORAGE_TAG_SIZE 16
+#define SECURE_STORAGE_BLOCK 16
 
 class SecureStorage {
 private:
     unsigned char master_key[SECURE_STORAGE_KEY_SIZE];
     bool initialized;
 
-    mbedtls_aes_context aes_ctx;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context drbg;
-
-    // Deriva chave de uma senha usando PBKDF2-like
     void deriveKey(const char* password, unsigned char* output) {
-        int64_t us = esp_timer_get_time();
-        uint32_t seed = 0;
-        
-        for (int i = 0; password[i]; i++) {
-            seed = (seed * 31 + password[i]) & 0xFFFFFFFF;
-            output[i % SECURE_STORAGE_KEY_SIZE] ^= password[i];
-        }
-        seed ^= (uint32_t)(us >> 32);
-        seed ^= (uint32_t)us;
-
-        // 5000 rounds para resistencia a brute-force
-        for (int round = 0; round < 5000; round++) {
-            uint32_t s = seed ^ round;
-            for (int i = 0; i < SECURE_STORAGE_KEY_SIZE; i++) {
-                output[i] ^= ((s >> (i % 4)) & 0xFF);
-                s = (s * 1103515245 + 12345) & 0x7FFFFFFF;
-            }
-        }
+        const unsigned char salt[] = "Hefestos-Storage-v3";
+        mbedtls_md_context_t md_ctx;
+        mbedtls_md_init(&md_ctx);
+        mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+        mbedtls_pkcs5_pbkdf2_hmac(&md_ctx,
+            (const unsigned char*)password, strlen(password),
+            salt, sizeof(salt),
+            100000,
+            SECURE_STORAGE_KEY_SIZE, output);
+        mbedtls_md_free(&md_ctx);
     }
 
 public:
     SecureStorage() : initialized(false) {}
 
-    // Inicializa com senha
     bool begin(const char* password) {
         if (!password || strlen(password) < 8) return false;
-
         deriveKey(password, master_key);
         initialized = true;
         return true;
     }
 
-    // Inicializa com chave raw
     bool beginRaw(const unsigned char* key) {
         if (!key) return false;
         memcpy(master_key, key, SECURE_STORAGE_KEY_SIZE);
@@ -67,57 +49,40 @@ public:
         return true;
     }
 
-    // Criptografa dados (CTR mode)
     int encrypt(const unsigned char* input, int len, uint8_t* output, const unsigned char* iv) {
         if (!initialized) return -1;
-
-        size_t olen = 0;
-        mbedtls_aes_init(&aes_ctx);
-        mbedtls_aes_setkey_enc(&aes_ctx, master_key, 256);
-
-        int ret = mbedtls_aes_crypt_ctr(
-            &aes_ctx,
-            len,
-            &olen,
-            iv,
-            input,
-            output
-        );
-
-        mbedtls_aes_free(&aes_ctx);
-        return ret == 0 ? olen : -1;
+        unsigned char tag[SECURE_STORAGE_TAG_SIZE];
+        mbedtls_gcm_context ctx;
+        mbedtls_gcm_init(&ctx);
+        int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, master_key, 256);
+        if (ret != 0) { mbedtls_gcm_free(&ctx); return -1; }
+        ret = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT,
+            len, iv, SECURE_STORAGE_IV_SIZE, NULL, 0,
+            input, output, SECURE_STORAGE_TAG_SIZE, tag);
+        mbedtls_gcm_free(&ctx);
+        if (ret != 0) return -1;
+        memcpy(output + len, tag, SECURE_STORAGE_TAG_SIZE);
+        return len + SECURE_STORAGE_TAG_SIZE;
     }
 
-    // Descriptografa dados
     int decrypt(const unsigned char* input, int len, uint8_t* output, const unsigned char* iv) {
-        return encrypt(input, len, output, iv);  // CTR is symmetric
-    }
-
-    // Versão simples XOR+rot13 para Arduino (memória limitada)
-    int encryptSimple(const unsigned char* input, int len, uint8_t* output) {
         if (!initialized) return -1;
-
-        for (int i = 0; i < len; i++) {
-            output[i] = input[i] ^ master_key[i % SECURE_STORAGE_KEY_SIZE];
-            output[i] = ((output[i] >> 2) | (output[i] << 6)) & 0xFF;  // ROT2
-        }
-        return len;
-    }
-
-    int decryptSimple(const unsigned char* input, int len, uint8_t* output) {
-        if (!initialized) return -1;
-
-        for (int i = 0; i < len; i++) {
-            output[i] = ((input[i] << 2) | (input[i] >> 6)) & 0xFF;  // ROT2 inverso
-            output[i] = input[i] ^ master_key[i % SECURE_STORAGE_KEY_SIZE];
-        }
-        return len;
+        int ct_len = len - SECURE_STORAGE_TAG_SIZE;
+        if (ct_len < 0) return -1;
+        mbedtls_gcm_context ctx;
+        mbedtls_gcm_init(&ctx);
+        int ret = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, master_key, 256);
+        if (ret != 0) { mbedtls_gcm_free(&ctx); return -1; }
+        ret = mbedtls_gcm_auth_decrypt(&ctx, ct_len,
+            iv, SECURE_STORAGE_IV_SIZE, NULL, 0,
+            input + ct_len, SECURE_STORAGE_TAG_SIZE, input, output);
+        mbedtls_gcm_free(&ctx);
+        return (ret == 0) ? ct_len : -1;
     }
 
     bool isInitialized() { return initialized; }
 };
 
-// Helper para limpar dados sensíveis da memória
 class SecureMem {
 public:
     static void wipe(unsigned char* data, int len) {
@@ -136,4 +101,4 @@ public:
     }
 };
 
-#endif // SECURE_STORAGE_H
+#endif
