@@ -1,11 +1,64 @@
-# CHANGELOG - HEFESTOS SIGINT v3.0
+# CHANGELOG - HEFESTOS SIGINT v3.1
 
-## Data: 2026-04-20
-## Status: Security Update Complete
+## Data: 2026-07-15
+## Status: Security Hardening Complete
 
 ---
 
-## v3.0 - Security Critical Update
+## v3.1.0 - Security Hardening (2026-07-15)
+
+### Bibliotecas Reescritas
+
+| Biblioteca | Linhas | Mudança |
+|------------|--------|---------|
+| `crypto_gcm.h` | ~100 | mbedtls GCM real (antes: AES-CTR+HMAC caseiro) |
+| `secure_storage.h` | ~100 | PBKDF2 + AES-256-GCM (antes: LCG + XOR+ROT13) |
+| `config.h` | ~220 | esp_fill_random(); credenciais hardcoded removidas |
+| `rate_limiter.h` | ~125 | IP tracking removido (apenas hash) |
+| `secure_protocol.h` | ~135 | Reset periódico removido |
+| `totp_auth.h` | ~230 | generateRandomSecret() via HW RNG |
+
+### Correções de Segurança
+
+| # | Vulnerabilidade | Correção |
+|---|----------------|----------|
+| 1 | AES-GCM caseiro (CTR+HMAC, IV previsível) | mbedtls_gcm_crypt_and_tag AEAD |
+| 2 | Key derivation LCG 5k rounds | PBKDF2-HMAC-SHA256 100k rounds |
+| 3 | Geração de chaves via LCG | esp_fill_random() (hardware RNG) |
+| 4 | Telnet auth sem username | Username + senha verificados |
+| 5 | Replay window de 60s | Counter monotônico (sem reset) |
+| 6 | Credenciais hardcoded no código/README | Geradas aleatoriamente no 1º boot |
+| 7 | TOTP secret RFC test vector | Gerado via esp_fill_random() |
+| 8 | Buffer overflow potencial | Bounds check + GCM real (tamanhos fixos) |
+| 9 | IP tracking em plaintext | Apenas hash anônimo |
+| 10 | XOR+ROT13 pseudo-criptografia | Removido |
+| 11 | Sessão telnet sem timeout | 1min idle / 5min absoluto |
+| 12 | Brute force sem bloqueio de IP | IP bloqueado 30min após 3 tentativas |
+| 13 | HTTP sem validação de input | Range validado (banda/frequência) |
+| 14 | Build artifacts no repo | Adicionados ao .gitignore |
+| 15 | Hex literal inválido 0xHEF3 | Corrigido para 0x1EF3 |
+
+### Arquivos Modificados
+
+| Arquivo | Mudanças |
+|---------|----------|
+| `src/lib/config.h` | loadDefaults() segura; esp_fill_random(); includes |
+| `src/lib/crypto_gcm.h` | **Reescrito** com mbedtls GCM; SecurePacket removido |
+| `src/lib/secure_storage.h` | **Reescrito** com PBKDF2 + AES-256-GCM |
+| `src/lib/secure_protocol.h` | Reset periódico removido; 0xHEF3 → 0x1EF3 |
+| `src/lib/rate_limiter.h` | ip_string removido; parâmetros limpos |
+| `src/lib/totp_auth.h` | generateRandomSecret(); include esp_random.h |
+| `src/Node2_Base_Hefestos.ino` | Auth fix; session timeout; brute force; sanitização |
+| `.gitignore` | Build artifacts adicionados |
+| `README.md` | Atualizado para v3.1 |
+
+### Aviso
+Credenciais anteriores foram removidas do código. Faça factoryReset() se atualizando de v3.0.  
+Histórico git contém credenciais expostas — use BFG Repo-Cleaner para purgar.
+
+---
+
+## v3.0 - Security Critical Update (2026-04-20)
 
 ### Novas Bibliotecas Criadas
 
@@ -69,5 +122,5 @@
 
 ## Versão
 
-- **Atual**: 3.0.0
-- **Data**: 2026-04-20
+- **Atual**: 3.1.0
+- **Data**: 2026-07-15
