@@ -40,6 +40,7 @@ DebugLogger debug;
 RateLimiter rateLimiter;
 SecureProtocol secProto;
 AESGCM aesgcm;
+PacketHistory packetHistory;
 
 uint8_t aes_key[16];
 SI4735 radioRX;
@@ -233,15 +234,29 @@ void loop() {
     rssiLoRa = LoRa.packetRssi();
 
     uint8_t decrypted[256];
-    uint32_t counter;
-    int decLen = aesgcm.decrypt(buffer, len, decrypted, &counter);
+    int decLen = aesgcm.decrypt(buffer, len, decrypted);
 
     if (decLen > 0) {
+      uint32_t counter;
+      memcpy(&counter, buffer, 4);
+
       if (!secProto.isValidCounter(counter)) {
-        replay_count++;
-        debug.logf("REPLAY DETECTADO #%u", counter);
+        if (packetHistory.isDuplicate(counter)) {
+          replay_count++;
+          debug.logf("REPLAY DETECTADO #%u", counter);
+        } else {
+          debug.logf("RESYNC #%u (reboot detectado)", counter);
+          secProto.updateValidCounter(counter);
+          packetHistory.add(counter);
+          gcm_valid_count++;
+          mensagemAlvo = String((char*)decrypted);
+          if (mensagemAlvo.startsWith("ALVO_")) {
+            packet_rx_count++;
+          }
+        }
       } else {
         secProto.updateValidCounter(counter);
+        packetHistory.add(counter);
         gcm_valid_count++;
         
         mensagemAlvo = String((char*)decrypted);
@@ -251,8 +266,6 @@ void loop() {
           debug.logf("RX #%u: %s (GCM OK)", counter, mensagemAlvo.c_str());
         }
       }
-    } else if (decLen == -2) {
-      replay_count++;
     } else {
       gcm_invalid_count++;
     }

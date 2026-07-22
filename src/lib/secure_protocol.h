@@ -71,6 +71,12 @@ public:
         }
     }
 
+    // Define counter (ex: após carregar da EEPROM)
+    void setCounter(uint32_t counter) {
+        tx_counter = counter;
+        last_valid_counter = counter;
+    }
+
     // getters
     uint32_t getTXCounter() { return tx_counter; }
     uint32_t getRXCounter() { return rx_counter; }
@@ -94,7 +100,7 @@ public:
 // Buffer circular para últimos pacotes (detecção de duplicatas)
 class PacketHistory {
 private:
-    static const int HISTORY_SIZE = 32;
+    static const int HISTORY_SIZE = 256;
     uint32_t counters[HISTORY_SIZE];
     int head;
     int count;

@@ -7,6 +7,7 @@
 #include <Wire.h>
 #include <Adafruit_Si4713.h>
 
+#include <EEPROM.h>
 #include "../lib/config.h"
 #include "../lib/crypto_gcm.h"
 #include "../lib/secure_protocol.h"
@@ -19,6 +20,8 @@
 #define FM_FREQ 10010
 
 #define GPS_POLL_INTERVAL 1000
+#define EEPROM_COUNTER_ADDR 0x100
+#define TX_SAVE_INTERVAL 10
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
@@ -44,6 +47,16 @@ void setup() {
   memcpy(aes_key, config.getAESKey(), 16);
   aesgcm.setKey(aes_key, 16);
 
+  secProto.begin(0xDEADBEEF);
+
+  uint32_t saved;
+  EEPROM.get(EEPROM_COUNTER_ADDR, saved);
+  if (saved != 0xFFFFFFFF && saved != 0) {
+    secProto.setCounter(saved);
+    debug.logf("Counter loaded from EEPROM: %u", saved);
+  }
+  debug.logf("Counter init: %u", secProto.getTXCounter());
+
   SerialGPS.begin(9600, SERIAL_8N1, 16, 17);
 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
@@ -51,9 +64,6 @@ void setup() {
   LoRa.setSpreadingFactor(10);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setTxPower(20);
-  
-  secProto.begin(0xDEADBEEF);
-  debug.logf("Counter init: %u", secProto.getTXCounter());
 
   radioTX.begin();
   radioTX.powerUp();
@@ -94,6 +104,11 @@ void loop() {
       LoRa.beginPacket();
       LoRa.write(output, outLen);
       LoRa.endPacket();
+
+      if (counter % TX_SAVE_INTERVAL == 0) {
+        EEPROM.put(EEPROM_COUNTER_ADDR, counter);
+        EEPROM.commit();
+      }
 
       if (DEBUG_MODE) {
         debug.logf("TX #%u: %s,%s (GCM OK)", counter, latStr, lonStr);

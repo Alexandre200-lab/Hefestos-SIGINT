@@ -57,7 +57,7 @@ public:
         return GCM_IV_SIZE + len + GCM_TAG_SIZE;
     }
 
-    int decrypt(const unsigned char* input, int len, unsigned char* output, uint32_t* last_counter) {
+    int decrypt(const unsigned char* input, int len, unsigned char* output) {
         if (len < GCM_IV_SIZE + GCM_TAG_SIZE) return -1;
 
         int ct_len = len - GCM_IV_SIZE - GCM_TAG_SIZE;
@@ -65,12 +65,6 @@ public:
 
         unsigned char iv[GCM_IV_SIZE];
         memcpy(iv, input, GCM_IV_SIZE);
-
-        uint32_t packet_counter;
-        memcpy(&packet_counter, iv, 4);
-        if (last_counter && packet_counter <= *last_counter) {
-            return -2;
-        }
 
         unsigned char tag[GCM_TAG_SIZE];
         memcpy(tag, input + GCM_IV_SIZE + ct_len, GCM_TAG_SIZE);
@@ -91,9 +85,6 @@ public:
 
         if (ret != 0) return -1;
 
-        if (last_counter) {
-            *last_counter = packet_counter;
-        }
         return ct_len;
     }
 };
