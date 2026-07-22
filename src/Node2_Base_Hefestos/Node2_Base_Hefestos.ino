@@ -55,18 +55,23 @@ struct TelnetState {
   String username;
   unsigned long last_activity;
   unsigned long session_start;
-} telnet_state = {false, 0, "", 0, 0};
+  String auth_input;
+  String auth_password;
+  bool waiting_password;
+} telnet_state = {false, 0, "", 0, 0, "", "", false};
 
 #define SESSION_IDLE_TIMEOUT 60000
 #define SESSION_ABSOLUTE_TIMEOUT 300000
 #define MAX_AUTH_ATTEMPTS 3
 #define BLOCK_DURATION 1800000
+#define MAX_BLOCKED_IPS 16
+#define EEPROM_BLOCKED_ADDR 0x110
 
 struct BlockedIP {
   IPAddress ip;
   unsigned long blocked_since;
 };
-BlockedIP blocked_ips[8];
+BlockedIP blocked_ips[MAX_BLOCKED_IPS];
 int blocked_count = 0;
 
 bool isIPBlocked(IPAddress ip) {
@@ -84,10 +89,57 @@ bool isIPBlocked(IPAddress ip) {
 }
 
 void blockIP(IPAddress ip) {
-  if (blocked_count < 8) {
+  if (blocked_count < MAX_BLOCKED_IPS) {
     blocked_ips[blocked_count].ip = ip;
     blocked_ips[blocked_count].blocked_since = millis();
     blocked_count++;
+  } else {
+    int oldest = 0;
+    for (int i = 1; i < MAX_BLOCKED_IPS; i++) {
+      if (blocked_ips[i].blocked_since < blocked_ips[oldest].blocked_since) {
+        oldest = i;
+      }
+    }
+    debug.logf("BLOCK LRU: substituindo slot %d", oldest);
+    blocked_ips[oldest].ip = ip;
+    blocked_ips[oldest].blocked_since = millis();
+  }
+  persistBlockedIPs();
+}
+
+void persistBlockedIPs() {
+  EEPROM.write(EEPROM_BLOCKED_ADDR, blocked_count);
+  for (int i = 0; i < blocked_count; i++) {
+    for (int j = 0; j < 4; j++) {
+      EEPROM.write(EEPROM_BLOCKED_ADDR + 1 + i * 4 + j, blocked_ips[i].ip[j]);
+    }
+  }
+  EEPROM.commit();
+}
+
+void loadBlockedIPs() {
+  blocked_count = EEPROM.read(EEPROM_BLOCKED_ADDR);
+  if (blocked_count > MAX_BLOCKED_IPS) blocked_count = 0;
+  for (int i = 0; i < blocked_count; i++) {
+    for (int j = 0; j < 4; j++) {
+      blocked_ips[i].ip[j] = EEPROM.read(EEPROM_BLOCKED_ADDR + 1 + i * 4 + j);
+    }
+    blocked_ips[i].blocked_since = 0;
+  }
+  debug.logf("Loaded %d blocked IPs from EEPROM", blocked_count);
+}
+
+void cleanupBlockedIPs() {
+  unsigned long now = millis();
+  bool changed = false;
+  for (int i = blocked_count - 1; i >= 0; i--) {
+    if (now - blocked_ips[i].blocked_since > BLOCK_DURATION) {
+      blocked_ips[i] = blocked_ips[--blocked_count];
+      changed = true;
+    }
+  }
+  if (changed && blocked_count > 0) {
+    persistBlockedIPs();
   }
 }
 
@@ -105,6 +157,8 @@ void setup() {
   aesgcm.setKey(aes_key, 16);
 
   SerialArduino.begin(9600, SERIAL_8N1, 16, 17);
+
+  loadBlockedIPs();
 
   const char* wifi_pass = config.getWiFiPassword();
   WiFi.softAP("Hefestos-SIGINT", wifi_pass, 1, false, 4);
@@ -189,6 +243,9 @@ void loop() {
       telnet_state.auth_attempts = 0;
       telnet_state.last_activity = millis();
       telnet_state.session_start = 0;
+      telnet_state.waiting_password = false;
+      telnet_state.auth_input = "";
+      telnet_state.auth_password = "";
 
       shellClient.println("\r\n=== HEFESTOS SIGINT v3.0 ===");
       shellClient.println("Seguranca: AES-GCM + Anti-Replay");
@@ -273,23 +330,19 @@ void loop() {
 }
 
 void processAuth() {
-  static String input = "";
-  static String password = "";
-  static bool waiting_password = false;
-
   while (shellClient.available()) {
     char c = shellClient.read();
     if (c == '\n' || c == '\r') {
-      if (!waiting_password) {
-        telnet_state.username = input;
-        waiting_password = true;
+      if (!telnet_state.waiting_password) {
+        telnet_state.username = telnet_state.auth_input;
+        telnet_state.waiting_password = true;
         shellClient.print("Senha: ");
       } else {
-        password = input;
+        telnet_state.auth_password = telnet_state.auth_input;
         const char* stored_user = config.getCLIUsername();
         const char* stored_pass = config.getCLIPassword();
 
-        if (telnet_state.username == config.getCLIUsername() && password == config.getCLIPassword()) {
+        if (telnet_state.username == config.getCLIUsername() && telnet_state.auth_password == config.getCLIPassword()) {
           telnet_state.authenticated = true;
           telnet_state.session_start = millis();
           telnet_state.last_activity = millis();
@@ -305,12 +358,12 @@ void processAuth() {
             shellClient.print("Usuario: ");
           }
         }
-        waiting_password = false;
+        telnet_state.waiting_password = false;
       }
-      input = "";
+      telnet_state.auth_input = "";
     } else if (c >= 32 && c <= 126) {
-      input += c;
-      if (waiting_password) {
+      telnet_state.auth_input += c;
+      if (telnet_state.waiting_password) {
         shellClient.print("*");
       } else {
         shellClient.print(c);
