@@ -83,9 +83,13 @@ public:
 
   void printMemory() {
     if (!enabled) return;
+#if defined(ESP32)
     port->print("[MEM] Free: ");
     port->print(ESP.getFreeHeap());
     port->println(" bytes");
+#else
+    port->println("[MEM] Not available on this platform");
+#endif
   }
 
   void enable() { enabled = true; }

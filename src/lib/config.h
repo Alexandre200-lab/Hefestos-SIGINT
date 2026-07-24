@@ -162,8 +162,8 @@ public:
     EEPROM.commit();
   }
 
-  uint8_t* getAESKey() { return config.aes_key; }
-  uint8_t* getAESIV() { return config.aes_iv; }
+  const uint8_t* getAESKey() const { return config.aes_key; }
+  const uint8_t* getAESIV() const { return config.aes_iv; }
   const char* getWiFiPassword() { return config.wifi_pass; }
   const char* getCLIPassword() { return config.cli_pass; }
   const char* getCLIUsername() { return config.cli_user; }  // NOVO v3.0

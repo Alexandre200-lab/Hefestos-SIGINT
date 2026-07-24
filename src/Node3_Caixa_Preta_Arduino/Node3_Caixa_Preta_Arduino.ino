@@ -4,8 +4,8 @@
 #include <SPI.h>
 #include <SD.h>
 
-#include "src/serial_protocol.h"
-#include "src/debug.h"
+#include "../../lib/serial_protocol.h"
+#include "../../lib/debug.h"
 
 SoftwareSerial SerialESP(2, 3);
 

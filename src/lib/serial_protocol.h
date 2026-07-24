@@ -28,9 +28,6 @@ public:
     return crc;
   }
 
-  static bool verify(const uint8_t* data, int len, uint16_t expected) {
-    return calculate(data, len - 2) == expected;
-  }
 };
 
 // Frame Structure:
@@ -116,7 +113,7 @@ public:
   }
 
   // Envia dados com retry
-  void sendWithRetry(HardwareSerial& serial, const uint8_t* data, int len, int max_retries = 3) {
+  void sendWithRetry(Stream& serial, const uint8_t* data, int len, int max_retries = 3) {
     uint8_t frame[len + 8];
     int frame_len = encodeFrame(FRAME_DATA, data, len, frame);
 
@@ -128,7 +125,7 @@ public:
   }
 
   // Detecta heartbeat quando inativo
-  void sendHeartbeat(HardwareSerial& serial) {
+  void sendHeartbeat(Stream& serial) {
     unsigned long now = millis();
     if (now - last_heartbeat > HEARTBEAT_INTERVAL) {
       uint8_t frame[8];

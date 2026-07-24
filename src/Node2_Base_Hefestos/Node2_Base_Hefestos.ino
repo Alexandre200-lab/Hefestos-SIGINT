@@ -1,7 +1,8 @@
-// Node 2: Servidor Base Hefestos (ESP32) - v3.0
-// Segurança: AES-GCM + Nonce/Counter + Rate Limit com IP real
+// Node 2: Hefestos Base Server (ESP32) - v3.1
+// Security: AES-GCM + Nonce/Counter + Rate Limit + Anti-Brute-Force
 #include <WiFi.h>
 #include <sys/time.h>
+#include <esp_task_wdt.h>
 
 void processCommand(String cmd);
 void processAuth();
@@ -24,10 +25,8 @@ void processAuth();
 #define LORA_DIO0 26
 #define RX_RST 12
 
-String mensagemAlvo = "Aguardando sincronizacao...";
-String ultimoSniff = "Nenhum trafego detectado";
+String targetMessage = "Aguardando sincronizacao...";
 int rssiLoRa = 0;
-String logWireshark = "";
 String currentBand = "FM";
 float currentFreq = 100.1;
 uint32_t packet_rx_count = 0;
@@ -37,7 +36,6 @@ uint32_t replay_count = 0;
 
 ConfigManager config;
 DebugLogger debug;
-RateLimiter rateLimiter;
 SecureProtocol secProto;
 AESGCM aesgcm;
 PacketHistory packetHistory;
@@ -45,7 +43,6 @@ PacketHistory packetHistory;
 uint8_t aes_key[16];
 SI4735 radioRX;
 AsyncWebServer server(80);
-HardwareSerial SerialArduino(2);
 WiFiServer shellServer(23);
 WiFiClient shellClient;
 
@@ -144,10 +141,13 @@ void cleanupBlockedIPs() {
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html><head><title>HEFESTOS SIGINT v3.0</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:monospace;background:#050505;color:#0f0;text-align:center;padding:10px}.card{background:#111;border:1px solid #0f0;padding:15px;margin:10px auto;width:90%;max-width:700px;border-radius:8px;text-align:left}.terminal{background:#000;color:#0f0;border:1px solid #333;padding:10px;height:150px;overflow-y:scroll;font-size:0.9em;margin-top:10px}.bar-bg{background:#333;height:20px;width:100%;border-radius:5px;margin-top:5px}.bar-fill{background:#0f0;height:100%;width:0%;transition:0.3s}button,select,input{background:#000;color:#0f0;border:1px solid #0f0;padding:8px;margin:5px}button{cursor:pointer;font-weight:bold}button:hover{background:#0f0;color:#000}.alert{color:#ff3333;font-weight:bold}.stats{color:#ffff00;font-size:0.8em}</style></head><body><h2>[ HEFESTOS SIGINT v3.0 ]</h2><div class="card"><h3>[+] Status Operacional</h3><p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p><p>Alvo: <span id="msg">--</span></p><p>RSSI: <span id="rssi">0</span> dBm</p><div class="bar-bg"><div id="rssi-bar" class="bar-fill"></div></div><button onclick="abrirMapa()">MAPEAR COORDENADAS</button></div><div class="card"><h3>[!] Sniffer RF</h3><div class="terminal" id="terminal-log">Aguardando...<br></div></div><div class="card"><h3>[*] Interceptacao Audio</h3><select id="band-input"><option value="FM">FM</option><option value="AM">AM</option><option value="SW">SW</option></select><input type="number" id="freq-input" step="0.1" value="100.1"><button onclick="sintonizar()">SINTONIZAR</button></div><script>setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{document.getElementById("msg").innerText=d.mensagem;document.getElementById("rssi").innerText=d.rssi;document.getElementById("rx-count").innerText=d.rx_count;document.getElementById("gcm-ok").innerText=d.gcm_ok;document.getElementById("gcm-fail").innerText=d.gcm_fail;document.getElementById("replay").innerText=d.replay_count;var p=Math.min(100,Math.max(0,(d.rssi+100)*2));document.getElementById("rssi-bar").style.width=p+"%";if(d.log){document.getElementById("terminal-log").innerHTML=d.log}})});setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{if(d.log){document.getElementById("terminal-log").innerHTML=d.log}})},2000);function abrirMapa(){var m=document.getElementById("msg").innerText.match(/Lat:([^|]+).*Lon:([^|]+)/);if(m)window.open("https://maps.google.com/maps?q="+m[1]+","+m[2])}function sintonizar(){var b=document.getElementById("band-input").value;var f=document.getElementById("freq-input").value;fetch("/sintonizar?b="+b+"&f="+f).then(r=>r.text()).then(alert)}
+<!DOCTYPE HTML><html><head><title>HEFESTOS SIGINT v3.0</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:monospace;background:#050505;color:#0f0;text-align:center;padding:10px}.card{background:#111;border:1px solid #0f0;padding:15px;margin:10px auto;width:90%;max-width:700px;border-radius:8px;text-align:left}.terminal{background:#000;color:#0f0;border:1px solid #333;padding:10px;height:150px;overflow-y:scroll;font-size:0.9em;margin-top:10px}.bar-bg{background:#333;height:20px;width:100%;border-radius:5px;margin-top:5px}.bar-fill{background:#0f0;height:100%;width:0%;transition:0.3s}button,select,input{background:#000;color:#0f0;border:1px solid #0f0;padding:8px;margin:5px}button{cursor:pointer;font-weight:bold}button:hover{background:#0f0;color:#000}.alert{color:#ff3333;font-weight:bold}.stats{color:#ffff00;font-size:0.8em}</style></head><body><h2>[ HEFESTOS SIGINT v3.0 ]</h2><div class="card"><h3>[+] Status Operacional</h3><p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p><p>Alvo: <span id="msg">--</span></p><p>RSSI: <span id="rssi">0</span> dBm</p><div class="bar-bg"><div id="rssi-bar" class="bar-fill"></div></div><button onclick="abrirMapa()">MAPEAR COORDENADAS</button></div><div class="card"><h3>[!] Sniffer RF</h3><div class="terminal" id="terminal-log">Aguardando...<br></div></div><div class="card"><h3>[*] Interceptacao Audio</h3><select id="band-input"><option value="FM">FM</option><option value="AM">AM</option><option value="SW">SW</option></select><input type="number" id="freq-input" step="0.1" value="100.1"><button onclick="sintonizar()">SINTONIZAR</button></div><script>setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{document.getElementById("msg").innerText=d.mensagem;document.getElementById("rssi").innerText=d.rssi;document.getElementById("rx-count").innerText=d.rx_count;document.getElementById("gcm-ok").innerText=d.gcm_ok;document.getElementById("gcm-fail").innerText=d.gcm_fail;document.getElementById("replay").innerText=d.replay_count;var p=Math.min(100,Math.max(0,(d.rssi+100)*2));document.getElementById("rssi-bar").style.width=p+"%";if(d.log){document.getElementById("terminal-log").innerText=d.log}})});function abrirMapa(){var m=document.getElementById("msg").innerText.match(/Lat:([^|]+).*Lon:([^|]+)/);if(m)window.open("https://maps.google.com/maps?q="+encodeURIComponent(m[1])+","+encodeURIComponent(m[2]))}function sintonizar(){var b=document.getElementById("band-input").value;var f=document.getElementById("freq-input").value;fetch("/sintonizar?b="+b+"&f="+f).then(r=>r.text()).then(alert)}
 </script></body></html>)rawliteral";
 
 void setup() {
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+
   Serial.begin(115200);
   debug.begin(115200);
   debug.log("Node2 v3.0: Inicializando...");
@@ -155,8 +155,6 @@ void setup() {
   config.begin();
   memcpy(aes_key, config.getAESKey(), 16);
   aesgcm.setKey(aes_key, 16);
-
-  SerialArduino.begin(9600, SERIAL_8N1, 16, 17);
 
   loadBlockedIPs();
 
@@ -180,27 +178,41 @@ void setup() {
   radioRX.setVolume(50);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/html", index_html);
+    AsyncWebServerResponse *resp = request->beginResponse_P(200, "text/html", index_html);
+    resp->addHeader("Content-Security-Policy", "default-src 'self'");
+    resp->addHeader("X-Content-Type-Options", "nosniff");
+    resp->addHeader("X-Frame-Options", "DENY");
+    request->send(resp);
   });
 
   server.on("/dados", HTTP_GET, [](AsyncWebServerRequest *request) {
     DynamicJsonDocument doc(1024);
-    doc["mensagem"] = mensagemAlvo;
+    doc["mensagem"] = targetMessage;
     doc["rssi"] = rssiLoRa;
-    doc["log"] = logWireshark;
     doc["rx_count"] = packet_rx_count;
     doc["gcm_ok"] = gcm_valid_count;
     doc["gcm_fail"] = gcm_invalid_count;
     doc["replay_count"] = replay_count;
     String jsonOutput;
     serializeJson(doc, jsonOutput);
-    request->send(200, "application/json", jsonOutput);
+    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", jsonOutput);
+    resp->addHeader("Content-Security-Policy", "default-src 'self'");
+    resp->addHeader("X-Content-Type-Options", "nosniff");
+    request->send(resp);
   });
 
   server.on("/sintonizar", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("b") && request->hasParam("f")) {
       String b = request->getParam("b")->value();
+      if (b.length() > 10) {
+        request->send(400, "text/plain", "Parametro invalido");
+        return;
+      }
       float f = request->getParam("f")->value().toFloat();
+      if (isnan(f) || isinf(f)) {
+        request->send(400, "text/plain", "Frequencia invalida");
+        return;
+      }
       if (b != "FM" && b != "AM" && b != "SW") {
         request->send(400, "text/plain", "Banda invalida");
         return;
@@ -215,7 +227,9 @@ void setup() {
       else if (b == "AM") radioRX.setAM(520, 1710, f, 10);
       else if (b == "SW") radioRX.setAM(2300, 30000, f * 1000, 5);
     }
-    request->send(200, "text/plain", "OK");
+    AsyncWebServerResponse *resp = request->beginResponse(200, "text/plain", "OK");
+    resp->addHeader("X-Content-Type-Options", "nosniff");
+    request->send(resp);
   });
 
   server.begin();
@@ -223,8 +237,7 @@ void setup() {
 }
 
 void loop() {
-  rateLimiter.cleanup();
-
+  esp_task_wdt_reset();
   if (shellServer.hasClient()) {
     if (!shellClient || !shellClient.connected()) {
       if (shellClient) shellClient.stop();
@@ -271,9 +284,12 @@ void loop() {
       if (!telnet_state.authenticated) {
         processAuth();
       } else {
-        String cmdLine = shellClient.readStringUntil('\n');
-        cmdLine.trim();
-        if (cmdLine.length() > 0) {
+        char cmdBuffer[128];
+        int cmdLen = shellClient.readBytesUntil('\n', cmdBuffer, sizeof(cmdBuffer) - 1);
+        if (cmdLen > 0) {
+          cmdBuffer[cmdLen] = '\0';
+          String cmdLine = String(cmdBuffer);
+          cmdLine.trim();
           telnet_state.last_activity = millis();
           processCommand(cmdLine);
         }
@@ -306,8 +322,8 @@ void loop() {
           secProto.updateValidCounter(counter);
           packetHistory.add(counter);
           gcm_valid_count++;
-          mensagemAlvo = String((char*)decrypted);
-          if (mensagemAlvo.startsWith("ALVO_")) {
+          targetMessage = String((char*)decrypted);
+          if (targetMessage.startsWith("ALVO_")) {
             packet_rx_count++;
           }
         }
@@ -316,9 +332,9 @@ void loop() {
         packetHistory.add(counter);
         gcm_valid_count++;
         
-        mensagemAlvo = String((char*)decrypted);
+        targetMessage = String((char*)decrypted);
         
-        if (mensagemAlvo.startsWith("ALVO_")) {
+        if (targetMessage.startsWith("ALVO_")) {
           packet_rx_count++;
           debug.logf("RX #%u: %s (GCM OK)", counter, mensagemAlvo.c_str());
         }
@@ -371,6 +387,9 @@ void processAuth() {
       }
       telnet_state.auth_input = "";
     } else if (c >= 32 && c <= 126) {
+      if (telnet_state.auth_input.length() >= 64) {
+        continue;
+      }
       telnet_state.auth_input += c;
       if (telnet_state.waiting_password) {
         shellClient.print("*");

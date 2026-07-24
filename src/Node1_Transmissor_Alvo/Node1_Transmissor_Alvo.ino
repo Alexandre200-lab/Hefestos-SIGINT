@@ -1,5 +1,5 @@
-// Node 1: Transmissor Alvo Tatica (ESP32) - v3.0
-// Segurança: AES-GCM + Nonce/Counter Anti-Replay
+// Node 1: Tactical Target Transmitter (ESP32) - v3.1
+// Security: AES-GCM + Nonce/Counter Anti-Replay
 #include <SPI.h>
 #include <LoRa.h>
 #include <TinyGPSPlus.h>
@@ -35,8 +35,8 @@ AESGCM aesgcm;
 uint8_t aes_key[16];
 uint8_t iv[12];
 
-unsigned long tempoAnterior = 0;
-bool gps_valid = false;
+unsigned long lastPollTime = 0;
+bool gpsValid = false;
 
 void setup() {
   Serial.begin(115200);
@@ -78,12 +78,12 @@ void loop() {
     gps.encode(SerialGPS.read());
   }
 
-  if (millis() - tempoAnterior >= GPS_POLL_INTERVAL) {
-    tempoAnterior = millis();
+  if (millis() - lastPollTime >= GPS_POLL_INTERVAL) {
+    lastPollTime = millis();
 
-    gps_valid = gps.location.isValid() && gps.location.lat() != 0.0 && gps.location.lng() != 0.0;
+    gpsValid = gps.location.isValid() && gps.location.lat() != 0.0 && gps.location.lng() != 0.0;
 
-    if (!gps_valid) {
+    if (!gpsValid) {
       debug.logWarning("GPS: Sem sinal valido, aguardando...");
       return;
     }
