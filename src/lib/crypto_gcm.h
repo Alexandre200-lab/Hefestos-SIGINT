@@ -6,6 +6,7 @@
 #include <esp_timer.h>
 #include <esp_random.h>
 #include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
 
 #define GCM_KEY_SIZE 16
 #define GCM_IV_SIZE 12
@@ -15,6 +16,14 @@
 class AESGCM {
 private:
     unsigned char key[GCM_KEY_SIZE];
+
+    // Verify RNG is producing non-zero entropy
+    static bool isRNGReady() {
+        uint8_t test[8];
+        esp_fill_random(test, 8);
+        for (int i = 0; i < 8; i++) if (test[i]) return true;
+        return false;
+    }
 
 public:
     AESGCM() {
@@ -28,10 +37,26 @@ public:
 
     int encrypt(const unsigned char* input, int len, unsigned char* output, uint32_t counter) {
         if (len > GCM_PAYLOAD_MAX) return -1;
+        if (!isRNGReady()) return -2;  // RNG failure
 
         unsigned char iv[GCM_IV_SIZE];
         memcpy(iv, &counter, 4);
-        esp_fill_random(iv + 4, 8);
+        
+        // Derive remaining 8 bytes from SHA-256(counter || random_4B)
+        uint8_t rand_part[4];
+        esp_fill_random(rand_part, 4);
+        
+        uint8_t hash_input[8];
+        memcpy(hash_input, &counter, 4);
+        memcpy(hash_input + 4, rand_part, 4);
+        
+        mbedtls_md_context_t md_ctx;
+        mbedtls_md_init(&md_ctx);
+        mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 0);
+        mbedtls_md_starts(&md_ctx);
+        mbedtls_md_update(&md_ctx, hash_input, 8);
+        mbedtls_md_finish(&md_ctx, iv + 4);  // Write to iv[4..11] (8 bytes)
+        mbedtls_md_free(&md_ctx);
 
         unsigned char tag[GCM_TAG_SIZE];
         size_t olen = 0;

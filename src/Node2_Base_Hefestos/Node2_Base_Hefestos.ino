@@ -501,9 +501,14 @@ void loop() {
   }
 }
 
-static bool secureCompare(const char* a, const char* b, size_t maxLen) {
+static bool secureCompare(const char* a, const char* b) {
+  if (!a || !b) return false;
+  size_t len_a = strlen(a);
+  size_t len_b = strlen(b);
+  if (len_a != len_b) return false;
+  
   volatile uint8_t result = 0;
-  for (size_t i = 0; i < maxLen; i++) {
+  for (size_t i = 0; i < len_a; i++) {
     result |= (uint8_t)a[i] ^ (uint8_t)b[i];
   }
   return result == 0;
@@ -522,8 +527,8 @@ void processAuth() {
         const char* stored_user = config.getCLIUsername();
         const char* stored_pass = config.getCLIPassword();
 
-        if (secureCompare(telnet_state.username.c_str(), config.getCLIUsername(), CLI_USER_SIZE) &&
-            secureCompare(telnet_state.auth_password.c_str(), config.getCLIPassword(), CLI_PASS_SIZE)) {
+        if (secureCompare(telnet_state.username.c_str(), config.getCLIUsername()) &&
+            secureCompare(telnet_state.auth_password.c_str(), config.getCLIPassword())) {
           telnet_state.authenticated = true;
           telnet_state.session_start = millis();
           telnet_state.last_activity = millis();
