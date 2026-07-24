@@ -188,9 +188,11 @@ void loadBlockedIPs() {
     for (int j = 0; j < 4; j++) {
       blocked_ips[i].ip[j] = EEPROM.read(EEPROM_ADDR_BLOCKED + 1 + i * 4 + j);
     }
-    blocked_ips[i].blocked_since = 0;
+    // Don't restore blocked_since = 0 (causes permanent block)
+    // Instead mark as expired so they can try again after reboot
+    blocked_ips[i].blocked_since = millis() - BLOCK_DURATION - 1;
   }
-  debug.logf("Loaded %d blocked IPs from EEPROM", blocked_count);
+  debug.logf("Loaded %d blocked IPs from EEPROM (expired)", blocked_count);
 }
 
 void cleanupBlockedIPs() {
