@@ -60,6 +60,84 @@ struct BlockedIP {
 BlockedIP blocked_ips[MAX_BLOCKED_IPS];
 int blocked_count = 0;
 
+// === HTTP Session Management ===
+#define MAX_HTTP_SESSIONS 4
+#define HTTP_SESSION_IDLE_TIMEOUT 1800000   // 30 min
+#define HTTP_SESSION_ABSOLUTE_TIMEOUT 14400000  // 4 hours
+
+struct HTTPSession {
+  char token[33];        // 16 bytes -> 32 hex chars + null
+  IPAddress ip;
+  unsigned long last_activity;
+  unsigned long created_at;
+  bool active;
+};
+
+HTTPSession http_sessions[MAX_HTTP_SESSIONS];
+
+bool verifyHTTPSession(AsyncWebServerRequest* request) {
+  if (!request->hasHeader("Cookie") && !request->hasHeader("X-Hefestos-Token")) {
+    return false;
+  }
+  
+  String token = "";
+  if (request->hasHeader("X-Hefestos-Token")) {
+    token = request->getHeader("X-Hefestos-Token")->value();
+  } else if (request->hasHeader("Cookie")) {
+    String cookie = request->getHeader("Cookie")->value();
+    int pos = cookie.indexOf("X-Hefestos-Token=");
+    if (pos >= 0) {
+      pos += 17; // length of "X-Hefestos-Token="
+      int end = cookie.indexOf(';', pos);
+      if (end < 0) end = cookie.length();
+      token = cookie.substring(pos, end);
+    }
+  }
+  
+  if (token.length() != 32) return false;
+  
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+    if (http_sessions[i].active && 
+        strcmp(http_sessions[i].token, token.c_str()) == 0 &&
+        http_sessions[i].ip == request->client()->remoteIP()) {
+      
+      if (now - http_sessions[i].last_activity > HTTP_SESSION_IDLE_TIMEOUT ||
+          now - http_sessions[i].created_at > HTTP_SESSION_ABSOLUTE_TIMEOUT) {
+        http_sessions[i].active = false;
+        return false;
+      }
+      
+      http_sessions[i].last_activity = now;
+      return true;
+    }
+  }
+  return false;
+}
+
+void cleanupHTTPSessions() {
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+    if (http_sessions[i].active &&
+        (now - http_sessions[i].last_activity > HTTP_SESSION_IDLE_TIMEOUT ||
+         now - http_sessions[i].created_at > HTTP_SESSION_ABSOLUTE_TIMEOUT)) {
+      http_sessions[i].active = false;
+    }
+  }
+}
+
+String generateSessionToken() {
+  uint8_t random_bytes[16];
+  esp_fill_random(random_bytes, 16);
+  String token = "";
+  for (int i = 0; i < 16; i++) {
+    char hex[3];
+    sprintf(hex, "%02x", random_bytes[i]);
+    token += hex;
+  }
+  return token;
+}
+
 bool isIPBlocked(IPAddress ip) {
   unsigned long now = millis();
   for (int i = 0; i < blocked_count; i++) {
@@ -167,6 +245,12 @@ void setup() {
   radioRX.setVolume(50);
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!verifyHTTPSession(request)) {
+      AsyncWebServerResponse *resp = request->beginResponse(401, "text/html", "<html><body><h1>401 Unauthorized</h1><p><a href='/login'>Login</a></p></body></html>");
+      resp->addHeader("WWW-Authenticate", "Bearer");
+      request->send(resp);
+      return;
+    }
     AsyncWebServerResponse *resp = request->beginResponse_P(200, "text/html", index_html);
     resp->addHeader("Content-Security-Policy", "default-src 'self'");
     resp->addHeader("X-Content-Type-Options", "nosniff");
@@ -174,7 +258,79 @@ void setup() {
     request->send(resp);
   });
 
+  // Login endpoint
+  server.on("/login", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (!request->hasParam("user", true) || !request->hasParam("pass", true)) {
+      request->send(400, "text/plain", "Missing credentials");
+      return;
+    }
+    String user = request->getParam("user", true)->value();
+    String pass = request->getParam("pass", true)->value();
+    
+    if (user == config.getCLIUsername() && pass == config.getCLIPassword()) {
+      cleanupHTTPSessions();
+      
+      String token = generateSessionToken();
+      for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+        if (!http_sessions[i].active) {
+          token.toCharArray(http_sessions[i].token, 33);
+          http_sessions[i].ip = request->client()->remoteIP();
+          http_sessions[i].last_activity = millis();
+          http_sessions[i].created_at = millis();
+          http_sessions[i].active = true;
+          break;
+        }
+      }
+      
+      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"token\":\"" + token + "\"}");
+      resp->addHeader("Set-Cookie", "X-Hefestos-Token=" + token + "; HttpOnly; Path=/");
+      resp->addHeader("Content-Security-Policy", "default-src 'self'");
+      request->send(resp);
+    } else {
+      // Rate limit on failed login
+      if (!rateLimiter.allowCommand(request->client()->remoteIP().toString().c_str())) {
+        request->send(429, "text/plain", "Too many attempts");
+      } else {
+        request->send(401, "text/plain", "Invalid credentials");
+      }
+    }
+  });
+
+  // Logout endpoint
+  server.on("/logout", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String token = "";
+    if (request->hasHeader("X-Hefestos-Token")) {
+      token = request->getHeader("X-Hefestos-Token")->value();
+    } else if (request->hasHeader("Cookie")) {
+      String cookie = request->getHeader("Cookie")->value();
+      int pos = cookie.indexOf("X-Hefestos-Token=");
+      if (pos >= 0) {
+        pos += 17;
+        int end = cookie.indexOf(';', pos);
+        if (end < 0) end = cookie.length();
+        token = cookie.substring(pos, end);
+      }
+    }
+    
+    if (token.length() == 32) {
+      for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+        if (http_sessions[i].active && strcmp(http_sessions[i].token, token.c_str()) == 0) {
+          http_sessions[i].active = false;
+          break;
+        }
+      }
+    }
+    
+    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"ok\":true}");
+    resp->addHeader("Set-Cookie", "X-Hefestos-Token=; HttpOnly; Path=/; Max-Age=0");
+    request->send(resp);
+  });
+
   server.on("/dados", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!verifyHTTPSession(request)) {
+      request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+      return;
+    }
     DynamicJsonDocument doc(1024);
     doc["mensagem"] = targetMessage;
     doc["rssi"] = rssiLoRa;
@@ -190,7 +346,18 @@ void setup() {
     request->send(resp);
   });
 
-  server.on("/sintonizar", HTTP_GET, [](AsyncWebServerRequest *request) {
+server.on("/sintonizar", HTTP_GET, [](AsyncWebServerRequest *request) {
+    // Rate limit for /sintonizar
+    if (!rateLimiter.allowCommand(request->client()->remoteIP().toString().c_str())) {
+      request->send(429, "text/plain", "Rate limit exceeded");
+      return;
+    }
+    
+    if (!verifyHTTPSession(request)) {
+      request->send(401, "text/plain", "Unauthorized");
+      return;
+    }
+    
     if (request->hasParam("b") && request->hasParam("f")) {
       String b = request->getParam("b")->value();
       if (b.length() > 10) {
@@ -226,8 +393,6 @@ void setup() {
 }
 
 void loop() {
-  esp_task_wdt_reset();
-  if (shellServer.hasClient()) {
     if (!shellClient || !shellClient.connected()) {
       if (shellClient) shellClient.stop();
       WiFiClient newClient = shellServer.available();
