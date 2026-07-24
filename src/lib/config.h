@@ -1,7 +1,5 @@
-// config.h - EEPROM Configuration Manager - v3.0
+// config.h - EEPROM Configuration Manager - v4.0
 // Gerencia credenciais, chaves criptográficas e parâmetros operacionais
-// Suporta geração de chaves únicas no primeiro boot
-// CORRIGIDO v3.0: Username configurável (não mais hardcoded)
 
 #ifndef CONFIG_H
 #define CONFIG_H
@@ -10,29 +8,11 @@
 #include <string.h>
 #include <esp_random.h>
 #include <WiFi.h>
+#include "hefestos_pins.h"
 
-#define EEPROM_SIZE 512
-#define EEPROM_MAGIC 0x4845
+// Legacy magic numbers for backward compatibility
 #define EEPROM_MAGIC_V2 0x4846
-#define EEPROM_MAGIC_V3 0x4847  // Nova versão v3.0
-#define EEPROM_ADDR_MAGIC 0
-#define EEPROM_ADDR_VERSION 2
-#define EEPROM_ADDR_AES_KEY 4
-#define EEPROM_ADDR_AES_IV 20
-#define EEPROM_ADDR_WIFI_PASS 36
-#define EEPROM_ADDR_CLI_PASS 68
-#define EEPROM_ADDR_CLI_USER 100  // NOVO v3.0: Username
-#define EEPROM_ADDR_FLAGS 132
-
-#define AES_KEY_SIZE 16
-#define AES_IV_SIZE 16
-#define WIFI_PASS_SIZE 32
-#define CLI_PASS_SIZE 32
-#define CLI_USER_SIZE 16         // NOVO v3.0
-
-#define FLAG_DEBUG_MODE 0x01
-#define FLAG_FACTORY_RESET 0x02
-#define FLAG_KEYS_GENERATED 0x04
+#define EEPROM_MAGIC_V3 0x4847
 
 struct HefestosConfig {
   uint16_t magic;
@@ -102,7 +82,7 @@ public:
   }
 
   void loadDefaults() {
-    config.magic = EEPROM_MAGIC_V3;
+    config.magic = EEPROM_MAGIC;
     config.version = 3;
     config.flags = 0;
     generateUniqueKeys();
@@ -209,7 +189,7 @@ public:
 
   void factoryReset() {
     memset(&config, 0, sizeof(config));
-    config.magic = EEPROM_MAGIC_V3;  // v3.0
+    config.magic = EEPROM_MAGIC;  // v3.0
     config.version = 3;
     generateUniqueKeys();
     generateSecurePassword(config.wifi_pass, WIFI_PASS_SIZE);
