@@ -1,8 +1,35 @@
-# HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v3.0)
+# HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v4.0)
 
 Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e telemetria com arquitetura Master-Slave distribuída. Realiza rastreamento GPS criptografado (AES-GCM), transmissão via LoRa (915 MHz Sub-GHz), interceptação de RF (AM/FM/SW), e retenção forense em SD Card com autenticação 2FA.
 
-## Versão 3.1 - Segurança Revisada (Jul 2026)
+## Versão 4.0 - Architecture Unification (Jul 2026)
+
+### Principais Mudanças v4.0
+
+| Área | Mudança |
+|------|---------|
+| **Config** | Header centralizado `hefestos_pins.h` (pins, EEPROM, limites) |
+| **Build** | Script unificado `build.sh` — compila os 3 nós do zero |
+| **Node1** | Refatorado para pins centralizados, CSMA/CA no LoRa |
+| **Node2** | Session-based HTTP auth, StaticJson, String→char arrays |
+| **Node3** | **Migrado Arduino Uno → ESP32-C3**: HardwareSerial nativo, LEDC PWM, buffer RAM 16→256, 3.3V logic (sem level shifter) |
+| **EEPROM** | Criptografada com chave derivada do efuse MAC (AES-256-GCM + PBKDF2 100k) |
+| **HTTP** | Session tokens (Bearer/Cookie), idle 30min / absolute 4h, rate limit |
+| **LoRa** | Nonce derivado SHA-256 (elimina padrão de counter), RNG check |
+
+### Correções de Segurança v4.0
+
+| # | Vulnerabilidade | Correção |
+|---|----------------|----------|
+| 1 | EEPROM plaintext (chaves AES, senhas) | AES-256-GCM com chave única por chip (efuse MAC) |
+| 2 | HTTP sem autenticação | Session tokens obrigatórios em `/`, `/dados`, `/sintonizar` |
+| 3 | Nonce previsível (counter + random) | SHA-256(counter || random_4B) → 12B nonce |
+| 4 | RNG failure silencioso | `isRNGReady()` retorna erro -2 |
+| 5 | `secureCompare` lê além do `\0` | Compara `strlen` real + constant-time |
+| 6 | `blocked_since = 0` persistia bloqueio eterno | Expira no boot (`millis() - BLOCK_DURATION - 1`) |
+| 7 | `DynamicJsonDocument` fragmenta heap | `StaticJsonDocument<1024>` na stack |
+| 8 | `String` dinâmico em loops | `char[]` fixo elimina fragmentação |
+| 9 | LoRa sem CSMA/CA | Channel sense + random backoff antes de TX |
 
 ### Bibliotecas de Segurança Revisadas
 | Biblioteca | Descrição | Mudanças |
