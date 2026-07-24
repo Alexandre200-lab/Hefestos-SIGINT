@@ -12,16 +12,6 @@
 #define SECURE_PROTOCOL_MAX_PAYLOAD 256
 #define SECURE_PROTOCOL_MAGIC 0x1EF3  // Magic para v3.0
 
-// Estrutura do pacote seguro
-// [MAGIC(2)] [COUNTER(4)] [PAYLOAD(N)] [HMAC(8)]
-typedef struct {
-    uint16_t magic;
-    uint32_t counter;
-    uint8_t payload[SECURE_PROTOCOL_MAX_PAYLOAD];
-    uint16_t payload_len;
-    uint8_t hmac[8];
-} SecurePacketData;
-
 class SecureProtocol {
 private:
     uint32_t tx_counter;
