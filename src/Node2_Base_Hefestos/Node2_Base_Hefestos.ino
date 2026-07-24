@@ -21,9 +21,9 @@ void processAuth();
 #include "../lib/rate_limiter.h"
 #include "../lib/debug.h"
 
-String targetMessage = "Aguardando sincronizacao...";
+char targetMessage[128] = "Aguardando sincronizacao...";
 int rssiLoRa = 0;
-String currentBand = "FM";
+char currentBand[4] = "FM";
 float currentFreq = 100.1;
 uint32_t packet_rx_count = 0;
 uint32_t gcm_valid_count = 0;
@@ -45,11 +45,11 @@ WiFiClient shellClient;
 struct TelnetState {
   bool authenticated;
   int auth_attempts;
-  String username;
+  char username[64];
   unsigned long last_activity;
   unsigned long session_start;
-  String auth_input;
-  String auth_password;
+  char auth_input[64];
+  char auth_password[64];
   bool waiting_password;
 } telnet_state = {false, 0, "", 0, 0, "", "", false};
 
@@ -328,12 +328,12 @@ void setup() {
     request->send(resp);
   });
 
-  server.on("/dados", HTTP_GET, [](AsyncWebServerRequest *request) {
+server.on("/dados", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (!verifyHTTPSession(request)) {
-      request->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+      request->send(401, "text/plain", "Unauthorized");
       return;
     }
-    DynamicJsonDocument doc(1024);
+    StaticJsonDocument<1024> doc;
     doc["mensagem"] = targetMessage;
     doc["rssi"] = rssiLoRa;
     doc["rx_count"] = packet_rx_count;

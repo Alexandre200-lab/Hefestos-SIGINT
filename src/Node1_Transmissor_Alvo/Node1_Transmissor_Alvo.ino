@@ -92,6 +92,13 @@ void loop() {
     int outLen = aesgcm.encrypt((uint8_t*)payload, strlen(payload), output, counter);
 
     if (outLen > 0) {
+      // CSMA/CA: check channel before transmit
+      unsigned long csma_start = millis();
+      while (millis() - csma_start < 1000) {
+        if (LoRa.parsePacket() == 0) break;  // Channel clear
+        delay(random(5, 20));  // Random backoff
+      }
+      
       LoRa.beginPacket();
       LoRa.write(output, outLen);
       LoRa.endPacket();
