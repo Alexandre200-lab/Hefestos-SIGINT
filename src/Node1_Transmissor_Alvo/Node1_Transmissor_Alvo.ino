@@ -1,5 +1,5 @@
-// Node 1: Tactical Target Transmitter (ESP32) - v3.1
-// Security: AES-GCM + Nonce/Counter Anti-Replay
+// Node 1: Tactical Target Transmitter (ESP32) - v4.0
+// Uses centralized pin definitions from hefestos_pins.h
 #include <SPI.h>
 #include <LoRa.h>
 #include <TinyGPSPlus.h>
@@ -8,24 +8,15 @@
 #include <Adafruit_Si4713.h>
 
 #include <EEPROM.h>
+#include "../lib/hefestos_pins.h"
 #include "../lib/config.h"
 #include "../lib/crypto_gcm.h"
 #include "../lib/secure_protocol.h"
 #include "../lib/debug.h"
 
-#define LORA_SS 5
-#define LORA_RST 14
-#define LORA_DIO0 26
-#define FM_RST 32
-#define FM_FREQ 10010
-
-#define GPS_POLL_INTERVAL 1000
-#define EEPROM_COUNTER_ADDR 0x100
-#define TX_SAVE_INTERVAL 10
-
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);
-Adafruit_Si4713 radioTX = Adafruit_Si4713(FM_RST);
+Adafruit_Si4713 radioTX = Adafruit_Si4713(N1_FM_RST);
 
 ConfigManager config;
 DebugLogger debug;
@@ -41,7 +32,7 @@ bool gpsValid = false;
 void setup() {
   Serial.begin(115200);
   debug.begin(115200);
-  debug.log("Node1 v3.0: Inicializando...");
+  debug.log("Node1 v4.0: Inicializando...");
 
   config.begin();
   memcpy(aes_key, config.getAESKey(), 16);
@@ -50,27 +41,27 @@ void setup() {
   secProto.begin(0xDEADBEEF);
 
   uint32_t saved;
-  EEPROM.get(EEPROM_COUNTER_ADDR, saved);
+  EEPROM.get(EEPROM_ADDR_COUNTER, saved);
   if (saved != 0xFFFFFFFF && saved != 0) {
     secProto.setCounter(saved);
     debug.logf("Counter loaded from EEPROM: %u", saved);
   }
   debug.logf("Counter init: %u", secProto.getTXCounter());
 
-  SerialGPS.begin(9600, SERIAL_8N1, 16, 17);
+  SerialGPS.begin(9600, SERIAL_8N1, N1_GPS_RX, N1_GPS_TX);
 
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  LoRa.begin(915E6);
-  LoRa.setSpreadingFactor(10);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setTxPower(20);
+  LoRa.setPins(N1_LORA_SS, N1_LORA_RST, N1_LORA_DIO0);
+  LoRa.begin(LORA_FREQ);
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setTxPower(LORA_TX_POWER);
 
   radioTX.begin();
   radioTX.powerUp();
   radioTX.setTXpower(115);
-  radioTX.tuneFM(FM_FREQ);
+  radioTX.tuneFM(10010);
 
-  debug.log("Node1 v3.0: Pronto para transmissao");
+  debug.log("Node1 v4.0: Pronto para transmissao");
 }
 
 void loop() {
@@ -106,7 +97,7 @@ void loop() {
       LoRa.endPacket();
 
       if (counter % TX_SAVE_INTERVAL == 0) {
-        EEPROM.put(EEPROM_COUNTER_ADDR, counter);
+        EEPROM.put(EEPROM_ADDR_COUNTER, counter);
         EEPROM.commit();
       }
 

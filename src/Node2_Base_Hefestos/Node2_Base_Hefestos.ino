@@ -1,5 +1,5 @@
-// Node 2: Hefestos Base Server (ESP32) - v3.1
-// Security: AES-GCM + Nonce/Counter + Rate Limit + Anti-Brute-Force
+// Node 2: Hefestos Base Server (ESP32) - v4.0
+// Uses centralized pin definitions from hefestos_pins.h
 #include <WiFi.h>
 #include <sys/time.h>
 #include <esp_task_wdt.h>
@@ -14,16 +14,12 @@ void processAuth();
 #include <SI4735.h>
 #include <HardwareSerial.h>
 
+#include "../lib/hefestos_pins.h"
 #include "../lib/config.h"
 #include "../lib/crypto_gcm.h"
 #include "../lib/secure_protocol.h"
 #include "../lib/rate_limiter.h"
 #include "../lib/debug.h"
-
-#define LORA_SS 5
-#define LORA_RST 14
-#define LORA_DIO0 26
-#define RX_RST 12
 
 String targetMessage = "Aguardando sincronizacao...";
 int rssiLoRa = 0;
@@ -56,13 +52,6 @@ struct TelnetState {
   String auth_password;
   bool waiting_password;
 } telnet_state = {false, 0, "", 0, 0, "", "", false};
-
-#define SESSION_IDLE_TIMEOUT 60000
-#define SESSION_ABSOLUTE_TIMEOUT 300000
-#define MAX_AUTH_ATTEMPTS 3
-#define BLOCK_DURATION 1800000
-#define MAX_BLOCKED_IPS 16
-#define EEPROM_BLOCKED_ADDR 0x110
 
 struct BlockedIP {
   IPAddress ip;
@@ -105,21 +94,21 @@ void blockIP(IPAddress ip) {
 }
 
 void persistBlockedIPs() {
-  EEPROM.write(EEPROM_BLOCKED_ADDR, blocked_count);
+  EEPROM.write(EEPROM_ADDR_BLOCKED, blocked_count);
   for (int i = 0; i < blocked_count; i++) {
     for (int j = 0; j < 4; j++) {
-      EEPROM.write(EEPROM_BLOCKED_ADDR + 1 + i * 4 + j, blocked_ips[i].ip[j]);
+      EEPROM.write(EEPROM_ADDR_BLOCKED + 1 + i * 4 + j, blocked_ips[i].ip[j]);
     }
   }
   EEPROM.commit();
 }
 
 void loadBlockedIPs() {
-  blocked_count = EEPROM.read(EEPROM_BLOCKED_ADDR);
+  blocked_count = EEPROM.read(EEPROM_ADDR_BLOCKED);
   if (blocked_count > MAX_BLOCKED_IPS) blocked_count = 0;
   for (int i = 0; i < blocked_count; i++) {
     for (int j = 0; j < 4; j++) {
-      blocked_ips[i].ip[j] = EEPROM.read(EEPROM_BLOCKED_ADDR + 1 + i * 4 + j);
+      blocked_ips[i].ip[j] = EEPROM.read(EEPROM_ADDR_BLOCKED + 1 + i * 4 + j);
     }
     blocked_ips[i].blocked_since = 0;
   }
@@ -141,7 +130,7 @@ void cleanupBlockedIPs() {
 }
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html><head><title>HEFESTOS SIGINT v3.0</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:monospace;background:#050505;color:#0f0;text-align:center;padding:10px}.card{background:#111;border:1px solid #0f0;padding:15px;margin:10px auto;width:90%;max-width:700px;border-radius:8px;text-align:left}.terminal{background:#000;color:#0f0;border:1px solid #333;padding:10px;height:150px;overflow-y:scroll;font-size:0.9em;margin-top:10px}.bar-bg{background:#333;height:20px;width:100%;border-radius:5px;margin-top:5px}.bar-fill{background:#0f0;height:100%;width:0%;transition:0.3s}button,select,input{background:#000;color:#0f0;border:1px solid #0f0;padding:8px;margin:5px}button{cursor:pointer;font-weight:bold}button:hover{background:#0f0;color:#000}.alert{color:#ff3333;font-weight:bold}.stats{color:#ffff00;font-size:0.8em}</style></head><body><h2>[ HEFESTOS SIGINT v3.0 ]</h2><div class="card"><h3>[+] Status Operacional</h3><p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p><p>Alvo: <span id="msg">--</span></p><p>RSSI: <span id="rssi">0</span> dBm</p><div class="bar-bg"><div id="rssi-bar" class="bar-fill"></div></div><button onclick="abrirMapa()">MAPEAR COORDENADAS</button></div><div class="card"><h3>[!] Sniffer RF</h3><div class="terminal" id="terminal-log">Aguardando...<br></div></div><div class="card"><h3>[*] Interceptacao Audio</h3><select id="band-input"><option value="FM">FM</option><option value="AM">AM</option><option value="SW">SW</option></select><input type="number" id="freq-input" step="0.1" value="100.1"><button onclick="sintonizar()">SINTONIZAR</button></div><script>setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{document.getElementById("msg").innerText=d.mensagem;document.getElementById("rssi").innerText=d.rssi;document.getElementById("rx-count").innerText=d.rx_count;document.getElementById("gcm-ok").innerText=d.gcm_ok;document.getElementById("gcm-fail").innerText=d.gcm_fail;document.getElementById("replay").innerText=d.replay_count;var p=Math.min(100,Math.max(0,(d.rssi+100)*2));document.getElementById("rssi-bar").style.width=p+"%";if(d.log){document.getElementById("terminal-log").innerText=d.log}})});function abrirMapa(){var m=document.getElementById("msg").innerText.match(/Lat:([^|]+).*Lon:([^|]+)/);if(m)window.open("https://maps.google.com/maps?q="+encodeURIComponent(m[1])+","+encodeURIComponent(m[2]))}function sintonizar(){var b=document.getElementById("band-input").value;var f=document.getElementById("freq-input").value;fetch("/sintonizar?b="+b+"&f="+f).then(r=>r.text()).then(alert)}
+<!DOCTYPE HTML><html><head><title>HEFESTOS SIGINT v3.0</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:monospace;background:#050505;color:#0f0;text-align:center;padding:10px}.card{background:#111;border:1px solid #0f0;padding:15px;margin:10px auto;width:90%;max-width:700px;border-radius:8px;text-align:left}.terminal{background:#000;color:#0f0;border:1px solid #333;padding:10px;height:150px;overflow-y:scroll;font-size:0.9em;margin-top:10px}.bar-bg{background:#333;height:20px;width:100%;border-radius:5px;margin-top:5px}.bar-fill{background:#0f0;height:100%;width:0%;transition:0.3s}button,select,input{background:#000;color:#0f0;border:1px solid #0f0;padding:8px;margin:5px}button{cursor:pointer;font-weight:bold}button:hover{background:#0f0;color:#000}.alert{color:#ff3333;font-weight:bold}.stats{color:#ffff00;font-size:0.8em}</style></head><body><h2>[ HEFESTOS SIGINT v4.0 ]</h2><div class="card"><h3>[+] Status Operacional</h3><p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p><p>Alvo: <span id="msg">--</span></p><p>RSSI: <span id="rssi">0</span> dBm</p><div class="bar-bg"><div id="rssi-bar" class="bar-fill"></div></div><button onclick="abrirMapa()">MAPEAR COORDENADAS</button></div><div class="card"><h3>[!] Sniffer RF</h3><div class="terminal" id="terminal-log">Aguardando...<br></div></div><div class="card"><h3>[*] Interceptacao Audio</h3><select id="band-input"><option value="FM">FM</option><option value="AM">AM</option><option value="SW">SW</option></select><input type="number" id="freq-input" step="0.1" value="100.1"><button onclick="sintonizar()">SINTONIZAR</button></div><script>setInterval(function(){fetch('/dados').then(r=>r.json()).then(d=>{document.getElementById("msg").innerText=d.mensagem;document.getElementById("rssi").innerText=d.rssi;document.getElementById("rx-count").innerText=d.rx_count;document.getElementById("gcm-ok").innerText=d.gcm_ok;document.getElementById("gcm-fail").innerText=d.gcm_fail;document.getElementById("replay").innerText=d.replay_count;var p=Math.min(100,Math.max(0,(d.rssi+100)*2));document.getElementById("rssi-bar").style.width=p+"%";if(d.log){document.getElementById("terminal-log").innerText=d.log}})});function abrirMapa(){var m=document.getElementById("msg").innerText.match(/Lat:([^|]+).*Lon:([^|]+)/);if(m)window.open("https://maps.google.com/maps?q="+encodeURIComponent(m[1])+","+encodeURIComponent(m[2]))}function sintonizar(){var b=document.getElementById("band-input").value;var f=document.getElementById("freq-input").value;fetch("/sintonizar?b="+b+"&f="+f).then(r=>r.text()).then(alert)}
 </script></body></html>)rawliteral";
 
 void setup() {
@@ -150,7 +139,7 @@ void setup() {
 
   Serial.begin(115200);
   debug.begin(115200);
-  debug.log("Node2 v3.0: Inicializando...");
+  debug.log("Node2 v4.0: Inicializando...");
 
   config.begin();
   memcpy(aes_key, config.getAESKey(), 16);
@@ -161,19 +150,19 @@ void setup() {
   const char* wifi_pass = config.getWiFiPassword();
   WiFi.softAP("Hefestos-SIGINT", wifi_pass, 1, false, 4);
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  debug.log("WiFi: Hefestos-SIGINT (v3.0)");
+  debug.log("WiFi: Hefestos-SIGINT (v4.0)");
 
   shellServer.begin();
 
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  LoRa.begin(915E6);
-  LoRa.setSpreadingFactor(10);
-  LoRa.setSignalBandwidth(125E3);
+  LoRa.setPins(N2_LORA_SS, N2_LORA_RST, N2_LORA_DIO0);
+  LoRa.begin(LORA_FREQ);
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
 
   secProto.begin(0xDEADBEEF);
 
-  Wire.begin(21, 22);
-  radioRX.setup(RX_RST, 1);
+  Wire.begin(N2_I2C_SDA, N2_I2C_SCL);
+  radioRX.setup(N2_RX_RST, 1);
   radioRX.setFM(8400, 10800, currentFreq * 100, 10);
   radioRX.setVolume(50);
 
@@ -233,7 +222,7 @@ void setup() {
   });
 
   server.begin();
-  debug.log("Node2 v3.0: Ready");
+  debug.log("Node2 v4.0: Ready");
 }
 
 void loop() {
@@ -244,7 +233,7 @@ void loop() {
       WiFiClient newClient = shellServer.available();
 
       if (isIPBlocked(newClient.remoteIP())) {
-        newClient.println("\r\n=== HEFESTOS SIGINT v3.0 ===");
+        newClient.println("\r\n=== HEFESTOS SIGINT v4.0 ===");
         newClient.println("IP temporariamente bloqueado.");
         delay(100);
         newClient.stop();
@@ -260,7 +249,7 @@ void loop() {
       telnet_state.auth_input = "";
       telnet_state.auth_password = "";
 
-      shellClient.println("\r\n=== HEFESTOS SIGINT v3.0 ===");
+      shellClient.println("\r\n=== HEFESTOS SIGINT v4.0 ===");
       shellClient.println("Seguranca: AES-GCM + Anti-Replay");
       shellClient.println("Usuario:");
       shellClient.print("> ");

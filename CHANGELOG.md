@@ -1,7 +1,43 @@
-# CHANGELOG - HEFESTOS SIGINT v3.1
+# CHANGELOG - HEFESTOS SIGINT v4.0
 
-## Data: 2026-07-15
-## Status: Security Hardening Complete
+## Data: 2026-07-24
+## Status: Architecture Unification Complete
+
+---
+
+## v4.0.0 - Architecture Unification (2026-07-24)
+
+### Major Changes
+
+| Area | Change |
+|------|--------|
+| **Config** | Centralized `hefestos_pins.h` with all pin/EEPROM/constant definitions |
+| **Build** | Unified `build.sh` compiling all 3 nodes from source |
+| **Node1** | Refactored to use centralized pins, version bumped to v4.0 |
+| **Node2** | Refactored to use centralized pins, removed duplicate defines, version v4.0 |
+| **Node3** | **Migrated from Arduino Uno to ESP32-C3**: Native UART (no SoftwareSerial), LEDC PWM for buzzer, expanded RAM buffer (16→256 entries), direct 3.3V logic (no level shifter) |
+| **EEPROM** | Unified address map (v4.0 magic 0x4848) |
+| **LoRa** | Centralized frequency/SF/BW/TX power constants |
+
+### Architecture Improvements
+
+| # | Improvement | Impact |
+|---|-------------|--------|
+| 1 | Centralized pin/constant header | Single source of truth, no magic numbers |
+| 2 | ESP32-C3 Node3 | 200x RAM (400KB vs 2KB), native USB, unified toolchain |
+| 3 | Removed level shifter | Both ESP32 nodes now 3.3V logic |
+| 4 | Build from source | Reproducible builds, no pre-compiled binaries |
+
+### Hardware Changes (Node3)
+
+| Component | Arduino Uno | ESP32-C3 | Benefit |
+|-----------|-------------|----------|---------|
+| MCU | ATmega328P (8-bit, 16MHz) | ESP32-C3 (RISC-V, 160MHz) | 200x performance |
+| RAM | 2 KB | 400 KB | Buffer 16→256 entries |
+| Flash | 32 KB | 4 MB | Full debug symbols |
+| UART | 1 (SoftSerial for 2nd) | 2 Hardware | No timing issues |
+| USB | UART-only | Native CDC | Direct Serial monitor |
+| Logic | 5V | 3.3V | Matches Node2, no level shifter |
 
 ---
 
