@@ -37,9 +37,10 @@ public:
   uint32_t hashIP(const char* ip) {
     if (!ip) return 0;
     
-    uint32_t hash = 5381;
+    uint32_t hash = 0x811c9dc5;  // FNV-1a offset basis
     for (int i = 0; ip[i] != '\0' && i < 15; i++) {
-      hash = ((hash << 5) + hash) + ip[i];
+      hash ^= (uint8_t)ip[i];
+      hash *= 0x01000193;  // FNV-1a prime
     }
     return hash;
   }

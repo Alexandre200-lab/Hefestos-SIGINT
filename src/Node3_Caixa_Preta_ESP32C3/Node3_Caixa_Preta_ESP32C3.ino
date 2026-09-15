@@ -33,6 +33,17 @@ LogEntry log_buffer[LOG_BUFFER_SIZE];
 int log_buffer_idx = 0;
 int log_buffer_count = 0;
 
+// === Buffer Circular de Capturas para Dashboard ===
+#define CAPTURE_HISTORY_SIZE 20
+struct CaptureHistory {
+  uint32_t timestamp;
+  char tipo[10];
+  char dados[64];
+};
+CaptureHistory capture_history[CAPTURE_HISTORY_SIZE];
+int capture_head = 0;
+int capture_count = 0;
+
 void initSDCard() {
   int retries = 0;
   while (!SD.begin(N3_SD_CS, SPI, 20000000, N3_SD_MOSI, N3_SD_MISO, N3_SD_SCK) && retries < SD_RETRY_MAX) {
@@ -129,6 +140,76 @@ void flushRAMBuffer() {
   log_buffer_idx = 0;
 }
 
+// === Buffer Circular de Capturas para Dashboard ===
+void registrarCapture(const char* tipo, const char* dados) {
+  CaptureHistory* entry = &capture_history[capture_head];
+  entry->timestamp = millis();
+  strncpy(entry->tipo, tipo, sizeof(entry->tipo) - 1);
+  entry->tipo[sizeof(entry->tipo) - 1] = '\0';
+  strncpy(entry->dados, dados, sizeof(entry->dados) - 1);
+  entry->dados[sizeof(entry->dados) - 1] = '\0';
+
+  capture_head = (capture_head + 1) % CAPTURE_HISTORY_SIZE;
+  if (capture_count < CAPTURE_HISTORY_SIZE) {
+    capture_count++;
+  }
+}
+
+String getCaptureJSON() {
+  if (capture_count == 0) {
+    return "{\"tipo\":\"NONE\",\"dados\":\"\",\"timestamp\":0}";
+  }
+  int idx = (capture_head - 1 + CAPTURE_HISTORY_SIZE) % CAPTURE_HISTORY_SIZE;
+  CaptureHistory* entry = &capture_history[idx];
+  
+  String json = "{\"tipo\":\"" + String(entry->tipo) + "\",";
+  json += "\"dados\":\"" + String(entry->dados) + "\",";
+  json += "\"timestamp\":" + String(entry->timestamp) + "}";
+  return json;
+}
+
+String getHistoricoJSON() {
+  String json = "{\"total_captures\":" + String(capture_count) + ",";
+  json += "\"capture_history\":[";
+  
+  for (int i = 0; i < capture_count; i++) {
+    int idx = (capture_head - i - 1 + CAPTURE_HISTORY_SIZE) % CAPTURE_HISTORY_SIZE;
+    CaptureHistory* entry = &capture_history[idx];
+    
+    if (i > 0) json += ",";
+    json += "{\"tipo\":\"" + String(entry->tipo) + "\",";
+    json += "\"dados\":\"" + String(entry->dados) + "\",";
+    json += "\"timestamp\":" + String(entry->timestamp) + "}";
+  }
+  json += "]}";
+  return json;
+}
+
+void clearCaptureHistory() {
+  capture_head = 0;
+  capture_count = 0;
+  debug.log("Capture history cleared");
+}
+
+// === Processar Comandos Seriais do Node2 ===
+void processSerialCommands() {
+  if (!SerialNode2.available()) return;
+  
+  String cmd = SerialNode2.readStringUntil('\n');
+  cmd.trim();
+  
+  if (cmd == "GET_CAPTURE") {
+    SerialNode2.println(getCaptureJSON());
+  }
+  else if (cmd == "GET_HISTORICO") {
+    SerialNode2.println(getHistoricoJSON());
+  }
+  else if (cmd == "CLEAR_HISTORICO") {
+    clearCaptureHistory();
+    SerialNode2.println("{\"status\":\"ok\"}");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   debug.begin(115200);
@@ -214,6 +295,8 @@ void loop() {
 
             Serial.println(dados);
             total_logs++;
+            
+            registrarCapture(tipo, dados);
 
             if (DEBUG_MODE) {
               Serial.print("    Bytes: ");
@@ -243,5 +326,6 @@ void loop() {
     }
   }
 
+  processSerialCommands();
   serialProto.sendHeartbeat(SerialNode2);
 }

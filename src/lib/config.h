@@ -346,6 +346,7 @@ public:
     saveEncrypted();
   }
 
+#ifdef DEBUG_MODE
   void dumpKeys() {
     debug.log("=== HEFESTOS KEY DUMP ===");
     debug.log("Use these to recover if chip is replaced:");
@@ -358,6 +359,11 @@ public:
     debug.logf("CLI Pass: %s", config.cli_pass);
     debug.logf("TOTP Secret: [check totp_auth.h]");
   }
+#else
+  void dumpKeys() {
+    debug.logError("dumpKeys() disabled in production build");
+  }
+#endif
 
   bool isInitialized() { return initialized; }
 
