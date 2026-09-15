@@ -83,5 +83,7 @@
 #define FLAG_DEBUG_MODE       0x01
 #define FLAG_FACTORY_RESET    0x02
 #define FLAG_KEYS_GENERATED   0x04
+#define FLAG_FW_VERSION       0xF8  // 3 bits for version (0-7)
+#define FLAG_FW_MINOR         0x07  // 3 bits for minor version
 
 #endif // HEFESTOS_PINS_H
