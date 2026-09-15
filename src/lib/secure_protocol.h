@@ -41,10 +41,13 @@ public:
         return ++tx_counter;
     }
 
-    // Verifica se counter é válido (maior que último válido)
+// Verifica se counter é válido (maior que último válido)
+// Com tolerância para drift de clock (máximo 1000 counters)
     // Sem reset periódico — uint32_t não overflowa em uso real (2^32 a 1/min = 8000 anos)
     bool isValidCounter(uint32_t counter) {
-        return counter > last_valid_counter;
+        if (counter <= last_valid_counter) return false;
+        // Permitir gap máximo de 1000 counters para clock drift
+        return (counter - last_valid_counter) <= 1000;
     }
 
     // Atualiza último counter válido
