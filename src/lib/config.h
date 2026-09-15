@@ -196,6 +196,20 @@ public:
     
     uint16_t magic = (EEPROM.read(EEPROM_ADDR_MAGIC) << 8) | EEPROM.read(EEPROM_ADDR_MAGIC + 1);
     
+    // Extract firmware version from flags (3 bits)
+    uint8_t fw_flags = EEPROM.read(EEPROM_ADDR_FLAGS);
+    uint8_t stored_version = (fw_flags & FLAG_FW_VERSION) >> 3;
+    uint8_t stored_minor = fw_flags & FLAG_FW_MINOR;
+    
+    // Safe-mode check: if version mismatch, read-only mode
+    bool version_match = (stored_version == 4);  // FW_VERSION = 4
+    
+    if (!version_match) {
+      debug.log("SAFE MODE: Firmware version mismatch - read only");
+      // Disable non-essential functions, prevent EEPROM writes
+      config.flags &= ~FLAG_KEYS_GENERATED;  // Prevent key changes
+    }
+    
     if (magic != EEPROM_MAGIC && magic != EEPROM_MAGIC_V2 && magic != EEPROM_MAGIC_V3) {
       loadDefaults();
       if ((config.flags & FLAG_KEYS_GENERATED) == 0) {
@@ -324,6 +338,7 @@ public:
     memset(&config, 0, sizeof(config));
     config.magic = EEPROM_MAGIC;
     config.version = 4;
+    config.flags = (4 << 3) | 0x01;  // FW_VERSION=4, MINOR=1
     generateUniqueKeys();
     generateSecurePassword(config.wifi_pass, WIFI_PASS_SIZE);
     generateSecurePassword(config.cli_pass, CLI_PASS_SIZE);
@@ -345,6 +360,13 @@ public:
   }
 
   bool isInitialized() { return initialized; }
+
+  uint8_t getFirmwareVersion() { return (config.flags & FLAG_FW_VERSION) >> 3; }
+  uint8_t getFirmwareMinor() { return config.flags & FLAG_FW_MINOR; }
+
+  bool isFirmwareVersion(uint8_t version) {
+    return (config.flags & FLAG_FW_VERSION) >> 3 == version;
+  }
 };
 
 #endif // CONFIG_H
