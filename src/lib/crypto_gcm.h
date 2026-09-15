@@ -21,8 +21,9 @@ private:
     static bool isRNGReady() {
         uint8_t test[8];
         esp_fill_random(test, 8);
-        for (int i = 0; i < 8; i++) if (test[i]) return true;
-        return false;
+        int non_zero = 0;
+        for (int i = 0; i < 8; i++) if (test[i]) non_zero++;
+        return non_zero >= 4;  // 50% minimum entropy threshold
     }
 
 public:
