@@ -1,22 +1,22 @@
-// Node 3: Caixa Preta Forense e Interface Serial (Arduino) - v2.1
-// Melhorias: RAM buffer flush quando SD voltar, protocolo CRC completo
-#include <SoftwareSerial.h>
+// Node 3: Caixa Preta Forense e Interface Serial (Arduino) - v4.0
+// Migração: HardwareSerial, LEDC PWM buzzer, buffer RAM 256 slots
 #include <SPI.h>
 #include <SD.h>
 
 #include "../../lib/serial_protocol.h"
 #include "../../lib/debug.h"
 
-SoftwareSerial SerialESP(2, 3);
-
-#define LED_VERDE 7
-#define LED_VERMELHO 8
-#define BUZZER 9
+#define LOG_BUFFER_SIZE 256
 #define CS_SD 4
 
-#define DEBUG_MODE 1
-#define SD_RETRY_MAX 3
-#define SD_RETRY_DELAY 500
+#define DEBUG_MODE 0
+
+// Pins definidos via hefestos_pins.h centralizado v4.0
+// #define LED_VERDE 7
+// #define LED_VERMELHO 8
+// #define BUZZER 9
+
+#include "../../lib/hefestos_pins.h"
 
 File arquivoLog;
 SerialProtocol serialProto;
@@ -27,7 +27,6 @@ uint32_t failed_writes = 0;
 unsigned long last_sd_check = 0;
 bool sd_ok = false;
 
-#define LOG_BUFFER_SIZE 16
 struct LogEntry {
   uint32_t timestamp;
   char tipo[10];
@@ -41,7 +40,7 @@ void initSDCard() {
   int retries = 0;
   while (!SD.begin(CS_SD) && retries < SD_RETRY_MAX) {
     debug.logError("SD init failed, retrying...");
-    tone(BUZZER, 300, 200);
+    toneBuzzer(300, 200);
     delay(SD_RETRY_DELAY);
     retries++;
   }
@@ -49,9 +48,9 @@ void initSDCard() {
   if (SD.begin(CS_SD)) {
     sd_ok = true;
     debug.log("SD Card initialized OK");
-    tone(BUZZER, 1000, 100);
+    toneBuzzer(1000, 100);
     delay(100);
-    tone(BUZZER, 1500, 100);
+    toneBuzzer(1500, 100);
 
     if (!SD.exists("HEFESTOS.CSV")) {
       arquivoLog = SD.open("HEFESTOS.CSV", FILE_WRITE);
@@ -65,7 +64,7 @@ void initSDCard() {
   } else {
     sd_ok = false;
     debug.logError("SD Card FAILED - using RAM buffer only");
-    tone(BUZZER, 500, 500);
+    toneBuzzer(500, 500);
   }
 }
 
@@ -124,19 +123,28 @@ void flushRAMBuffer() {
   log_buffer_idx = 0;
 }
 
+void toneBuzzer(int freq, int duration) {
+  ledcSetup(BUZZER_PWM_CHANNEL, freq, 8);
+  ledcAttachPin(BUZZER, BUZZER_PWM_CHANNEL);
+  ledcWrite(BUZZER_PWM_CHANNEL, 128);
+  delay(duration);
+  ledcWrite(BUZZER_PWM_CHANNEL, 0);
+  ledcDetachPin(BUZZER);
+}
+
 void setup() {
   Serial.begin(115200);
   debug.begin(115200);
 
-  SerialESP.begin(9600);
+  // HardwareSerial substitui SoftwareSerial
+  SerialNode2.begin(9600, SERIAL_8N1, N3_UART_RX, N3_UART_TX);
 
-  pinMode(LED_VERDE, OUTPUT);
-  pinMode(LED_VERMELHO, OUTPUT);
-  pinMode(BUZZER, OUTPUT);
+  pinMode(N3_LED_GREEN, OUTPUT);
+  pinMode(N3_LED_RED, OUTPUT);
 
   Serial.println("=========================================");
-  Serial.println(" HEFESTOS - DATA LOGGER FORENSE v2.1");
-  Serial.println(" CRC16 + RAM Flush + Error Recovery");
+  Serial.println(" HEFESTOS - DATA LOGGER FORENSE v4.0");
+  Serial.println(" ESP32-C3 + CRC16 + RAM Flush + Recovery");
   Serial.println("=========================================");
 
   initSDCard();
@@ -154,13 +162,13 @@ void loop() {
     }
   }
 
-  if (SerialESP.available()) {
+  if (SerialNode2.available()) {
     SerialFrame frame;
     uint8_t buffer[512];
     int buffer_idx = 0;
 
-    while (SerialESP.available() && buffer_idx < 512) {
-      uint8_t b = SerialESP.read();
+    while (SerialNode2.available() && buffer_idx < 512) {
+      uint8_t b = SerialNode2.read();
       buffer[buffer_idx++] = b;
 
       if (buffer_idx > 1 && buffer[buffer_idx - 1] == SERIAL_FRAME_END &&
@@ -168,7 +176,7 @@ void loop() {
         if (serialProto.decodeFrame(buffer, buffer_idx, &frame)) {
           if (frame.type == FRAME_DATA) {
             char tipo[16];
-char dados[64];
+            char dados[64];
 
             int pipe_pos = 0;
             for (int i = 0; i < frame.len && pipe_pos == 0; i++) {
@@ -196,15 +204,15 @@ char dados[64];
             addToRAMBuffer(timestamp, tipo, dados);
 
             if (strcmp(tipo, "ALVO") == 0) {
-              digitalWrite(LED_VERDE, HIGH);
-              tone(BUZZER, 2000, 200);
+              digitalWrite(N3_LED_GREEN, HIGH);
+              toneBuzzer(2000, 200);
               delay(50);
-              digitalWrite(LED_VERDE, LOW);
+              digitalWrite(N3_LED_GREEN, LOW);
               Serial.print("[+] ALVO_TX: ");
             } else {
-              digitalWrite(LED_VERMELHO, HIGH);
+              digitalWrite(N3_LED_RED, HIGH);
               delay(30);
-              digitalWrite(LED_VERMELHO, LOW);
+              digitalWrite(N3_LED_RED, LOW);
               Serial.print("[!] SNIFF_RX: ");
             }
 
@@ -239,5 +247,5 @@ char dados[64];
     }
   }
 
-  serialProto.sendHeartbeat(SerialESP);
+  serialProto.sendHeartbeat(SerialNode2);
 }

@@ -11,11 +11,12 @@ Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e tele
 | **Config** | Header centralizado `hefestos_pins.h` (pins, EEPROM, limites) |
 | **Build** | Script unificado `build.sh` — compila os 3 nós do zero |
 | **Node1** | Refatorado para pins centralizados, CSMA/CA no LoRa |
-| **Node2** | Session-based HTTP auth, StaticJson, String→char arrays |
+| **Node2** | Session-based HTTP auth, StaticJson, String→char arrays, V4.1 features (banda sweep, jamming detection, OTA) |
 | **Node3** | **Migrado Arduino Uno → ESP32-C3**: HardwareSerial nativo, LEDC PWM, buffer RAM 16→256, 3.3V logic (sem level shifter) |
 | **EEPROM** | Criptografada com chave derivada do efuse MAC (AES-256-GCM + PBKDF2 100k) |
-| **HTTP** | Session tokens (Bearer/Cookie), idle 30min / absolute 4h, rate limit |
-| **LoRa** | Nonce derivado SHA-256 (elimina padrão de counter), RNG check |
+| **HTTP** | Session tokens (Bearer/Cookie), idle 30min / absolute 4h, rate limit anônimo (hash) |
+| **LoRa** | Nonce derivado SHA-256(counter || random_4B) → 12B nonce; CSMA/CA com backoff 1000ms |
+| **Segurança** | `isRNGReady()`: threshold 4/8 bytes entropia; `isValidCounter()`: janela 1000 counters drift tolerance; `secureCompare`: constant-time comparation |
 
 ### Correções de Segurança v4.0
 
@@ -81,11 +82,13 @@ O histórico do git ainda contém credenciais expostas — use `git filter-branc
 - Detecção de replay attacks
 - Controle rádio (AM/FM/SW)
 
-### 3. Node 3 (Caixa Preta - Arduino)
+### 3. Node 3 (Caixa Preta - ESP32-C3)
 - Log forense em SD Card
 - CRC16 UART
-- RAM fallback (50 slots)
-- LEDs/Buzzer
+- Buffer RAM 256 slots (expandido de 16 entries)
+- LEDs/Buzzer via LEDC PWM
+- UART nativo (sem SoftwareSerial)
+- 3.3V logic (sem level shifter - compatível com Node2)
 
 ---
 
@@ -126,10 +129,31 @@ RX Scanner:    SDA(21), SCL(22), RST(12)
 UART Node3:   TX(17), RX(16)
 ```
 
-### Node 3 (Arduino)
+## Compilação
+
+```bash
+# ESP32 boards
+arduino-cli core install esp32:esp32
+arduino-cli core install arduino:avr
+
+# Compilar Node1
+arduino-cli compile -b esp32:esp32:esp32 src/Node1_Transmissor_Alvo/
+
+# Compilar Node2
+arduino-cli compile -b esp32:esp32:esp32 src/Node2_Base_Hefestos/
+
+# Compilar Node3 (ESP32-C3)
+arduino-cli compile -b esp32:esp32:esp32c3 src/Node3_Caixa_Preta_ESP32C3/
 ```
-SD Card:      CS(4), MOSI(11), MISO(12), SCK(13)
-UART:        RX(0), TX(1)
+
+---
+<tool_call>
+<function=edit>
+<parameter=newString>
+### Node 3 (Caixa Preta - ESP32-C3)
+```
+SD Card:      CS(4), MOSI(6), MISO(5), SCK(7)
+UART:        RX(20), TX(21)
 LEDs/Buzzer: 7, 8, 9
 ```
 
@@ -190,10 +214,10 @@ arduino-cli compile -b arduino:avr:uno src/Node3_Caixa_Preta_Arduino/
 
 ## Versão
 
-- **Versão atual**: 3.1.0
-- **Data**: 2026-07-15
+- **Versão atual**: 4.0.0
+- **Data**: 2026-09-15
 - **Status**: Production-ready (security hardened)
-- **Compatibilidade**: ESP32, Arduino Uno/Mega
+- **Compatibilidade**: ESP32, ESP32-C3, Arduino Uno (modo legado)
 
 ---
 

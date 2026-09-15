@@ -17,7 +17,7 @@ class AESGCM {
 private:
     unsigned char key[GCM_KEY_SIZE];
 
-    // Verify RNG is producing non-zero entropy
+// Verify RNG is producing non-zero entropy
     static bool isRNGReady() {
         uint8_t test[8];
         esp_fill_random(test, 8);
