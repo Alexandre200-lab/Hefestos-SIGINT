@@ -1,4 +1,4 @@
-# HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v4.0)
+# HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v4.1)
 
 Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e telemetria com arquitetura Master-Slave distribuída. Realiza rastreamento GPS criptografado (AES-GCM), transmissão via LoRa (915 MHz Sub-GHz), interceptação de RF (AM/FM/SW), e retenção forense em SD Card com autenticação 2FA.
 
@@ -156,6 +156,42 @@ SD Card:      CS(4), MOSI(6), MISO(5), SCK(7)
 UART:        RX(20), TX(21)
 LEDs/Buzzer: 7, 8, 9
 ```
+
+---
+
+## Dashboard Web (v4.1)
+
+### Endpoints Disponíveis
+
+| Endpoint | Método | Auth | Descrição |
+|----------|--------|------|-----------|
+| `/` | GET | Sim | Dashboard HTML completo |
+| `/login` | POST | Não | Autenticação HTTP |
+| `/logout` | POST | Sim | Encerrar sessão |
+| `/dados` | GET | Sim | Status operacional JSON |
+| `/sintonizar` | GET | Sim | Controle rádio (parâmetros: `b`, `f`) |
+| `/ultima` | GET | Sim | Última captura capturada |
+| `/historico` | GET | Sim | Últimas 20 capturas |
+| `/clear_historico` | POST | Sim | Limpar histórico |
+| `/jamming` | GET | Sim | Status de jamming |
+| `/ota` | POST | Sim | Atualização firmware |
+
+### Dashboard Features
+
+- **Status Operacional**: RX, GCM OK/FAIL, RSSI, contadores
+- **Última Captura**: Tipo (ALVO/SNIFF_RX), dados, timestamp
+- **Histórico**: Lista das últimas 20 capturas com timestamp
+- **Atualização Automática**: Polling a cada 2 segundos
+- **Controles**: Botão atualizar manual e limpar histórico
+- **Indicadores Visuais**: Status de sinal (FORTE/BOM/FRACO)
+
+### Comandos Seriais (Node2 → Node3)
+
+| Comando | Resposta | Descrição |
+|---------|----------|-----------|
+| `GET_CAPTURE` | JSON `{tipo, dados, timestamp}` | Retorna última captura |
+| `GET_HISTORICO` | JSON `{total_captures, capture_history[]}` | Retorna histórico completo |
+| `CLEAR_HISTORICO` | JSON `{status: "ok"}` | Limpa buffer de histórico |
 
 ---
 

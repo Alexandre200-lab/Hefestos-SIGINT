@@ -44,6 +44,21 @@
 | `src/lib/config.h` | Safe-mode boot on version mismatch, `getFirmwareVersion()`, `getFirmwareMinor()`, `isFirmwareVersion()` |
 | `factoryReset()` | Sets firmware flags v4.1 automatically |
 
+### Phase 5: Dashboard Web + Capture History
+
+| Component | Feature | Description |
+|-----------|---------|-------------|
+| **Node3** | `capture_history[20]` | Buffer circular de 20 capturas para dashboard (RAM volátil) |
+| **Node3** | `registrarCapture()` | Registra cada pacote capturado no buffer circular |
+| **Node3** | `getCaptureJSON()` | Retorna última captura em formato JSON |
+| **Node3** | `getHistoricoJSON()` | Retorna histórico das últimas 20 capturas |
+| **Node3** | `processSerialCommands()` | Processa comandos `GET_CAPTURE`, `GET_HISTORICO`, `CLEAR_HISTORICO` via serial |
+| **Node2** | `/ultima` (GET) | Retorna última captura via serial do Node3 |
+| **Node2** | `/historico` (GET) | Retorna histórico completo via serial do Node3 |
+| **Node2** | `/clear_historico` (POST) | Limpa buffer de histórico no Node3 |
+| **Node2** | `index_html` (PROGMEM) | Dashboard web completo com polling a cada 2s |
+| **Node2** | `SerialNode2` | UART 9600 baud para comunicação com Node3 |
+
 ---
 
 ## v4.0.0 - Architecture Unification (2026-07-24)
