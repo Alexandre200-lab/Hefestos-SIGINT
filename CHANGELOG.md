@@ -1,7 +1,48 @@
-# CHANGELOG - HEFESTOS SIGINT v4.0
+# CHANGELOG - HEFESTOS SIGINT v4.1
 
-## Data: 2026-07-24
-## Status: Architecture Unification Complete
+## Data: 2026-09-15
+## Status: All 4 Phases Complete - Production Ready
+
+---
+
+## v4.1.0 - Hardening + V4.1 Features (2026-09-15)
+
+### Phase 1: Cryptographic Hardening
+
+| File | Function | Change |
+|------|----------|--------|
+| `src/lib/crypto_gcm.h` | `isRNGReady()` | Requires 4/8 non-zero bytes (50% entropy threshold) instead of any single byte |
+| `src/lib/secure_protocol.h` | `isValidCounter()` | Added 1000-counter tolerance window for clock drift |
+
+### Phase 2: Node3 Arduino → ESP32-C3 Migration
+
+| Change | Before (Arduino v2.1) | After (ESP32-C3 v4.0) |
+|--------|----------------------|----------------------|
+| Serial | `SoftwareSerial SerialESP(2, 3)` | `HardwareSerial SerialNode2(0)` |
+| RAM Buffer | `LOG_BUFFER_SIZE 16` | `LOG_BUFFER_SIZE 256` (16x) |
+| Buzzer | `tone(BUZZER, freq, dur)` | `toneBuzzer(freq, dur)` LEDC PWM |
+| Pins | `LED_VERDE 7`, `LED_VERMELHO 8`, `BUZZER 9` | `hefestos_pins.h` centralized |
+| Debug | `DEBUG_MODE 1` | `DEBUG_MODE 0` (build flag) |
+| Branding | "v2.1" | "v4.0" / "ESP32-C3" |
+
+### Phase 3: V4.1 Architecture Features (Node2)
+
+| Feature | Description |
+|---------|-------------|
+| `barridaBanda()` | Auto FM/AM/SW band sweep with RSSI logging |
+| `monitorLinkQuality()` | Jamming detection via SNR estimation |
+| `isJammingDetected()` | Jamming status query |
+| `/ota` endpoint | Over-the-air update with session auth |
+| `/jamming` endpoint | Jamming status JSON response |
+| Loop band sweep | Periodic 30-second band sweep |
+
+### Phase 4: Rollout Mechanism + EEPROM Versioning
+
+| File | Change |
+|------|--------|
+| `src/lib/hefestos_pins.h` | Added `FLAG_FW_VERSION` (0xF8) and `FLAG_FW_MINOR` (0x07) |
+| `src/lib/config.h` | Safe-mode boot on version mismatch, `getFirmwareVersion()`, `getFirmwareMinor()`, `isFirmwareVersion()` |
+| `factoryReset()` | Sets firmware flags v4.1 automatically |
 
 ---
 
@@ -158,5 +199,5 @@ Histórico git contém credenciais expostas — use BFG Repo-Cleaner para purgar
 
 ## Versão
 
-- **Atual**: 3.1.0
-- **Data**: 2026-07-15
+- **Atual**: 4.1.0
+- **Data**: 2026-09-15
