@@ -44,36 +44,41 @@ CaptureHistory capture_history[CAPTURE_HISTORY_SIZE];
 int capture_head = 0;
 int capture_count = 0;
 
+bool initializeSDCardHardware() {
+  return SD.begin(N3_SD_CS, SPI, 20000000, N3_SD_MOSI, N3_SD_MISO, N3_SD_SCK);
+}
+
 void initSDCard() {
   int retries = 0;
-  while (!SD.begin(N3_SD_CS, SPI, 20000000, N3_SD_MOSI, N3_SD_MISO, N3_SD_SCK) && retries < SD_RETRY_MAX) {
+  while (retries < SD_RETRY_MAX) {
+    if (initializeSDCardHardware()) {
+      sd_ok = true;
+      debug.log("SD Card initialized OK");
+      toneBuzzer(1000, 100);
+      delay(100);
+      toneBuzzer(1500, 100);
+
+      if (!SD.exists("HEFESTOS.CSV")) {
+        arquivoLog = SD.open("HEFESTOS.CSV", FILE_WRITE);
+        if (arquivoLog) {
+          arquivoLog.println("TEMPO_MS,TIPO,DADOS");
+          arquivoLog.close();
+        }
+      }
+
+      flushRAMBuffer();
+      return;
+    }
+
     debug.logError("SD init failed, retrying...");
     toneBuzzer(300, 200);
     delay(SD_RETRY_DELAY);
     retries++;
   }
 
-  if (SD.begin(N3_SD_CS, SPI, 20000000, N3_SD_MOSI, N3_SD_MISO, N3_SD_SCK)) {
-    sd_ok = true;
-    debug.log("SD Card initialized OK");
-    toneBuzzer(1000, 100);
-    delay(100);
-    toneBuzzer(1500, 100);
-
-    if (!SD.exists("HEFESTOS.CSV")) {
-      arquivoLog = SD.open("HEFESTOS.CSV", FILE_WRITE);
-      if (arquivoLog) {
-        arquivoLog.println("TEMPO_MS,TIPO,DADOS");
-        arquivoLog.close();
-      }
-    }
-
-    flushRAMBuffer();
-  } else {
-    sd_ok = false;
-    debug.logError("SD Card FAILED - using RAM buffer only");
-    toneBuzzer(500, 500);
-  }
+  sd_ok = false;
+  debug.logError("SD Card FAILED - using RAM buffer only");
+  toneBuzzer(500, 500);
 }
 
 void toneBuzzer(int freq, int duration) {
