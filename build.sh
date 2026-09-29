@@ -1,6 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
+if ! command -v arduino-cli >/dev/null 2>&1; then
+  echo "ERROR: arduino-cli not found. Install it before building the project."
+  echo "Docs: https://arduino.github.io/arduino-cli/latest/installation/"
+  exit 127
+fi
+
 BOARD_ESP32="esp32:esp32:esp32"
 BOARD_ESP32C3="esp32:esp32:esp32c3"
 BUILD_DIR="build"
