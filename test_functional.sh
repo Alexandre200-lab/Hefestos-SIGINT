@@ -32,7 +32,7 @@ echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/8] Invariantes de pinagem"
+echo "[1/9] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -70,7 +70,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/8] Layout do protocolo LoRa"
+echo "[2/9] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -110,7 +110,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/8] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/9] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -141,7 +141,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/8] Ausencia de legado inseguro"
+echo "[4/9] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -156,7 +156,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/8] Anti-replay estrito e TOTP ativo"
+echo "[5/9] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -176,7 +176,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/8] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/9] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -191,7 +191,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/8] Estado anti-replay persistido (replay pos-reboot)"
+echo "[7/9] Estado anti-replay persistido (replay pos-reboot)"
 REPLAY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -230,7 +230,59 @@ fi
 [ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[8/8] Build dos tres nos"
+echo "[8/9] Orcamento de RF (tempo no ar e duty cycle)"
+BUDGET=0
+if command -v g++ >/dev/null 2>&1; then
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/link_budget.cpp" -o /tmp/hef_budget_test 2>/tmp/hef_budget_cc.log; then
+        if /tmp/hef_budget_test > /tmp/hef_budget_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_budget_run.log | head -6
+            echo "  ... (ver /tmp/hef_budget_run.log para o restante)"
+            echo "  [PASS] orcamento de RF (51 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_budget_run.log || true
+            echo "  [FAIL] orcamento de RF"; BUDGET=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de orcamento falhou:"
+        head -20 /tmp/hef_budget_cc.log
+        BUDGET=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (teste de orcamento nao executado)"
+fi
+# A ferramenta de linha de comando valida a MESMA formula contra a tabela
+# oficial do RP002. Se firmware e ferramenta divergirem, o duty cycle
+# real sera diferente do planejado.
+if command -v python3 >/dev/null 2>&1; then
+    if python3 "$ROOT/tools/airtime.py" --selftest > /tmp/hef_airtime.log 2>&1; then
+        echo "  [PASS] tools/airtime.py reproduz a tabela RP002"
+    else
+        grep -E "FALHA|divergencia" /tmp/hef_airtime.log || true
+        echo "  [FAIL] tools/airtime.py divergiu da tabela RP002"; BUDGET=1
+    fi
+else
+    echo "  [SKIP] python3 nao instalado (airtime.py nao executado)"
+fi
+# O firmware tem de usar parametros viaveis: SF8 a 1/30 s.
+if grep -q "#define LORA_SF  *8" "$ROOT/lib/src/hefestos_pins.h" &&
+   grep -q "#define LORA_TX_INTERVAL_MIN_MS 30000UL" "$ROOT/lib/src/hefestos_pins.h"; then
+    echo "  [PASS] parametros de RF viaveis (SF8 a 1/30 s)"
+else
+    echo "  [FAIL] parametros de RF continuam inviaveis"; BUDGET=1
+fi
+# O firmware precisa IMPEDIR a transmissao quando o duty cycle seria violado.
+if grep -q "dutyGuard.allows" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino" &&
+   grep -q "dutyGuard.allows" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
+    echo "  [PASS] firmware impede violacao do duty cycle (Node1 e Node2)"
+else
+    echo "  [FAIL] firmware nao aplica o orcamento de duty cycle"; BUDGET=1
+fi
+[ $BUDGET -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[9/9] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

@@ -95,18 +95,61 @@
 // ============================================================
 // LORA
 // ============================================================
+// v5.1.0 - CORRECAO DE VIABILIDADE DE RF
+//   A v5.0.0 usava SF10 com 1 frame/s: o ciclo completo (telemetria + ACK)
+//   ocupa 2256,9 ms de tempo no ar a cada 1000 ms -> duty cycle de 225%.
+//   Isso e' fisicamente impossivel (o enlace nao pode ocupar mais de 100%
+//   do tempo): o resultado e' colisao permanente, fila no driver LoRa e
+//   consumo de 6,5 Ah/dia so de TX.
+//
+//   Com SF8 e um intervalo de 30 s o ciclo cai para 564,2 ms:
+//     duty cycle 1,88%  |  TX 0,054 Ah/dia  |  alcance 3x maior que SF10.
+//
+//   TEMPO NO AR (formula validada contra a tabela RP002, ver
+//   tools/airtime.py --selftest):
+//     SF10: telemetria 1312,8 ms + ACK 944,1 ms = 2256,9 ms
+//     SF8 : telemetria  328,2 ms + ACK 236,0 ms =  564,2 ms
+//
 #define LORA_FREQ          915E6
-#define LORA_SF            10
+#define LORA_SF            8
 #define LORA_BW            125E3
 #define LORA_TX_POWER      20
 #define LORA_CCA_RSSI_DBM  (-90)    // limiar de channel sensing (RSSI do SX1276)
 #define LORA_CCA_WINDOW_MS  1000
 #define LORA_CCA_BACKOFF_MS 200
 
+// Perfil regional de referencia (ver lib/src/band_plan.h).
+// ATENCAO: valores de engenharia, nao parecer juridico. O operador deve
+// confirmar o perfil e os limites vigentes na sua jurisdicao.
+#define HEF_BAND_PROFILE   "915-ANATEL"
+
+// Intervalo minimo entre ciclos de transmissao e o jitter aplicado
+// (+/- LORA_TX_JITTER_PCT) para dessincronizar a frota (evita colisao
+// quando varias unidades acordam juntas).
+#define LORA_TX_INTERVAL_MIN_MS 30000UL
+#define LORA_TX_JITTER_PCT      10
+// Corrente de TX usada nas estimativas de energia (SX1276 @ 20 dBm).
+#define LORA_TX_CURRENT_MA      120.0f
+
 // ============================================================
 // GPS
 // ============================================================
-#define GPS_POLL_INTERVAL_MS   1000
+// v5.1.0: removido `GPS_POLL_INTERVAL_MS` (1000 ms).
+//
+//   A constante era enganosa: NAO controlava nenhuma leitura do GPS. O
+//   Node 1 drena a UART do GNSS CONTINUAMENTE no loop principal
+//   (`while (gpsSerial.available()) gps.encode(...)`), e o modulo GNSS
+//   decide a propria taxa de saida (1 Hz por padrao). O que a constante
+//   controlava, na pratica, era o INTERVALO DE TRANSMISSAO do link LoRa
+//   (o `if (now - lastTxMs >= GPS_POLL_INTERVAL_MS)`), que e' agora
+//   governado por `LORA_TX_INTERVAL_MIN_MS` + o orcamento de duty cycle.
+//
+//   Como o radio consumia mais que o GNSS, o gargalo real era o radio.
+//   Manter uma constante morta e enganosa num arquivo que se declara
+//   "fonte unica de verdade" e' pior que remove-la.
+//
+//   A validade do fix continua governada pela idade do ultimo fix
+//   (`GPS_FIX_MAX_AGE_MS`), que independe da taxa de leitura.
 #define GPS_FIX_MAX_AGE_MS     5000
 #define GPS_MIN_SATS           4
 

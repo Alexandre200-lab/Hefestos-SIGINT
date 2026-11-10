@@ -31,6 +31,8 @@
 #include <link_protocol.h>
 #include <provisioning.h>
 #include <secure_protocol.h>
+#include <link_budget.h>
+#include <band_plan.h>
 
 // ---------------------------------------------------------------------
 // Estado global
@@ -56,6 +58,57 @@ static uint32_t ackCount       = 0;
 static uint32_t retryCount     = 0;
 static uint32_t gpsFixCount    = 0;
 static bool     gpsValid       = false;
+static uint32_t txDenied       = 0;   // transmissoes negadas pelo duty budget
+
+// ---------------------------------------------------------------------
+// Orcamento de RF (v5.1.0)
+// ---------------------------------------------------------------------
+// O perfil regional define o limite de duty cycle. O firmware NAO pode
+// ultrapassar esse limite: antes de cada transmissao o guard verifica o
+// orcamento da janela deslizante de 1 h e, se violar, a transmissao e'
+// suspensa (o operador ve o motivo no console).
+//
+// Alem disso, o intervalo entre ciclos e' derivdo do proprio limite: se
+// o perfil exigir (por exemplo, ETSI a 1%), o intervalo e' alongado
+// automaticamente ate caber no orcamento.
+static const HefBandProfile* band = HefBandPlan::active();
+static HefDutyGuard dutyGuard;
+
+static HefLinkParams linkParams() {
+    HefLinkParams p;
+    p.sf = LORA_SF;
+    p.bwKHz = 125;
+    p.crNum = 4;
+    return p;
+}
+
+// Tempo no ar do frame de telemetria (ms).
+static uint32_t trackAirtimeMs() {
+    return HefLinkBudget::airtimeMs(HEF_TRACK_FRAME_LEN, linkParams());
+}
+
+// Intervalo efetivo entre ciclos: o maior entre o configurado, o minimo
+// do perfil e o intervalo que o duty cycle exige.
+static uint32_t effectiveIntervalMs() {
+    uint32_t cycle = trackAirtimeMs()
+                   + HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
+    uint32_t base = LORA_TX_INTERVAL_MIN_MS;
+    uint32_t need = HefLinkBudget::minIntervalForDuty(band->dutyLimitPercent, cycle);
+    if (need > base) base = need;
+    if (base < band->minIntervalMs) base = band->minIntervalMs;
+    return base;
+}
+
+// Jitter de +/- LORA_TX_JITTER_PCT: dessincroniza a frota (varias
+// unidades acordando juntas colidiria no mesmo instante).
+static uint32_t jitteredIntervalMs(uint32_t base) {
+    int32_t span = (int32_t)((uint32_t)base * LORA_TX_JITTER_PCT / 100UL);
+    if (span <= 0) return base;
+    uint32_t r = esp_random() % (uint32_t)(2 * span + 1);
+    int32_t v = (int32_t)base + ((int32_t)r - span);
+    if (v < 1000) v = 1000;
+    return (uint32_t)v;
+}
 
 // Beacon FM
 static bool     fmBeaconEnabled = false;
@@ -179,6 +232,22 @@ static uint32_t utcFromCivil(int year, int month, int day,
 static bool buildAndSendTrack(uint8_t retry) {
     if (!keyReady) return false;
 
+    // --- Orcamento de duty cycle ---
+    // A transmissao e' recusada ANTES de gastar energia se violar o
+    // limite do perfil regional. Falha fechada: em caso de duvida, nao
+    // transmite.
+    uint32_t airtime = trackAirtimeMs();
+    if (airtime == 0) {
+        dbg.logError("Parametros de RF invalidos: transmissao suspensa");
+        return false;
+    }
+    if (!dutyGuard.allows((uint32_t)millis(), airtime, band->dutyLimitPercent)) {
+        txDenied++;
+        dbg.logf("TX suspensa: duty cycle do perfil %s seria violado (%.2f%%)",
+                 band->name, dutyGuard.dutyCyclePercent((uint32_t)millis()));
+        return false;
+    }
+
     uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
     gpsValid = gps.location.isValid() && sats >= GPS_MIN_SATS &&
                gps.location.age() < GPS_FIX_MAX_AGE_MS;
@@ -248,6 +317,9 @@ static bool buildAndSendTrack(uint8_t retry) {
     LoRa.write(out, frameLen);
     LoRa.endPacket();
 
+    // O airtime e' registrado no orcamento assim que o frame parte.
+    dutyGuard.record((uint32_t)millis(), airtime);
+
     // Retoma a recepcao para pegar o ACK.
     LoRa.receive();
 
@@ -298,6 +370,7 @@ static void printHelp() {
     Serial.println("=== HEFESTOS SIGINT v5 - Node1 (Emissor) ===");
     Serial.println("help              esta ajuda");
     Serial.println("status            estado do link");
+    Serial.println("budget            orcamento de RF (duty cycle, airtime, perfil)");
     Serial.println("id                node_id deste no");
     Serial.println("psk <64 hex>     define o PSK de deploy (32 bytes hex)");
     Serial.println("psk show          mostra se o PSK esta configurado");
@@ -312,10 +385,32 @@ static void handleConsole(char* line) {
     } else if (strncmp(line, "status", 6) == 0) {
         Serial.printf("node_id: %u | key: %s\n", nodeId, keyReady ? "OK" : "AUSENTE");
         Serial.printf("epoch: %u | counter: %u\n", txSeq.epoch(), txSeq.counter());
-        Serial.printf("TX: %u | ACK: %u | retry: %u\n", txCount, ackCount, retryCount);
+        Serial.printf("TX: %u | ACK: %u | retry: %u | negadas: %u\n",
+                      txCount, ackCount, retryCount, txDenied);
         Serial.printf("GPS fix: %u | sats: %u | hdop: %.1f\n",
                       gpsFixCount, (int)(gps.satellites.isValid() ? gps.satellites.value() : 0),
                       gps.hdop.hdop());
+    } else if (strncmp(line, "budget", 6) == 0) {
+        uint32_t track = trackAirtimeMs();
+        uint32_t ack   = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
+        uint32_t cycle = track + ack;
+        uint32_t iv    = effectiveIntervalMs();
+        Serial.printf("perfil: %s (%s)\n", band->name, band->region);
+        Serial.printf("faixa: %.3f-%.3f MHz | SF%d BW%u CR%u/%u | EIRP<=%d dBm\n",
+                      band->freqMinKHz / 1000.0, band->freqMaxKHz / 1000.0,
+                      LORA_SF, linkParams().bwKHz, band->crNum, band->crNum + 1,
+                      band->eirpDbmMax);
+        Serial.printf("airtime: track=%u ms ack=%u ms ciclo=%u ms\n",
+                      track, ack, cycle);
+        Serial.printf("intervalo: %u ms | duty: %.3f%% (limite %.1f%%)\n",
+                      iv, HefLinkBudget::dutyCyclePercent(cycle, iv),
+                      band->dutyLimitPercent);
+        float mahCycle = HefLinkBudget::txEnergyMah(cycle, LORA_TX_CURRENT_MA);
+        float mahDay   = mahCycle * (86400000.0f / (float)iv);
+        Serial.printf("energia TX: %.4f mAh/ciclo | %.3f mAh/dia (%.0f mA)\n",
+                      (double)mahCycle, (double)mahDay, (double)LORA_TX_CURRENT_MA);
+        Serial.printf("duty na janela de 1h: %.3f%% | transmissoes negadas: %u\n",
+                      dutyGuard.dutyCyclePercent((uint32_t)millis()), txDenied);
     } else if (strncmp(line, "id", 2) == 0) {
         Serial.printf("node_id: %u\n", nodeId);
     } else if (strncmp(line, "psk show", 7) == 0) {
@@ -449,10 +544,14 @@ void loop() {
         gpsFixCount++;
     }
 
-    // Transmissao periodica
+    // Transmissao periodica (o intervalo efetivo ja incorpora o duty
+    // cycle exigido pelo perfil regional; o jitter dessincroniza a frota).
     uint32_t now = millis();
-    if (now - lastTxMs >= GPS_POLL_INTERVAL_MS) {
+    static uint32_t txIntervalMs = 0;
+    if (txIntervalMs == 0) txIntervalMs = effectiveIntervalMs();
+    if (now - lastTxMs >= txIntervalMs) {
         lastTxMs = now;
+        txIntervalMs = jitteredIntervalMs(effectiveIntervalMs());
         if (keyReady) {
             buildAndSendTrack(0);
         } else {

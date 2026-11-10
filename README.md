@@ -14,20 +14,28 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 
 ---
 
-## 0. v5.1.0 — estado anti-replay sobrevivente a reinício
+## 0. v5.1.0 — anti-replay sobrevivente a reinício + RF viável
 
-O primeiro item do plano de escala militar: **o anti-replay agora sobrevive a
-um reinício do receptor**.
+Os dois primeiros itens do plano de escala militar:
 
-| | v5.0.0 | v5.1.0 |
-|---|---|---|
+1. **O anti-replay agora sobrevive a um reinício do receptor** (item 1.1) —
+   um frame capturado por SDR não é mais aceito como frame novo depois que
+   o receptor reinicia.
+2. **O link LoRa passa a ser fisicamente viável** (item 1.2) — a v5.0.0
+   operava com 225,7% de duty cycle, o que é impossível.
+
+| v5.0.0 | v5.1.0 |
+|---|---|
 | Estado anti-replay | só em RAM | **persistido no vault cifrado** (TLV `0x0A`) |
 | Frame capturado, replay após reinício | **aceito** | **rejeitado** (`REPLAY` / `STALE_EPOCH`) |
 | Queda longa de link | enlace morria (`FAR`) | reancora o high-water |
+| SF10 a 1 Hz → **225,7% de duty cycle** (inviável) | **SF8 a 1/30 s → 1,88%** |
+| Nenhuma verificação de conformidade de RF | **perfis regionais + firmware impede violar o duty cycle** |
 | Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
-| Testes | 7 grupos | 8 grupos (+75 verificações no host) |
+| Testes | 7 grupos | 9 grupos (+126 verificações no host) |
 
-Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510).
+Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510) e
+[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
 
 ---
 
@@ -62,14 +70,15 @@ O dashboard do Node 2 é servido em `http://<ip-do-node2>/` (SoftAP
 
 ---
 
-## 2. O que mudou da v4.1 para a v5.0.0
+## 2. O que mudou da v4.1 para a v5.1.0
 
 A v4.1 não compilava e tinha falhas que invalidavam as propriedades de segurança
-anunciadas. A v5.0.0 foi uma reescrita com verificação empírica.
+anunciadas. A v5.0.0 foi uma reescrita com verificação empírica; a v5.1.0
+corrige a segurança do enlace e a viabilidade física do link RF (ver §0).
 
 ### 2.1 Build
 
-| Problema na v4.1 | Correção na v5.0.0 |
+| Problema na v4.1 | Correção na v5.0.0/v5.1.0 |
 |---|---|
 | `#include "../lib/..."` quebrava o build (o Arduino copia o sketch para outro diretório) | Biblioteca real em `lib/` com `library.properties`; build com `--libraries <raiz>` |
 | `SD.begin()` com assinatura inexistente no core ESP32 | `SPI.begin(sck, miso, mosi, cs)` + `SD.begin(cs, SPI, 10 MHz)` |
@@ -102,6 +111,12 @@ Resultado medido: Node 1 **24%**, Node 2 **66%**, Node 3 **25%** da flash.
 | Node 3: UART0 para o link, sem console | Link em **UART1**; console em UART0 |
 | Node 1: GPS em UART0, conflitando com o console | GPS em **UART2**; console em UART0 |
 | Pinos de strapping/flash usados no C3 | Conjunto validado por teste automatizado (sem GPIO2/8/9/12–17) |
+
+**RF (v5.1.0):** o link LoRa da v5.0.0 operava com **SF10 a 1 frame/s**, o
+que exige **225,7% de duty cycle** — fisicamente impossível, com 6,5 Ah/dia
+só de TX. Agora são **SF8 a 1/30 s** (duty cycle 1,88%, 0,054 Ah/dia), com
+jitter de ±10%, perfis regionais de referência e **impedimento no firmware**
+de qualquer transmissão que viole o limite. Ver [§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
 
 ### 2.4 ESM (espectro / jamming) — de decorativo para real
 
@@ -371,6 +386,22 @@ esperando o Node 3.
 > GPIO12–17 (flash), GPIO18/19 (USB-JTAG) e GPIO20/21 (UART0) são evitados. O
 > teste `test_functional.sh` falha se essa regra for violada.
 
+### 5.4 Parâmetros de RF do link LoRa (Node 1 ↔ Node 2)
+
+| constante | valor | nota |
+|---|---|---|
+| `LORA_FREQ` | 915 MHz | dentro da faixa de `915-ANATEL` e `915-FCC` |
+| `LORA_SF` | 8 | era 10 na v5.0.0 (duty cycle inviável — ver §9.5) |
+| `LORA_BW` | 125 kHz | |
+| `LORA_TX_POWER` | 20 dBm | abaixo do EIRP máximo de referência do perfil |
+| `LORA_TX_INTERVAL_MIN_MS` | 30 000 ms | era 1 000 ms na v5.0.0 |
+| `LORA_TX_JITTER_PCT` | 10% | dessincroniza a frota |
+| `HEF_BAND_PROFILE` | `915-ANATEL` | perfil regional de referência |
+
+Fonte única de verdade: `lib/src/hefestos_pins.h`. O orçamento, os perfis e
+o comando de console `budget` estão em
+[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
+
 ---
 
 ## 6. Estrutura do repositório
@@ -391,6 +422,8 @@ lib/                     biblioteca compartilhada (Arduino library)
     jamming_detector.h   detecção real de interferência
     field_log.h          log forense com hash chain
     peer_state.h         estado anti-replay persistido por par
+    link_budget.h        tempo no ar, duty cycle e guard de orçamento de RF
+    band_plan.h          perfis de banda regionais de referência
     totp_auth.h          TOTP RFC 6238
     rate_limiter.h       token buckets por IP
     debug.h              logging sem vazamento de segredos
@@ -402,9 +435,12 @@ tests/
   framework.h           micro-framework de teste no host
   serial_roundtrip.cpp  teste de round-trip do protocolo serial (host)
   anti_replay_persistence.cpp  estado anti-replay persistido (host)
+  link_budget.cpp       tempo no ar, duty cycle e guard de RF (host)
   stub/HardwareSerial.h stub Arduino mínimo para compilar no host
+tools/
+  airtime.py            CLI de cálculo de RF (airtime/duty/energia) + --selftest
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + anti-replay + build
+test_functional.sh       invariantes + round-trip + anti-replay + RF + build
 ```
 
 ---
@@ -489,12 +525,16 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 
 ### 9.1 Console serial
 
-**Node 1:** `help`, `status`, `id`, `psk <hex>`, `psk show`,
+**Node 1:** `help`, `status`, `budget`, `id`, `psk <hex>`, `psk show`,
 `fm on|off`, `fm freq <kHz>`, `fm power <0-255>`.
 
-**Node 2:** `help`, `status`, `id`, `psk`, `user`, `pass`, `totp`,
+**Node 2:** `help`, `status`, `budget`, `id`, `psk`, `user`, `pass`, `totp`,
 `wifi`, `settime`, `time`, `enroll <node> <keyid>`, `peers`,
 `sweep on|off|now`, `radio <FM|AM|SW> <kHz>`, `reboot`, `factory`.
+
+> `budget` (Node 1 e Node 2) imprime o perfil regional, a faixa, o tempo no
+> ar, o intervalo efetivo e o duty cycle consumido na janela de 1 h — ver
+> [§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
 
 **Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
 `time <unix>`, `format`, `reboot`.
@@ -534,6 +574,147 @@ Estados: `NORMAL`, `DEGRADED` (SNR mediana abaixo do limite),
 `LINK_LOSS` (nenhum frame LoRa há 15 s). As métricas vêm do RF real —
 não de contadores que nunca eram atualizados.
 
+### 9.5 Orçamento de RF e conformidade regulatória
+
+#### 9.5.1 O que estava errado
+
+A v5.0.0 operava o link LoRa com **SF10 a 1 frame/s**, sem nenhuma
+verificação de orçamento de espectro. O ciclo completo (telemetria + ACK)
+ocupava **2256,9 ms de tempo no ar a cada 1000 ms** — um **duty cycle de
+225,7%**, fisicamente impossível (o enlace não pode ocupar mais de 100% do
+tempo). O resultado prático era colisão permanente, fila no driver LoRa e
+**6,5 Ah/dia só de transmissão** — mais que a bateria de 6,6 Ah do nó.
+
+> **Correção de uma estimativa do próprio plano de escala.** O plano
+>(original) calculava 4564 ms de tempo no ar para SF10/54 B e deduzia
+> 757% de duty cycle. Esse número estava **errado**: a tabela oficial de
+> airtime do RP002 (LoRaWAN Regional Parameters) dá **1312,8 ms** para
+> SF10/54 B. A fórmula correta foi validada contra as 9 referências da
+> tabela oficial (SF7/10/12 × 12/51/115 B, erro < 0,001 ms) e contra a lei
+> de escalonamento exata `2^ΔSF`. A conclusão do plano (inviável) permanece,
+> mas com o número correto: **225,7%**, e 6,5 Ah/dia — não 13,2 Ah/dia.
+>
+> A ferramenta `tools/airtime.py --selftest` é a fonte da verdade e está
+> wired na suíte de testes, para que a fórmula não se degrade.
+
+#### 9.5.2 Configuração adotada
+
+| parâmetro | v5.0.0 | v5.1.0 |
+|---|---|---|
+| Spreading factor | SF10 | **SF8** |
+| Intervalo de TX | 1 s (via `GPS_POLL_INTERVAL_MS`, constante enganosa) | **30 s** (`LORA_TX_INTERVAL_MIN_MS`) |
+| Jitter | nenhum | **±10%** (`LORA_TX_JITTER_PCT`) |
+| Tempo no ar (telemetria 54 B) | 1312,8 ms | **328,2 ms** |
+| Tempo no ar (ACK 35 B) | 944,1 ms | **236,0 ms** |
+| Ciclo completo | 2256,9 ms | **564,2 ms** |
+| **Duty cycle** | **225,7%** (inviável) | **1,88%** |
+| TX por dia (120 mA @ 20 dBm) | 6,5 Ah | **0,054 Ah** |
+
+SF8 também entrega **≈3× mais alcance** que SF10 para a mesma potência
+(ganho de ~10,5 dB no enlace) — o que, no contexto de uma frota, vale mais
+do que a taxa bruta.
+
+> O firmware arredonda o airtime **para cima** (ms inteiros) ao aplicar o
+> orçamento: 329 + 237 = 566 ms, o que dá 1,887% — 0,006 p.p. acima do
+> valor exato de 1,881% da tabela. É uma folga deliberada a favor do
+> operador.
+
+> O item 1.3 do plano (transmissão por evento) ainda não está implementado:
+> hoje o Node 1 transmite **periodicamente** a cada 30 s. O duty cycle
+> mostrado acima é o do regime periódico; com TX por evento o consumo cai
+> proporcionalmente ao número de eventos.
+
+#### 9.5.3 Perfis regionais de referência
+
+`lib/src/band_plan.h` define perfis por região. O perfil ativo é o de
+compilação (`HEF_BAND_PROFILE`, padrão `915-ANATEL`).
+
+| perfil | faixa | SF/BW/CR | EIRP máx | duty cycle |
+|---|---|---|---|---|
+| `915-ANATEL` | 915–928 MHz | SF8 / 125 kHz / 4/5 | 30 dBm | 10% (orçamento próprio) |
+| `915-FCC` | 902–928 MHz | SF8 / 125 kHz / 4/5 | 30 dBm | 10% (orçamento próprio) |
+| `868-ETSI` | 868–870 MHz | SF8 / 125 kHz / 4/5 | 14 dBm | 1% (normativo) |
+
+> **Sub-bandas ETSI:** o duty cycle de 1% vale para a faixa 868,7–869,2 MHz;
+> as sub-bandas 868,0–868,6 MHz e 869,4–869,65 MHz têm limite de **0,1%**
+> (com o firmware atual, isso exigiria um intervalo de ~9,4 min). A sub-banda
+> exata precisa ser confirmada antes de operar.
+
+> ⚠️ **Estes valores são referência de engenharia, NÃO parecer jurídico.**
+> Os limites regulatórios variam por país, por sub-banda, por modalidade de
+> acesso (FHSS, DSSS, LPD/CHIP) e por classe de equipamento. Os limites de
+> duty cycle em `915-ANATEL` e `915-FCC` são **auto-impostos e
+> deliberadamente conservadores** — essas normas não fixam um duty cycle
+> geral para a faixa ISM. O **operador é o único responsável** por confirmar
+> o perfil, a sub-faixa, o EIRP e os limites vigentes (ANATEL, FCC, ETSI)
+> antes de operar. Emitir em frequências reguladas sem autorização é ilegal
+> na maioria das jurisdições.
+
+#### 9.5.4 O firmware impede a violação
+
+O orçamento não é apenas documentação: o firmware **recusa** a
+transmissão quando ela violaria o limite do perfil.
+
+- `HefDutyGuard` (`lib/src/link_budget.h`) mantém uma **janela deslizante
+  de 1 hora**, discretizada em baldes de 1 minuto, com o airtime acumulado.
+- **Node 1** verifica `dutyGuard.allows()` **antes** de gastar energia na
+  telemetria; se violaria, a transmissão é suspensa e o contador
+  `txDenied` é incrementado.
+- **Node 2** faz o mesmo no `sendAck()` — o ACK da base **é uma
+  transmissão** e consome espectro. Contador: `acksDenied`.
+- O **intervalo efetivo** entre ciclos é o maior entre: o configurado, o
+  mínimo do perfil e o intervalo que o duty cycle exige. Com o perfil
+  `868-ETSI` (1%), o intervalo é automaticamente alongado para ~56,6 s
+  (o firmware arredonda o airtime para cima: 566 ms × 100 / 1%).
+- O **jitter de ±10%** dessincroniza a frota: várias unidades acordando
+  juntas colidiriam no mesmo instante.
+
+Falha fechada: em caso de dúvida (parâmetros inválidos, limite zero), o
+firmware **não transmite**.
+
+#### 9.5.5 Verificação
+
+```console
+# Node 1 — console serial
+budget
+perfil: 915-ANATEL (Brasil (ANATEL))
+faixa: 915.000-928.000 MHz | SF8 BW125 CR4/5 | EIRP<=30 dBm
+airtime: track=329 ms ack=237 ms ciclo=566 ms
+intervalo: 30000 ms | duty: 1.887% (limite 10.0%)
+energia TX: 0.0189 mAh/ciclo | 54.337 mAh/dia (120 mA)
+duty na janela de 1h: 0.009% | transmissoes negadas: 0
+
+# Node 2 — console serial
+budget
+perfil: 915-ANATEL (Brasil (ANATEL))
+faixa: 915.000-928.000 MHz | SF8 BW125 | EIRP<=30 dBm | 915 kHz OK
+airtime: track=329 ms ack=237 ms
+energia TX (ACK): 0.0079 mAh/ACK (120 mA)
+duty 1h: 0.007% (limite 10.0%) | ACKs negados: 0
+```
+
+> O `duty` de regime (1,887%) é o do ciclo **periódico**; o `duty na janela
+> de 1 h` é o consumo **acumulado** desde o boot.
+
+```bash
+# Ferramenta de cálculo (host) — a mesma fórmula do firmware
+python3 tools/airtime.py --selftest              # valida contra o RP002
+python3 tools/airtime.py --profile 915-ANATEL --sf 8 --interval 30000
+python3 tools/airtime.py --profile 868-ETSI --sf 8 --interval 30000
+python3 tools/airtime.py --sweep                 # tabela SF × intervalo
+```
+
+A API do Node 2 expõe o orçamento em `/api/status`:
+
+```json
+"rf_budget": {
+  "profile": "915-ANATEL", "region": "Brasil (ANATEL)",
+  "freq_min_khz": 915000, "freq_max_khz": 928000, "eirp_max_dbm": 30,
+  "sf": 8, "bw_khz": 125, "airtime_ack_ms": 237,
+  "duty_limit_pct": 10.0, "duty_used_pct": 0.007, "freq_ok": true
+}
+```
+
 ---
 
 ## 10. Log forense (Node 3)
@@ -554,11 +735,11 @@ não de contadores que nunca eram atualizados.
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + round-trip + build dos 3 nós
+./test_functional.sh            # invariantes + round-trip + orçamento de RF + build
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (8 grupos):
+Cobertura (9 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -575,13 +756,24 @@ Cobertura (8 grupos):
    limite, e o cenário crítico de replay de frame capturado após reinício do
    receptor — com um bloco que demonstra explicitamente que **sem** a
    reidratação o mesmo frame seria aceito (a vulnerabilidade da v5.0.0);
-8. build dos três nós.
+8. **orçamento de RF** (`tests/link_budget.cpp`, 51 verificações no host):
+   tempo no ar contra as 9 referências da tabela oficial do RP002, lei de
+   escalonamento `2^ΔSF`, valores do projeto, parâmetros inválidos,
+   intervalo mínimo por perfil, e o **guard de duty cycle** (que precisa
+   *recusar* a transmissão que violaria o limite). O grupo também executa
+   `tools/airtime.py --selftest` (mesma fórmula, lado Python) e verifica
+   estaticamente que os parâmetros do firmware são viáveis e que o guard
+   está aplicado no Node 1 **e** no Node 2;
+9. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
 compilava e o link Node2↔Node3 simplesmente nunca funcionava em campo. O
 teste de anti-replay existe pelo mesmo motivo: a falha era **silenciosa** e
-só apareceu em análise do modelo de ameaça, não em nenhum teste.
+só apareceu em análise do modelo de ameaça, não em nenhum teste. O teste de
+orçamento de RF existe pelo mesmo motivo: um duty cycle de 225% é
+**matematicamente impossível** e nenhuma compilação ou revisão de código o
+apontava.
 
 ---
 
@@ -652,9 +844,14 @@ Consequências práticas:
 - **Epoch de 16 bits:** o emissor sorteia um epoch novo por boot. Após ~65 536
   boots o epoch pode dar a volta (aritmética de número de série). Migrar para
   epoch de 32 bits na v6.
-- **Duty cycle do link ainda é inviável na taxa atual** (`LORA_SF 10`,
-  `GPS_POLL_INTERVAL_MS 1000`): o tempo no ar exige ~757% de duty cycle. A
-  correção de SF/intervalo é o próximo item do plano de escala.
+- **Duty cycle do link:** viabilizado na v5.1.0 (SF8 a 1/30 s → 1,88%).
+  Porém a transmissão ainda é **periódica**, não por evento: o item 1.3 do
+  plano (TX por movimento/heartbeat) ainda não está implementado. O
+  orçamento do perfil continua sendo respeitado em ambos os regimes.
+- **Perfis de banda são referência de engenharia, não parecer jurídico.**
+  Os limites de duty cycle de `915-ANATEL`/`915-FCC` são auto-impostos e
+  conservadores; o operador deve confirmar o perfil aplicável e os limites
+  vigentes na sua jurisdição antes de operar (ver §9.5.3).
 
 ---
 

@@ -24,9 +24,53 @@
   - `tests/framework.h` (novo): micro-framework de teste reutilizável no host.
   - Indicadores novos em `/api/peers` e no console: `stale_epoch`, `resyncs`,
     `epoch`, `counter`, `state_persisted`.
+- **Orçamento de RF e conformidade regulatória (item 1.2 do plano).** A
+  v5.0.0 operava o link LoRa com SF10 a 1 frame/s sem nenhuma verificação de
+  espectro: o ciclo completo (telemetria + ACK) ocupava 2256,9 ms de tempo
+  no ar a cada 1000 ms — **225,7% de duty cycle**, fisicamente impossível,
+  com 6,5 Ah/dia só de TX.
+  - `lib/src/link_budget.h` (novo): `HefLinkParams`, `HefLinkBudget`
+    (`airtimeUs`/`airtimeMs`/`dutyCyclePercent`/`txEnergyMah`/
+    `minIntervalForDuty`) e `HefDutyGuard` (janela deslizante de 1 h em
+    baldes de 1 min).
+  - `lib/src/band_plan.h` (novo): perfis regionais de referência
+    `915-ANATEL`, `915-FCC` e `868-ETSI` (faixa, SF/BW/CR, EIRP, limite de
+    duty cycle). O perfil ativo é o de compilação (`HEF_BAND_PROFILE`).
+  - `tools/airtime.py` (novo, executável): CLI de cálculo de airtime/duty/
+    energia com `--selftest` (valida a fórmula contra a tabela oficial do
+    RP002), `--profile`, `--sweep`.
+  - `tests/link_budget.cpp` (novo, host): 51 verificações — tabela RP002,
+    lei de escalonamento `2^ΔSF`, valores do projeto, parâmetros inválidos,
+    intervalo mínimo por perfil e o guard de duty cycle (que precisa
+    **recusar** a transmissão violadora).
+  - `lib/src/link_protocol.h`: `HEF_TRACK_FRAME_LEN` e `HEF_ACK_FRAME_LEN`
+    (tamanho real dos frames no ar, usado pelo cálculo de airtime).
+  - Node 1: guard de duty cycle **antes e depois** da TX, intervalo efetivo
+    (configurado ∧ mínimo do perfil ∧ mínimo exigido pelo duty cycle),
+    jitter de ±10% para dessincronizar a frota, contador `txDenied` e
+    comando de console `budget`.
+  - Node 2: guard de duty cycle no `sendAck()` (o ACK da base **é uma
+    transmissão**), contador `acksDenied`, objeto `rf_budget` em
+    `/api/status` e comando de console `budget`.
+  - `test_functional.sh`: novo grupo 8/9 (orçamento de RF), que executa
+    também `tools/airtime.py --selftest` e verifica estaticamente que os
+    parâmetros do firmware são viáveis e que o guard está aplicado no Node 1
+    **e** no Node 2.
 
 ### Corrigido
 
+- **Link LoRa fisicamente inviável.** `LORA_SF` 10 → **8** e intervalo de TX
+  1 s → **30 s** (`LORA_TX_INTERVAL_MIN_MS`). O duty cycle cai de 225,7%
+  para **1,88%** e o consumo de TX de 6,5 Ah/dia para **0,054 Ah/dia**.
+  SF8 entrega ainda ≈3× mais alcance que SF10 na mesma potência.
+- **GPS poll de 1 Hz — constante morta removida.** `GPS_POLL_INTERVAL_MS`
+  (1000 ms) **não** controlava nenhuma leitura do GPS: o Node 1 drena a
+  UART do GNSS continuamente no loop e o módulo decide a própria taxa de
+  saída. Na prática ela governava o **intervalo de transmissão** do link
+  LoRa (hoje `LORA_TX_INTERVAL_MIN_MS` + orçamento de duty cycle). O
+  gargalo real era o rádio, que consumia mais que o GNSS. A constante foi
+  removida de `lib/src/hefestos_pins.h` — um arquivo que se declara "fonte
+  única de verdade" não pode manter uma constante morta e enganosa.
 - **Enlace morria após uma queda longa de link.** O salto do contador dentro
   da mesma epoch era comparado com a janela de bits (1024) e rejeitado como
   `FAR` — sem caminho de recuperação. Agora a janela de bits serve apenas
@@ -51,11 +95,34 @@
 
 ### Documentado
 
+- README §9.5 (novo): "Orçamento de RF e conformidade regulatória" — o que
+  estava errado, a configuração adotada, os perfis regionais de referência,
+  como o firmware impede a violação e como verificar (console `budget`,
+  `/api/status.rf_budget`, `tools/airtime.py`).
 - README §3.5.1: estado anti-replay persistido, política de gravação, janela
   residual de 60 s, indicador de migração de vault v5.0.0 e limites do epoch
   de 16 bits.
-- README §14: limitações conhecidas atualizadas (janela residual de replay,
-  epoch de 16 bits, duty cycle ainda inviável).
+- README §5.4 (novo): parâmetros de RF do link LoRa (constantes e origem).
+- README §2.3, §9.1, §11 e §14 atualizados: duty cycle viabilizado,
+  profiles regionais, comando `budget`, 9 grupos de teste (+126 verificações
+  no host) e as novas limitações conhecidas.
+
+### Correção de estimativa (documento do plano)
+
+- **O tempo no ar do plano de escala estava errado.** O plano original
+  calculava **4564 ms** para SF10/54 B e deduzia **757%** de duty cycle e
+  13,2 Ah/dia de TX. A tabela oficial de airtime do **RP002** (LoRaWAN
+  Regional Parameters) dá **1312,8 ms** para SF10/54 B. A fórmula correta
+  foi validada contra as **9 referências** da tabela oficial
+  (SF7/10/12 × 12/51/115 B, erro < 0,001 ms) e contra a lei de
+  escalonamento exata `2^ΔSF`.
+- Os números reais da v5.0.0 são: **225,7%** de duty cycle e **6,5 Ah/dia**
+  de TX. A conclusão do plano (inviável) permanece — o que muda é a
+  magnitude, e portanto a urgência da correção. O duty cycle de 225% ainda
+  é fisicamente impossível.
+- `tools/airtime.py --selftest` é agora a fonte da verdade da fórmula e está
+  wired na suíte de testes, para que uma regressão na conta seja detectada
+  automaticamente.
 
 ---
 

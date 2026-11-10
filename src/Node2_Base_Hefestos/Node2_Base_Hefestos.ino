@@ -44,6 +44,8 @@
 #include <provisioning.h>
 #include <secure_protocol.h>
 #include <peer_state.h>
+#include <link_budget.h>
+#include <band_plan.h>
 #include <rate_limiter.h>
 #include <totp_auth.h>
 #include <radio_si4735.h>
@@ -107,6 +109,7 @@ static uint32_t loraFramesOk = 0;
 static uint32_t loraFramesBad = 0;
 static uint32_t loraReplays = 0;
 static uint32_t acksSent = 0;
+static uint32_t acksDenied = 0;   // ACKs negados pelo orcamento de duty cycle
 
 // =====================================================================
 // Cache de respostas do Node3 (nao-bloqueante)
@@ -142,6 +145,30 @@ struct LoginFail {
     bool     used;
 };
 static LoginFail loginFails[8];
+
+// =====================================================================
+// Orcamento de RF (v5.1.0)
+// =====================================================================
+// O ACK da base e' uma TRANSMISSAO: consome espectro e precisa respeitar
+// o limite de duty cycle do perfil regional, exatamente como a telemetria
+// do Node 1.
+//
+// NOTA: este bloco fica DEPOIS das definicoes de struct de propósito.
+// O gerador de prototipos do Arduino Core insere os prototipos das funcoes
+// no ponto da PRIMEIRA definicao de funcao do sketch: se `linkParams()`
+// estivesse antes de `struct RespCache`/`struct Session`, o prototipo
+// gerado (`static const RespCache* cachedResponse(uint8_t);`) viria antes
+// dos structs e o build quebraria.
+static const HefBandProfile* band = HefBandPlan::active();
+static HefDutyGuard dutyGuard;
+
+static HefLinkParams linkParams() {
+    HefLinkParams p;
+    p.sf = LORA_SF;
+    p.bwKHz = 125;
+    p.crNum = 4;
+    return p;
+}
 
 // =====================================================================
 // Utilitarios
@@ -289,8 +316,18 @@ static bool persistPeerStates() {
 static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter) {
     if (!peer) return;
 
+    // Orcamento de duty cycle: o ACK e' uma transmissao e nao pode
+    // violar o limite do perfil regional.
+    uint32_t airtime = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
+    if (airtime == 0 || !dutyGuard.allows(nowMs(), airtime, band->dutyLimitPercent)) {
+        acksDenied++;
+        dbg.logf("ACK suspenso: duty cycle do perfil %s seria violado",
+                 band->name);
+        return;
+    }
+
     uint8_t hdr[HEF_HEADER_LEN];
-    uint8_t payload[4];
+    uint8_t payload[HEF_ACK_PAYLOAD_LEN];
     putU32(payload, counter);
 
     if (!linkBuildHeader(hdr, HEF_MSG_TRACK_ACK, 0, peer->keyId,
@@ -313,6 +350,7 @@ static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter) {
     LoRa.write(out, (size_t)(HEF_HEADER_LEN + ctLen));
     LoRa.endPacket();
     LoRa.receive();
+    dutyGuard.record(nowMs(), airtime);
     acksSent++;
 }
 
@@ -823,8 +861,25 @@ static String jsonStatus() {
     l["frames_bad"] = loraFramesBad;
     l["replays"] = loraReplays;
     l["acks_sent"] = acksSent;
+    l["acks_denied"] = acksDenied;
     l["peers"] = peerCount();
     l["key"] = keyReady ? "ok" : "ausente";
+
+    // Orcamento de RF: duty cycle consumido na janela de 1 h e limite do
+    // perfil regional. O firmware NUNCA ultrapassa esse limite.
+    uint32_t ackAir = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
+    JsonObject b = doc.createNestedObject("rf_budget");
+    b["profile"] = band->name;
+    b["region"] = band->region;
+    b["freq_min_khz"] = band->freqMinKHz;
+    b["freq_max_khz"] = band->freqMaxKHz;
+    b["eirp_max_dbm"] = band->eirpDbmMax;
+    b["sf"] = LORA_SF;
+    b["bw_khz"] = linkParams().bwKHz;
+    b["airtime_ack_ms"] = ackAir;
+    b["duty_limit_pct"] = band->dutyLimitPercent;
+    b["duty_used_pct"] = dutyGuard.dutyCyclePercent(nowMs());
+    b["freq_ok"] = HefBandPlan::frequencyAllowed(band, (uint32_t)(LORA_FREQ / 1000));
 
     JsonObject r = doc.createNestedObject("radio");
     r["band"] = HefRadio::bandName(radio.band());
@@ -1312,6 +1367,7 @@ static void printHelp() {
     Serial.println("time                     mostra o relogio UTC");
     Serial.println("enroll <node> <keyid>    registra um par manualmente");
     Serial.println("peers                    lista pares");
+    Serial.println("budget                   orcamento de RF (duty cycle, perfil)");
     Serial.println("sweep on|off|now         varredura automatica/agora");
     Serial.println("radio <FM|AM|SW> <kHz>   sintoniza o receptor");
     Serial.println("reboot                   reinicia");
@@ -1411,6 +1467,23 @@ static void handleConsole(char* line) {
                           vault.getPeerState(peers[i].nodeId, nullptr, nullptr)
                               ? "sim" : "nao");
         }
+    } else if (strncmp(line, "budget", 6) == 0) {
+        uint32_t ack = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
+        uint32_t track = HefLinkBudget::airtimeMs(HEF_TRACK_FRAME_LEN, linkParams());
+        Serial.printf("perfil: %s (%s)\n", band->name, band->region);
+        Serial.printf("faixa: %.3f-%.3f MHz | SF%d BW%u | EIRP<=%d dBm | %d kHz %s\n",
+                      band->freqMinKHz / 1000.0, band->freqMaxKHz / 1000.0,
+                      LORA_SF, linkParams().bwKHz, band->eirpDbmMax,
+                      (unsigned)(LORA_FREQ / 1000),
+                      HefBandPlan::frequencyAllowed(band, (uint32_t)(LORA_FREQ / 1000))
+                          ? "OK" : "FORA DA FAIXA");
+        Serial.printf("airtime: track=%u ms ack=%u ms\n", track, ack);
+        Serial.printf("energia TX (ACK): %.4f mAh/ACK (%.0f mA)\n",
+                      (double)HefLinkBudget::txEnergyMah(ack, LORA_TX_CURRENT_MA),
+                      (double)LORA_TX_CURRENT_MA);
+        Serial.printf("duty 1h: %.3f%% (limite %.1f%%) | ACKs negados: %u\n",
+                      dutyGuard.dutyCyclePercent(nowMs()), band->dutyLimitPercent,
+                      acksDenied);
     } else if (strncmp(line, "sweep on", 8) == 0) {
         autoSweep = true;
         if (!scanner.isRunning()) scanner.start();

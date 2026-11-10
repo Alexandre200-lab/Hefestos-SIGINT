@@ -57,6 +57,12 @@ enum HefTrackStatus {
 // --- Payload de tracking (23 bytes) ---
 #define HEF_TRACK_PAYLOAD_LEN 23
 
+// --- Tamanho completo dos frames no ar (cabecalho + payload + tag GCM) ---
+// Usado pelo calculo de tempo no ar / duty cycle (link_budget.h).
+#define HEF_ACK_PAYLOAD_LEN   4
+#define HEF_TRACK_FRAME_LEN  (HEF_HEADER_LEN + HEF_TRACK_PAYLOAD_LEN + HEF_TAG_LEN)
+#define HEF_ACK_FRAME_LEN    (HEF_HEADER_LEN + HEF_ACK_PAYLOAD_LEN + HEF_TAG_LEN)
+
 // --- Serializacao (big-endian, sem depender de struct packing) ---
 inline void putU16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 inline void putU32(uint8_t* p, uint32_t v) {
