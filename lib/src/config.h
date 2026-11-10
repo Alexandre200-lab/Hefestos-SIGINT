@@ -307,7 +307,9 @@ public:
         memcpy(out + 36, cipher, (size_t)ctLen);
 
         size_t total = 36 + (size_t)ctLen;
-        prefs_.putBytes(HEF_NVS_KEY_VAULT, out, total);
+        if (prefs_.putBytes(HEF_NVS_KEY_VAULT, out, total) == 0) {
+            return false;   // NVS recusou a escrita (sem flash livre?)
+        }
         return true;
     }
 

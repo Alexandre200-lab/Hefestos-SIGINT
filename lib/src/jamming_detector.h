@@ -121,13 +121,6 @@ public:
         noiseFloorDbuV_ = noiseFloorDbuV_ * 0.98f + rssiDbuV * 0.02f;
     }
 
-    void tick(uint32_t now) {
-        if (packetsSeen_ == 0) return;
-        if (lastPacketMs_ != 0 && (now - lastPacketMs_) > linkLossTimeoutMs_) {
-            // nada mais a fazer aqui: state() calcula o caso de perda
-        }
-    }
-
     JammingState state(uint32_t now) const {
         if (packetsSeen_ == 0) return JF_CLEAR;   // sem trafego ainda: sem juizo
         if (lastPacketMs_ != 0 && (now - lastPacketMs_) > linkLossTimeoutMs_) {

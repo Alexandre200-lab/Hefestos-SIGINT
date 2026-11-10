@@ -197,10 +197,16 @@ inline bool hefHkdfSha256(const uint8_t* ikm, size_t ikmLen,
         size_t pos = 0;
         if (tLen) { memcpy(block, t, tLen); pos += tLen; }
         if (info && infoLen) {
-            size_t cp = infoLen;
-            if (cp > sizeof(block) - pos) cp = sizeof(block) - pos;
-            memcpy(block + pos, info, cp);
-            pos += cp;
+            // RFC 5869: o `info` NAO pode ser truncado. Se nao couber no
+            // bloco T(i), a derivacao aborta (falha fechada).
+            if (infoLen + 1 > sizeof(block) - pos) {
+                memset(prk, 0, sizeof(prk));
+                memset(t, 0, sizeof(t));
+                memset(block, 0, sizeof(block));
+                return false;
+            }
+            memcpy(block + pos, info, infoLen);
+            pos += infoLen;
         }
         block[pos++] = counter;
         if (!hefHmacSha256(prk, sizeof(prk), block, pos, t)) {

@@ -146,7 +146,7 @@ public:
 
         uint8_t rec[256];
         size_t pos = 0;
-        uint32_t s = ++seq_;
+        uint32_t s = seq_ + 1;      // so e' confirmado se a gravacao der certo
         rec[pos++] = (uint8_t)(s >> 24); rec[pos++] = (uint8_t)(s >> 16);
         rec[pos++] = (uint8_t)(s >> 8);  rec[pos++] = (uint8_t)s;
         rec[pos++] = (uint8_t)(utc_ >> 24); rec[pos++] = (uint8_t)(utc_ >> 16);
@@ -173,6 +173,7 @@ public:
         if (w != pos + HEF_HASH_LEN) return false;
 
         memcpy(chain_, digest, HEF_HASH_LEN);
+        seq_ = s;
         records_++;
         return true;
     }

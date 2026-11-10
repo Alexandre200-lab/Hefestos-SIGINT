@@ -6,9 +6,10 @@
 #   ./test_functional.sh            # checagens estaticas + build dos 3 nos
 #   ./test_functional.sh --no-build # apenas checagens estaticas
 #
-# As checagens estaticas validam invariantes que ja falharam na v4.x:
+# As checagens validam invariantes que ja falharam na v4.x/v5.0:
 #   - pinagem duplicada / pinos proibidos no ESP32-C3
 #   - layout do cabecalho do protocolo LoRa
+#   - round-trip REAL do protocolo serial Node2<->Node3 (executado no host)
 #   - ausencia de Telnet, EEPROM e include relativo quebrado
 #   - anti-replay estrito (sem caminho de "resync")
 #   - TOTP realmente chamado no login
@@ -30,7 +31,7 @@ echo " Hefestos SIGINT v5.0.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/6] Invariantes de pinagem"
+echo "[1/7] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -68,7 +69,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/6] Layout do protocolo LoRa"
+echo "[2/7] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -108,7 +109,38 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/6] Ausencia de legado inseguro"
+echo "[3/7] Protocolo serial Node2<->Node3 (round-trip no host)"
+SER=0
+if command -v g++ >/dev/null 2>&1; then
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/lib/src" \
+            "$ROOT/tests/serial_roundtrip.cpp" -o /tmp/hef_serial_test 2>/tmp/hef_serial_cc.log; then
+        if /tmp/hef_serial_test > /tmp/hef_serial_run.log 2>&1; then
+            sed -n 's/^  /  /p' /tmp/hef_serial_run.log | grep -E "^\s+\[(PASS|FAIL)\]" | head -40
+            echo "  [PASS] round-trip do protocolo serial (33 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_serial_run.log || true
+            echo "  [FAIL] round-trip do protocolo serial"; SER=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste serial falhou:"
+        head -20 /tmp/hef_serial_cc.log
+        SER=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (round-trip nao executado)"
+fi
+# Checagem estatica do layout (independe do compilador host).
+if grep -q "buf_\[scan_ + 4\]" "$ROOT/lib/src/serial_protocol.h" &&
+   grep -q "buf_\[scan_ + 6 + len\]" "$ROOT/lib/src/serial_protocol.h"; then
+    echo "  [PASS] offsets do frame serial conferem (LEN/CRC/PAYLOAD)"
+else
+    echo "  [FAIL] offsets do frame serial inconsistentes"; SER=1
+fi
+[ $SER -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[4/7] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -123,7 +155,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/6] Anti-replay estrito e TOTP ativo"
+echo "[5/7] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -143,7 +175,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/6] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/7] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -158,7 +190,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/6] Build dos tres nos"
+echo "[7/7] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

@@ -54,7 +54,7 @@ public:
 
     bool begin(uint8_t resetPin) {
         radio_.setup(resetPin, POWER_UP_FM);
-        radio_.setFM(8400, 10800, 10010, 10);   // 87.5..108.0 MHz, passo 100 kHz
+        radio_.setFM(8750, 10800, 10010, 10);   // 87.5..108.0 MHz, passo 100 kHz
         radio_.setVolume(40);
         currentBand_ = HEF_BAND_FM;
         currentFreqKHz_ = 100100;
@@ -82,7 +82,7 @@ public:
         if (band == HEF_BAND_FM) {
             if (freqKHz < 87500 || freqKHz > 108000) return false;
             if (currentBand_ != HEF_BAND_FM) {
-                radio_.setFM(8400, 10800, (uint16_t)(freqKHz / 10), 10);
+                radio_.setFM(8750, 10800, (uint16_t)(freqKHz / 10), 10);
             } else {
                 radio_.setFrequency((uint16_t)(freqKHz / 10));
             }

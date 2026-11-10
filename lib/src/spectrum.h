@@ -76,12 +76,15 @@ public:
     }
 
     // Plano padrao: FM 87.5-108 MHz (passo 250 kHz), AM 520-1710 kHz
-    // (passo 20 kHz), SW 2.3-30 MHz (passo 25 kHz).
+    // (passo 20 kHz), SW 2.3-30 MHz (passo 100 kHz).
+    //
+    // O passo de 100 kHz em SW reduz a varredura de 1108 para 277 pontos
+    // (com dwell de 90 ms + settle de 60 ms, ~42 s so nessa banda).
     void setDefaultPlan() {
         SpectrumPlan p[3];
         p[0].band = HEF_BAND_FM; p[0].startKHz = 87500; p[0].stopKHz = 108000; p[0].stepKHz = 250;
         p[1].band = HEF_BAND_AM; p[1].startKHz = 520;   p[1].stopKHz = 1710;   p[1].stepKHz = 20;
-        p[2].band = HEF_BAND_SW; p[2].startKHz = 2300;  p[2].stopKHz = 30000;  p[2].stepKHz = 25;
+        p[2].band = HEF_BAND_SW; p[2].startKHz = 2300;  p[2].stopKHz = 30000;  p[2].stepKHz = 100;
         setPlan(p, 3);
     }
 

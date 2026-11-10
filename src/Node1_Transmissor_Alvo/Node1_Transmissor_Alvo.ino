@@ -61,7 +61,6 @@ static bool     gpsValid       = false;
 static bool     fmBeaconEnabled = false;
 static uint32_t fmFreqKHz       = 100100;
 static uint8_t  fmPower         = 100;  // dBuV (88..115 no Si4713)
-static uint32_t fmBeaconUntilMs = 0;
 
 // ---------------------------------------------------------------
 // Recepcao do ACK do Node2
@@ -182,8 +181,7 @@ static bool buildAndSendTrack(uint8_t retry) {
 
     uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
     gpsValid = gps.location.isValid() && sats >= GPS_MIN_SATS &&
-               gps.location.age() < GPS_FIX_MAX_AGE_MS &&
-               gps.location.age() > 0;
+               gps.location.age() < GPS_FIX_MAX_AGE_MS;
 
     uint8_t payload[HEF_TRACK_PAYLOAD_LEN];
     uint8_t statusFlags = 0;
@@ -213,7 +211,7 @@ static bool buildAndSendTrack(uint8_t retry) {
 
     uint32_t counter = txSeq.next();
     uint8_t hdr[HEF_HEADER_LEN];
-    if (!linkBuildHeader(hdr, HEF_MSG_TRACK, statusFlags, (uint8_t)(nodeId & 0xFF),
+    if (!linkBuildHeader(hdr, HEF_MSG_TRACK, statusFlags, keyId,
                          nodeId, txSeq.epoch(), counter, HEF_TRACK_PAYLOAD_LEN)) {
         return false;
     }
@@ -460,10 +458,5 @@ void loop() {
         } else {
             dbg.logWarning("Transmissao suspensa: sem chave de link");
         }
-    }
-
-    // Beacon FM com expiracao
-    if (fmBeaconEnabled && fmBeaconUntilMs > 0 && now > fmBeaconUntilMs) {
-        fmBeaconUntilMs = 0;
     }
 }

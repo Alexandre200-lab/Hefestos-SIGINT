@@ -2,17 +2,19 @@
 //
 // v5: remove qualquer rotina de dump de segredos. Nao existe mais
 // nenhuma funcao que imprima chave, senha ou PSK - nem em builds DEBUG.
+// (A antiga rotina de dump hexadecimal foi removida de proposito: ela
+//  permitiria despejar material de chave em log por engano.)
 #ifndef HEF_DEBUG_H
 #define HEF_DEBUG_H
 
 #include <HardwareSerial.h>
 #include <stdarg.h>
 
+#include "hefestos_pins.h"
+
 #ifndef DEBUG_MODE
 #define DEBUG_MODE 0
 #endif
-
-#define HEF_FW_VERSION "5.0.0"
 
 class DebugLogger {
 private:
@@ -30,7 +32,7 @@ public:
         port_->begin(baud);
         if (!enabled_) return;
         port_->println();
-        port_->println("===== HEFESTOS SIGINT v" HEF_FW_VERSION " (DEBUG) =====");
+        port_->println("===== HEFESTOS SIGINT v" HEF_FW_VERSION_STR " (DEBUG) =====");
     }
 
     void enable()  { enabled_ = true; }
@@ -63,32 +65,6 @@ public:
     void logWarning(const char* msg) {
         if (!enabled_ || !msg) return;
         port_->print("[W] ");
-        port_->println(msg);
-    }
-
-    void logHex(const uint8_t* data, int len, const char* label = nullptr) {
-        if (!enabled_ || !data) return;
-        if (label) { port_->print("[X] "); port_->print(label); port_->print(": "); }
-        for (int i = 0; i < len; i++) {
-            if (data[i] < 16) port_->print('0');
-            port_->print(data[i], HEX);
-            port_->print(' ');
-        }
-        port_->println();
-    }
-
-    void printMemory() {
-        if (!enabled_) return;
-#if defined(ESP32)
-        port_->print("[M] heap livre: ");
-        port_->println((unsigned long)ESP.getFreeHeap());
-#endif
-    }
-
-    // Saida irrestrita: usada para mensagens de boot e credenciais de
-    // primeiro provisioning, que o operador PRECISA ver.
-    void critical(const char* msg) {
-        if (!msg) return;
         port_->println(msg);
     }
 };

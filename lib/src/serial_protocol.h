@@ -99,17 +99,23 @@ public:
     }
 };
 
-// Receptor de frames nao-bloqueante com reassembly por deslocamento.
+// Receptor de frames nao-bloqueante.
+//
+// Estrategia: varredura por frame INTEIRO e VALIDADO (inicio + tamanho +
+// END + CRC16). Isso permite que o payload contenha 0xAA/0x55 (os
+// delimitadores) e que o receptor ressincronize sozinho depois de ruido,
+// bytes perdidos ou um frame corrompido, sem perder os frames seguintes.
 class HefSerialRx {
 private:
     uint8_t  buf_[HEF_SER_MAX_PAYLOAD + 32];
-    size_t   pos_;
+    size_t   pos_;       // bytes validos no buffer
+    size_t   scan_;      // posicao da varredura dentro do buffer
     uint32_t crcErrors_;
     uint32_t framesOk_;
     uint32_t overflows_;
 
 public:
-    HefSerialRx() : pos_(0), crcErrors_(0), framesOk_(0), overflows_(0) {
+    HefSerialRx() : pos_(0), scan_(0), crcErrors_(0), framesOk_(0), overflows_(0) {
         memset(buf_, 0, sizeof(buf_));
     }
 
@@ -117,52 +123,80 @@ public:
     uint32_t framesOk()   const { return framesOk_; }
     uint32_t overflows()  const { return overflows_; }
 
-    void reset() { pos_ = 0; }
+    void reset() { pos_ = 0; scan_ = 0; }
 
     // Alimenta bytes do stream. Quando um frame completo e' decodificado,
     // chama o callback (pode ser nullptr). Retorna o numero de frames
     // completos processados nesta chamada.
+    //
+    // Layout do frame: START(0) TYPE(1) SEQ(2..3) LEN(4..5)
+    //                  PAYLOAD(6..6+len-1) CRC(6+len..7+len) END(8+len)
     int feed(Stream& stream, void (*onFrame)(const HefSerFrame&, void*), void* ctx) {
         int completed = 0;
+
         while (stream.available()) {
             int c = stream.read();
             if (c < 0) break;
             uint8_t b = (uint8_t)c;
 
-            if (pos_ == 0) {
-                if (b != HEF_SER_START) continue;   // procura o inicio
-                buf_[pos_++] = b;
-                continue;
+            if (pos_ >= sizeof(buf_)) {
+                // Buffer cheio e nenhum frame valido: descarta o byte mais
+                // antigo e continua a varredura (nao trunca a fila).
+                memmove(buf_, buf_ + 1, pos_ - 1);
+                pos_--;
+                if (scan_ > 0) scan_--;
+                overflows_++;
             }
-
-            if (pos_ >= sizeof(buf_)) { pos_ = 0; overflows_++; continue; }
             buf_[pos_++] = b;
 
-            // Precisa de START + TYPE + SEQ(2) + LEN(2) para saber o total.
-            if (pos_ < 7) continue;
+            while (true) {
+                if (scan_ + 6 > pos_) break;          // falta o cabecalho
 
-            uint16_t len = (uint16_t)(((uint16_t)buf_[5] << 8) | buf_[6]);
-            if (len > HEF_SER_MAX_PAYLOAD) { pos_ = 0; crcErrors_++; continue; }
+                if (buf_[scan_] != HEF_SER_START) { scan_++; continue; }
 
-            size_t expected = 8 + (size_t)len + 1;
-            if (pos_ < expected) continue;   // payload pode conter 0x55
+                uint16_t len = (uint16_t)(((uint16_t)buf_[scan_ + 4] << 8) |
+                                          buf_[scan_ + 5]);
+                if (len > HEF_SER_MAX_PAYLOAD) { scan_++; continue; }
 
-            // Frame completo: START(1) TYPE(1) SEQ(2) LEN(2) PAYLOAD(N) CRC(2) END(1)
-            if (buf_[pos_ - 1] != HEF_SER_END) { pos_ = 0; crcErrors_++; continue; }
+                size_t total = 9 + (size_t)len;
+                if (scan_ + total > pos_) break;       // frame ainda incompleto
 
-            uint16_t gotCrc = (uint16_t)(((uint16_t)buf_[7 + len] << 8) | buf_[8 + len]);
-            uint16_t calc = Crc16::calculate(buf_ + 1, 5 + len);
-            if (gotCrc != calc) { crcErrors_++; pos_ = 0; continue; }
+                if (buf_[scan_ + total - 1] != HEF_SER_END) {
+                    crcErrors_++;                     // framing invalido
+                    scan_++;
+                    continue;
+                }
 
-            HefSerFrame frame;
-            frame.type = buf_[1];
-            frame.seq  = (uint16_t)(((uint16_t)buf_[2] << 8) | buf_[3]);
-            frame.len  = len;
-            if (len) memcpy(frame.payload, buf_ + 7, len);
-            framesOk_++;
-            completed++;
-            if (onFrame) onFrame(frame, ctx);
-            pos_ = 0;
+                uint16_t gotCrc = (uint16_t)(((uint16_t)buf_[scan_ + 6 + len] << 8) |
+                                             buf_[scan_ + 7 + len]);
+                uint16_t calc = Crc16::calculate(buf_ + scan_ + 1, 5 + len);
+                if (gotCrc != calc) { crcErrors_++; scan_++; continue; }
+
+                // Frame integro.
+                HefSerFrame frame;
+                frame.type = buf_[scan_ + 1];
+                frame.seq  = (uint16_t)(((uint16_t)buf_[scan_ + 2] << 8) |
+                                        buf_[scan_ + 3]);
+                frame.len  = len;
+                if (len) memcpy(frame.payload, buf_ + scan_ + 6, len);
+                framesOk_++;
+                completed++;
+                if (onFrame) onFrame(frame, ctx);
+
+                // Descarta o frame (e o lixo anterior a ele) do buffer.
+                size_t consumed = scan_ + total;
+                memmove(buf_, buf_ + consumed, pos_ - consumed);
+                pos_ -= consumed;
+                scan_ = 0;
+            }
+
+            // Compacta o buffer: o que a varredura ja descartou nao precisa
+            // ficar guardado.
+            if (scan_ > 0 && pos_ > 0) {
+                memmove(buf_, buf_ + scan_, pos_ - scan_);
+                pos_ -= scan_;
+                scan_ = 0;
+            }
         }
         return completed;
     }

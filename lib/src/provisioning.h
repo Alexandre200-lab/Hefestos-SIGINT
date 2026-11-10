@@ -10,7 +10,8 @@
 //   1. O operador establish um PSK de deploy (32 bytes) em cada no,
 //      uma unica vez (console serial na primeira operacao).
 //   2. Cada no deriva sua chave de link de forma DETERMINISTICA:
-//        key_node = HKDF-SHA256(ikm = PSK, salt = node_id, info = "link/aes256")
+//        key_node = HKDF-SHA256(ikm = PSK, salt = node_id (2 bytes LE),
+//                                info = "hefestos-v5/link/aes256")
 //   3. O Node2 mantem a lista de node_ids enrolled; para cada peer, deriva
 //      a mesma chave a partir do mesmo PSK.
 //   4. O PSK pode ser apagado do no apos a derivacao das chaves locais

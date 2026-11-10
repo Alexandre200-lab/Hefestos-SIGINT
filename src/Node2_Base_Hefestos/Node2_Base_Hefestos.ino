@@ -65,7 +65,6 @@ static JammingDetector jam;
 static HardwareSerial node3Serial(2);   // UART2 -> Node3
 static HefSerialTx    serTx;
 static HefSerialRx    serRx;
-static Preferences    seqPrefs;
 
 static AsyncWebServer server(80);
 
@@ -118,7 +117,6 @@ struct RespCache {
 static RespCache respCache[4];
 
 static uint32_t serFramesOk = 0;
-static uint32_t serCrcErrors = 0;
 static uint32_t serDrops = 0;
 static uint32_t serLastMs = 0;
 
@@ -203,6 +201,12 @@ static void wipePeers() {
         for (size_t k = 0; k < sizeof(peers[i].key); k++) p[k] = 0;
         memset(&peers[i], 0, sizeof(PeerState));
     }
+}
+
+// Chamada no factory reset: zera as chaves derivadas dos pares em RAM.
+static void resetPeers() {
+    wipePeers();
+    loraFramesOk = loraFramesBad = loraReplays = acksSent = 0;
 }
 
 // =====================================================================
@@ -508,6 +512,13 @@ static bool getCookie(AsyncWebServerRequest* r, const char* name,
     String v = h->value();
     String key = String(name) + "=";
     int idx = v.indexOf(key);
+    // O nome do cookie precisa comecar um "campo" do cabecalho Cookie,
+    // senao "XHEF_SID=" casaria com "HEF_SID=".
+    while (idx >= 0) {
+        if (idx == 0 || v[idx - 1] == ';' || v[idx - 1] == ' ' ||
+            v[idx - 1] == '\t') break;
+        idx = v.indexOf(key, idx + 1);
+    }
     if (idx < 0) return false;
     int start = idx + key.length();
     int end = v.indexOf(';', start);
@@ -611,7 +622,15 @@ static void ensureCredentials() {
         char b32[64];
         totp.exportBase32(b32, sizeof(b32));
         vault.setTotpSecret((const uint8_t*)b32, strlen(b32));
-        Serial.print("TOTP (novo): "); Serial.println(b32);
+        char uri[192];
+        totp.buildOtpAuthUri(uri, sizeof(uri), "Hefestos", "admin");
+        Serial.println();
+        Serial.println("=================================================");
+        Serial.println(" 2FA TOTP - cadastre no autenticador AGORA");
+        Serial.print("   segredo base32: "); Serial.println(b32);
+        Serial.print("   URI otpauth:    "); Serial.println(uri);
+        Serial.println("=================================================");
+        memset(b32, 0, sizeof(b32));
     }
 }
 
@@ -1309,6 +1328,7 @@ static void handleConsole(char* line) {
         ESP.restart();
     } else if (strncmp(line, "factory", 7) == 0) {
         vault.factoryReset();
+        resetPeers();
         Serial.println("Vault apagado. Reiniciando...");
         delay(200);
         ESP.restart();

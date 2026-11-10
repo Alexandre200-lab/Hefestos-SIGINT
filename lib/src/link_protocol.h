@@ -29,8 +29,8 @@
 // derivar a chave (HKDF do PSK de deploy). A autenticacao vem da tag GCM:
 // um node_id falso simply produz uma tag invalida -> frame descartado.
 //
-// NONCE: prefixo de 4 bytes (keyId ^ nodeId) || contador de 8 bytes.
-// Deterministico e unico por (chave, emissor, contador).
+// NONCE: prefixo de 4 bytes (nodeId) || contador de 8 bytes (big-endian).
+// Deterministico e unico por (chave, emissor, contador). Ver AeadGcm::buildIv.
 #ifndef HEF_LINK_PROTOCOL_H
 #define HEF_LINK_PROTOCOL_H
 
@@ -79,7 +79,7 @@ inline uint64_t getU64(const uint8_t* p) {
     return v;
 }
 
-// Preenche o cabecalho (13 bytes). Retorna false se os parametros sao invalidos.
+// Preenche o cabecalho (15 bytes). Retorna false se os parametros sao invalidos.
 inline bool linkBuildHeader(uint8_t* hdr,
                             uint8_t type, uint8_t flags, uint8_t keyId,
                             uint16_t nodeId, uint16_t epoch, uint32_t counter,
@@ -159,28 +159,6 @@ inline void linkUnpackTrack(const uint8_t* p, HefTrack* t) {
     t->fixQuality  = p[20];
     t->batteryPct  = p[21];
     t->statusFlags = p[22];
-}
-
-// Converte o epoch do payload para data/hora UTC (epoch unix).
-inline void epochUtcToDate(uint32_t epochUtc, int* year, int* month, int* day,
-                           int* hour, int* minute, int* second) {
-    // Implementacao civil (Howard Hinnant) - sem dependencia de timezone
-    // e com regras de ano bissexto do calendario gregoriano.
-    uint32_t z = epochUtc + 2208988800UL; // epoch -> dia civil
-    uint32_t era = z / 146097UL;
-    uint32_t doe = z - era * 146097UL;
-    uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    uint32_t mp  = (5 * doy + 2) / 153;
-    uint32_t d   = doy - (153 * mp + 2) / 5 + 1;
-    uint32_t m   = mp < 10 ? mp + 3 : mp - 9;
-    uint32_t y   = yoe + era * 400 + (m <= 2 ? 1 : 0);
-    if (year)   *year   = (int)y;
-    if (month)  *month  = (int)m;
-    if (day)    *day    = (int)d;
-    if (hour)   *hour   = (int)((z % 86400UL) / 3600UL);
-    if (minute) *minute = (int)(((z % 3600UL) / 60UL));
-    if (second) *second = (int)(z % 60UL);
 }
 
 #endif // HEF_LINK_PROTOCOL_H

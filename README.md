@@ -227,9 +227,25 @@ para aceitar pacotes atrasados.
 START(0xAA) TYPE(1) SEQ(2) LEN(2) PAYLOAD(N) CRC16(2) END(0x55)
 ```
 
-CRC16-IBM sobre `TYPE..PAYLOAD`. Tipos: `DATA`, `HEARTBEAT`, `REQUEST`,
-`RESPONSE`, `TIME`, `ACK`. Requisições: `CAPTURE_LAST`, `CAPTURE_LIST`,
-`CAPTURE_CLEAR`, `LOG_EXPORT`, `LOG_INFO`.
+| offset | tam | campo |
+|---:|---:|---|
+| 0 | 1 | `START` = `0xAA` |
+| 1 | 1 | tipo |
+| 2 | 2 | sequência (big-endian) |
+| 4 | 2 | comprimento do payload (big-endian) |
+| 6 | N | payload (pode conter `0xAA`/`0x55` à vontade) |
+| 6+N | 2 | CRC16-IBM sobre `TYPE..PAYLOAD` |
+| 8+N | 1 | `END` = `0x55` |
+
+Total = `9 + N` bytes. CRC16-IBM sobre `TYPE..PAYLOAD`. Tipos: `DATA`,
+`HEARTBEAT`, `REQUEST`, `RESPONSE`, `TIME`, `ACK`. Requisições:
+`CAPTURE_LAST`, `CAPTURE_LIST`, `CAPTURE_CLEAR`, `LOG_EXPORT`, `LOG_INFO`.
+
+O receptor (`HefSerialRx`) faz **varredura por frame íntegro** (início +
+comprimento + `END` + CRC16): um byte `0xAA` perdido, um frame truncado ou um
+frame corrompido não derruba os frames seguintes — o receptor ressincroniza
+sozinho e contabiliza o erro. Isso é coberto por teste de round-trip no host
+(`tests/serial_roundtrip.cpp`, 33 verificações).
 
 O Node 3 responde com `RESPONSE` cujo primeiro byte é o ID da requisição,
 seguido de JSON. O Node 2 mantém um cache e nunca bloqueia o handler HTTP
@@ -317,8 +333,11 @@ src/
   Node1_Transmissor_Alvo/
   Node2_Base_Hefestos/
   Node3_Caixa_Preta_ESP32C3/
+tests/
+  serial_roundtrip.cpp    teste de round-trip do protocolo serial (host)
+  stub/HardwareSerial.h   stub Arduino mínimo para compilar no host
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + build
+test_functional.sh       invariantes + round-trip + build
 ```
 
 ---
@@ -435,9 +454,11 @@ Todas exigem sessão autenticada (cookie `HEF_SID`).
 ### 9.3 Varredura de espectro
 
 Plano padrão: FM 87,5–108 MHz (passo 250 kHz), AM 520–1710 kHz (20 kHz),
-SW 2,3–30 MHz (25 kHz). A varredura é incremental: um ponto por `tick()`,
-com dwell configurável, e restaura a frequência do operador ao terminar.
-`auto=1` repete continuamente.
+SW 2,3–30 MHz (100 kHz). A varredura é incremental: um ponto por `tick()`,
+com dwell configurável (90 ms + 60 ms de settle por ponto) e restaura a
+frequência do operador ao terminar. `auto=1` repete continuamente.
+Com o plano padrão, um ciclo completo leva ~65 s (83 pontos FM + 60 AM +
+277 SW).
 
 ### 9.4 Detecção de interferência
 
@@ -466,13 +487,26 @@ não de contadores que nunca eram atualizados.
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + build dos 3 nós
-./test_functional.sh --no-build # só invariantes (rápido, sem toolchain)
+./test_functional.sh            # invariantes + round-trip + build dos 3 nós
+./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura: pinagem duplicada, pinos proibidos no C3, layout do frame,
-anti-replay estrito, ausência de Telnet/EEPROM/include relativo, TOTP no login,
-dashboard sem injeção de HTML e ausência de chaves hardcoded.
+Cobertura (7 grupos):
+
+1. pinagem duplicada e pinos proibidos no ESP32-C3;
+2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
+3. **round-trip real do protocolo serial** (`tests/serial_roundtrip.cpp`,
+   executado no host com `g++`): payload com `0xAA`/`0x55`, frames
+   concatenados, frame corrompido, frame truncado, feed byte a byte e
+   payload máximo;
+4. ausência de Telnet/EEPROM/include relativo;
+5. anti-replay estrito e TOTP verificado no login;
+6. dashboard sem injeção de HTML e ausência de chaves hardcoded;
+7. build dos três nós.
+
+O round-trip do protocolo serial existe porque um erro de offset de 1 byte
+no parser de frames já passou pelo build e pelos testes estáticos: o código
+compilava e o link Node2↔Node3 simplesmente nunca funcionava em campo.
 
 ---
 
@@ -498,6 +532,28 @@ dashboard sem injeção de HTML e ausência de chaves hardcoded.
   e TOTP. O chip continua o mesmo (a chave do vault é derivada do MAC).
 - **Node 3:** `format` apaga o log e recria o cabeçalho. Isso **destrói** a
   cadeia anterior; exporte antes.
+
+### 13.1 Credenciais de versões antigas
+
+A v4.x commitou no repositório uma senha de Wi-Fi e credenciais fixas. O
+histórico do Git foi reescrito (`git filter-repo`) para remover:
+
+- as credenciais fixas da v4.x (senha de Wi-Fi e segredos de TOTP);
+- os artefatos de build versionados (`.bin`, `.elf`, `.map`, `sdkconfig`);
+- os documentos `IMPLEMENTATION_GUIDE_v2.md` e `OPERATION_MANUAL_v2.md`,
+  obsoletos e contraditórios com o código real.
+
+Consequências práticas:
+
+- **Qualquer credencial que tenha sido usada na v4.x deve ser considerada
+  comprometida.** Troque a senha do Wi-Fi, a senha HTTP e cadastre um novo
+  TOTP antes de colocar o equipamento em campo.
+- Clientes existentes precisam recomeçar (`git clone` novo ou
+  `git fetch && git reset --hard origin/main`); os hashes antigos não existem
+  mais localmente.
+- Se o repositório remoto já tinha publicado essas credenciais, o purge só
+  tem efeito após um *force-push* do histórico reescrito — e mesmo assim o
+  valor deve ser considerado comprometido.
 
 ---
 
