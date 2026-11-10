@@ -16,6 +16,9 @@
 #   - TOTP realmente chamado no login
 #   - dashboard sem injecao de HTML
 #   - nenhuma chave PSK de 64 hex hardcoded no codigo
+#   - orcamento de RF viavel (duty cycle dentro do perfil regional)
+#   - politica de TX adaptativa (evento + heartbeat, sem perder movimento)
+#   - causa de reinicio e watchdog (contadores, progresso, visibilidade)
 # =====================================================================
 set -uo pipefail
 
@@ -32,7 +35,7 @@ echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/10] Invariantes de pinagem"
+echo "[1/11] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -70,7 +73,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/10] Layout do protocolo LoRa"
+echo "[2/11] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -110,7 +113,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/10] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/11] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -141,7 +144,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/10] Ausencia de legado inseguro"
+echo "[4/11] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -156,7 +159,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/10] Anti-replay estrito e TOTP ativo"
+echo "[5/11] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -176,7 +179,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/10] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/11] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -191,7 +194,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/10] Estado anti-replay persistido (replay pos-reboot)"
+echo "[7/11] Estado anti-replay persistido (replay pos-reboot)"
 REPLAY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -230,7 +233,7 @@ fi
 [ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[8/10] Orcamento de RF (tempo no ar e duty cycle)"
+echo "[8/11] Orcamento de RF (tempo no ar e duty cycle)"
 BUDGET=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -282,7 +285,7 @@ fi
 [ $BUDGET -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[9/10] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
+echo "[9/11] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
 POLICY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -357,7 +360,131 @@ fi
 [ $POLICY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[10/10] Build dos tres nos"
+echo "[10/11] Causa de reinicio e watchdog (item 1.4)"
+WDT=0
+if command -v g++ >/dev/null 2>&1; then
+    # --- 10a) Contadores de reinicio ---
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/reset_tracker.cpp" -o /tmp/hef_reset_test 2>/tmp/hef_reset_cc.log; then
+        if /tmp/hef_reset_test > /tmp/hef_reset_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_reset_run.log | head -4
+            echo "  ... (ver /tmp/hef_reset_run.log para o restante)"
+            echo "  [PASS] causa de reinicio e contadores (108 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_reset_run.log || true
+            echo "  [FAIL] causa de reinicio e contadores"; WDT=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de causa de reinicio falhou:"
+        head -20 /tmp/hef_reset_cc.log
+        WDT=1
+    fi
+
+    # --- 10b) Politica do watchdog ---
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/watchdog_policy.cpp" -o /tmp/hef_wdt_test 2>/tmp/hef_wdt_cc.log; then
+        if /tmp/hef_wdt_test > /tmp/hef_wdt_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_wdt_run.log | head -4
+            echo "  ... (ver /tmp/hef_wdt_run.log para o restante)"
+            echo "  [PASS] politica do watchdog (188 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_wdt_run.log || true
+            echo "  [FAIL] politica do watchdog"; WDT=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de politica do watchdog falhou:"
+        head -20 /tmp/hef_wdt_cc.log
+        WDT=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (testes de reinicio e watchdog nao executados)"
+fi
+
+# Os dois nos precisam INICIAR o watchdog e registrar a causa do boot.
+for NODE in "Node2_Base_Hefestos:src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" \
+            "Node3_Caixa_Preta_ESP32C3:src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino"; do
+    NAME="${NODE%%:*}"
+    FILE="$ROOT/${NODE##*:}"
+    if grep -q "hefWatchdogInit()" "$FILE" &&
+       grep -q "esp_reset_reason()" "$FILE" &&
+       grep -q "setupResetTracking()" "$FILE"; then
+        echo "  [PASS] $NAME inicia o watchdog e registra a causa do boot"
+    else
+        echo "  [FAIL] $NAME nao inicia o watchdog ou nao registra a causa"; WDT=1
+    fi
+done
+
+# A causa do reinicio tem de ser VISIVEL na API de saude (Node2) e no
+# JSON de log (Node3). Um contador invisivel nao serve para nada.
+if grep -q "reset_reason" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" &&
+   grep -q "watchdog_active" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" &&
+   grep -q "reset_reason" "$ROOT/src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino"; then
+    echo "  [PASS] causa do reinicio e estado do watchdog visiveis na API"
+else
+    echo "  [FAIL] causa do reinicio ou estado do watchdog invisivel na API"; WDT=1
+fi
+
+# Nenhum reinicio pode ser CEGO: todo ESP.restart() tem de passar pelo
+# registro de intencao.
+for NODE in "Node2_Base_Hefestos:src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" \
+            "Node3_Caixa_Preta_ESP32C3:src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino"; do
+    NAME="${NODE%%:*}"
+    FILE="$ROOT/${NODE##*:}"
+    # Conta as chamadas a ESP.restart(): todas tem de estar dentro do
+    # hefRestart(), que e' a unica funcao que grava a intencao.
+    # O padrao exige o ponto e virgula: assim a mencao em comentario
+    # (que explica o problema) nao conta como chamada.
+    TOTAL=$(grep -c "ESP.restart();" "$FILE" || true)
+    if [ "$TOTAL" -le 1 ] && grep -q "hefRestart(" "$FILE"; then
+        echo "  [PASS] $NAME: reinicio somente via hefRestart (motivo registrado)"
+    else
+        echo "  [FAIL] $NAME: ESP.restart() fora do registro de intencao"; WDT=1
+    fi
+done
+
+# O watchdog nao pode mascarar um travamento: o progresso das operacoes
+# longas tem de ser reportado em PONTOS DE AVANCO (no callback de
+# progresso do log, no Node3), nunca em laco sem avanco.
+if grep -q "setProgressCallback" "$ROOT/src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino" &&
+   grep -q "reportProgress" "$ROOT/lib/src/field_log.h" &&
+   grep -q "hefWatchdogLongOpStep" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
+    echo "  [PASS] operacoes longas reportam progresso (SD, vault, sweep)"
+else
+    echo "  [FAIL] operacoes longas nao reportam progresso ao watchdog"; WDT=1
+fi
+
+# A guarda de desgaste da NVS: os contadores nao podem ser gravados a
+# cada boot (438 mil escritas/ano num laco de brownout).
+if grep -q "HEF_RESET_PERSIST_EVERY_BOOTS 10" "$ROOT/lib/src/hefestos_pins.h" &&
+   grep -q "shouldPersistNow" "$ROOT/lib/src/reset_tracker.h" &&
+   grep -q "HEF_RESET_FLUSH_MS" "$ROOT/lib/src/hefestos_pins.h"; then
+    echo "  [PASS] guarda de desgaste da NVS nos contadores de reinicio"
+else
+    echo "  [FAIL] contadores de reinicio sem guarda de desgaste"; WDT=1
+fi
+
+# A intencao do reinicio tem de ser LIDA e CONSUMIDA. Se for gravada e
+# nunca lida, e' dado morto; se for lida e nunca removida, ela
+# reaparece em todos os boots seguintes — dizendo "reinicio solicitado
+# pelo operador" em reinicios que foram travamentos.
+for NODE in "Node2_Base_Hefestos:src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" \
+            "Node3_Caixa_Preta_ESP32C3:src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino"; do
+    NAME="${NODE%%:*}"
+    FILE="$ROOT/${NODE##*:}"
+    if grep -q "hefResetIntentMatches" "$FILE" &&
+       grep -q "resetPrefs.remove(HEF_NVS_KEY_RESET_INTENT)" "$FILE" &&
+       grep -q "HEF_NVS_KEY_RESET_INTENT" "$FILE"; then
+        echo "  [PASS] $NAME: a intencao do reinicio e' lida e consumida"
+    else
+        echo "  [FAIL] $NAME: intencao do reinicio gravada mas nao consumida"; WDT=1
+    fi
+done
+[ $WDT -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[11/11] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

@@ -27,6 +27,7 @@
 #include <time.h>
 #include <esp_random.h>
 #include <esp_efuse.h>
+#include <esp_system.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <LoRa.h>
@@ -52,6 +53,9 @@
 #include <spectrum.h>
 #include <jamming_detector.h>
 #include <serial_protocol.h>
+#include <reset_tracker.h>
+#include <watchdog.h>
+#include <watchdog_policy.h>
 
 // =====================================================================
 // Objetos globais
@@ -161,6 +165,109 @@ static LoginFail loginFails[8];
 // dos structs e o build quebraria.
 static const HefBandProfile* band = HefBandPlan::active();
 static HefDutyGuard dutyGuard;
+
+// =====================================================================
+// Causa de reinicio e contadores de operacao (v5.1.0, item 1.4)
+// =====================================================================
+// A v5.0.0 nao registrava NADA do motivo do reinicio: o boot imprimia
+// um banner e seguia. Um dispositivo que reiniciou 500 vezes por
+// brownout e um que reiniciou 500 vezes por travamento de software
+// eram INDISTINGUEIS.
+//
+// Este bloco fica DEPOIS das definicoes de struct pelo mesmo motivo do
+// bloco de orcamento de RF acima (o gerador de prototipos do Arduino
+// Core insere os prototipos na PRIMEIRA definicao de funcao).
+static Preferences    resetPrefs;
+static HefResetTracker resetTracker;
+static uint8_t        bootResetReason   = HEF_RST_UNKNOWN;
+static uint8_t        bootIntentKind    = HEF_RESET_INTENT_NONE;
+
+// Declaracao antecipada: `setupResetTracking()` grava o estado e
+// depende de `persistResetState()`.
+static void persistResetState();
+
+// Registra a causa do boot e persiste os contadores (quando a guarda de
+// desgaste permite). Retorna a causa lida.
+static uint8_t setupResetTracking() {
+    resetPrefs.begin(HEF_NVS_NAMESPACE_RESET, false);
+
+    // Carrega o estado anterior.
+    uint8_t blob[HEF_RESET_BLOB_LEN];
+    size_t  n = resetPrefs.getBytes(HEF_NVS_KEY_RESET, blob, sizeof(blob));
+    if (n >= HEF_RESET_BLOB_LEN) {
+        if (!resetTracker.importBlob(blob, sizeof(blob))) {
+            dbg.logWarning("Estado de reinicio invalido: contadores zerados");
+        }
+    }
+
+    // Registra este boot.
+    bootResetReason = (uint8_t)esp_reset_reason();
+    bool gravar = resetTracker.begin(bootResetReason,
+                                     HEF_RESET_PERSIST_EVERY_BOOTS);
+
+    // Le a INTENCAO do reinicio anterior (gravada antes do
+    // ESP.restart()). Ela explica o "por": foi o operador ou foi uma
+    // falha automatica?
+    //
+    // A intencao so vale para ESTE boot (a sequence tem de bater com o
+    // numero do boot). Depois de consumida, e' REMOVIDA: uma intencao
+    // nao consumida reapareceria em todos os boots seguintes, dizendo
+    // "reinicio solicitado pelo operador" em reinicios que foram
+    // travamentos. Informacao errada e' pior do que ausencia dela.
+    HefResetIntent intent;
+    memset(&intent, 0, sizeof(intent));
+    size_t ni = resetPrefs.getBytes(HEF_NVS_KEY_RESET_INTENT, &intent,
+                                    sizeof(intent));
+    if (ni == sizeof(intent) &&
+        hefResetIntentMatches(intent, resetTracker.counters().boots)) {
+        bootIntentKind = intent.kind;
+        resetPrefs.remove(HEF_NVS_KEY_RESET_INTENT);
+    }
+
+    if (gravar) persistResetState();
+    return bootResetReason;
+}
+
+// Grava o estado de reinicio na NVS.
+static void persistResetState() {
+    uint8_t blob[HEF_RESET_BLOB_LEN];
+    resetTracker.exportBlob(blob, sizeof(blob));
+    size_t written = resetPrefs.putBytes(HEF_NVS_KEY_RESET, blob,
+                                         sizeof(blob));
+    if (written == sizeof(blob)) {
+        resetTracker.markPersisted();
+    } else {
+        dbg.logWarning("Falha ao gravar o estado de reinicio na NVS");
+    }
+}
+
+// =====================================================================
+// Reinicio controlado (v5.1.0)
+// =====================================================================
+// Um `ESP.restart()` sem registro e' um reinicio CEGO: o operador ve
+// "reiniciou" e nao sabe se foi ele, o watchdog, ou a falta de energia.
+//
+// A intencao e' gravada ANTES do reinicio, para que o proximo boot
+// possa distinguir "alguem pediu" de "algo travou".
+static void hefRestart(uint8_t intentKind, uint8_t reason) {
+    // Grava a intencao do reinicio (a CONTAGEM do proximo boot
+    // classificara a causa; a intencao explica o por).
+    HefResetIntent intent;
+    memset(&intent, 0, sizeof(intent));
+    intent.kind     = intentKind;
+    intent.reason   = reason;
+    intent.sequence = resetTracker.counters().boots + 1;
+    resetPrefs.putBytes(HEF_NVS_KEY_RESET_INTENT, &intent, sizeof(intent));
+
+    // Garante que os contadores fiquem consistentes antes de sair.
+    if (resetTracker.shouldPersistNow()) persistResetState();
+
+    Serial.printf("Reiniciando (intencao=%u, causa=%s)...\n",
+                  intentKind, hefResetReasonName(reason));
+    Serial.flush();
+    delay(50);
+    ESP.restart();
+}
 
 static HefLinkParams linkParams() {
     HefLinkParams p;
@@ -291,12 +398,18 @@ static void restorePeerStates() {
 // Retorna true se houve gravacao e ela foi bem-sucedida.
 static bool persistPeerStates() {
     bool dirty = false;
+    // Operacao longa: a gravacao do vault (NVS cifrada + erase/write)
+    // pode levar dezenas de milissegundos, e o numero de pares pode
+    // crescer. O progresso e' reportado para que o watchdog NAO
+    // derrube o dispositivo numa gravacao legitima.
+    hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
     for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
         if (!peers[i].used) continue;
         if (!peers[i].rx.isDirty()) continue;
         vault.putPeerState(peers[i].nodeId, peers[i].rx.epoch(),
                            peers[i].rx.highest());
         dirty = true;
+        hefWatchdogLongOpStep((uint32_t)millis());
     }
     if (!dirty) return false;
 
@@ -304,6 +417,7 @@ static bool persistPeerStates() {
         dbg.logWarning("Falha ao gravar o estado anti-replay no vault");
         return false;   // as flags continuam sujas: tenta de novo
     }
+    hefWatchdogLongOpStep((uint32_t)millis());
     for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
         if (peers[i].used) peers[i].rx.clearPersistFlags();
     }
@@ -810,6 +924,14 @@ static bool startNetwork() {
         WiFi.begin(ssid, pass);
         uint32_t start = nowMs();
         while (WiFi.status() != WL_CONNECTED && (nowMs() - start) < 15000UL) {
+            // A espera pela conexao pode levar ate 15 s. Como o watchdog
+            // ja foi inscrito no inicio do setup (e o core Arduino so
+            // alimenta o WDT ANTES de cada `loop()`, nao durante o
+            // `setup()`), a task da loop ficaria sem alimentacao e o
+            // dispositivo reiniciaria no meio da inicializacao.
+            // Cada iteracao da espera e' um avanco real, entao o WDT e'
+            // alimentado aqui.
+            hefWatchdogFeed();
             delay(200);
         }
         memset(pass, 0, sizeof(pass));
@@ -998,7 +1120,7 @@ static String jsonSpectrum() {
 }
 
 static String jsonHealth() {
-    DynamicJsonDocument doc(1536);
+    DynamicJsonDocument doc(2048);
     doc["heap_free"] = ESP.getFreeHeap();
     doc["heap_min"] = ESP.getMinFreeHeap();
     doc["uptime_s"] = (uint32_t)(nowMs() / 1000UL);
@@ -1012,6 +1134,31 @@ static String jsonHealth() {
     uint8_t fails = 0;
     for (uint8_t i = 0; i < 8; i++) if (loginFails[i].used) fails++;
     doc["login_fails"] = fails;
+
+    // --- Causa de reinicio (v5.1.0, item 1.4) ---
+    // A causa do BOOT ATUAL e' exata (vem de esp_reset_reason()). Os
+    // contadores podem lagging alguns boots no pior caso (guarda de
+    // desgaste da NVS), mas a CAUSA nunca.
+    const HefResetCounters& rc = resetTracker.counters();
+    doc["reset_reason"] = hefResetReasonName(bootResetReason);
+    doc["reset_reason_code"] = bootResetReason;
+    doc["reset_fault"] = hefResetIsFault(bootResetReason);
+    doc["reset_brownout"] = hefResetIsBrownout(bootResetReason);
+    doc["boots"] = rc.boots;
+    doc["brownouts"] = rc.brownouts;
+    doc["wdt_resets"] = rc.wdtResets;
+    doc["sw_resets"] = rc.swResets;
+    doc["panics"] = rc.panics;
+    // A intencao do reinicio anterior: distingue "o operador pediu" de
+    // "algo travou". Vem da NVS e e' consumida no boot (removida depois
+    // de lida), entao reflete o reinicio imediatamente anterior.
+    doc["reset_intent"] = hefResetIntentName(bootIntentKind);
+    doc["reset_intent_kind"] = bootIntentKind;
+
+    // --- Watchdog ---
+    doc["watchdog_active"] = hefWatchdogActive();
+    doc["watchdog_timeout_s"] = hefWatchdogTimeoutS();
+
     String out;
     serializeJson(doc, out);
     return out;
@@ -1383,8 +1530,9 @@ static void printHelp() {
     Serial.println("budget                   orcamento de RF (duty cycle, perfil)");
     Serial.println("sweep on|off|now         varredura automatica/agora");
     Serial.println("radio <FM|AM|SW> <kHz>   sintoniza o receptor");
-    Serial.println("reboot                   reinicia");
+    Serial.println("reboot                   reinicia (motivo registrado)");
     Serial.println("factory                  apaga o vault e reinicia");
+    Serial.println("resets                   causa do reinicio e contadores");
 }
 
 static void handleConsole(char* line) {
@@ -1519,15 +1667,28 @@ static void handleConsole(char* line) {
             Serial.println("ERRO: use 'radio <FM|AM|SW> <kHz>'");
         }
     } else if (strncmp(line, "reboot", 6) == 0) {
-        Serial.println("Reiniciando...");
-        delay(100);
-        ESP.restart();
+        hefRestart(HEF_RESET_INTENT_USER, HEF_RST_SW);
     } else if (strncmp(line, "factory", 7) == 0) {
         vault.factoryReset();
         resetPeers();
         Serial.println("Vault apagado. Reiniciando...");
         delay(200);
-        ESP.restart();
+        hefRestart(HEF_RESET_INTENT_USER, HEF_RST_SW);
+    } else if (strncmp(line, "resets", 6) == 0) {
+        // Diagnostico do estado de reinicio (item 1.4).
+        const HefResetCounters& c = resetTracker.counters();
+        Serial.printf("causa do boot: %s (%u)\n",
+                      hefResetReasonName(bootResetReason), bootResetReason);
+        Serial.printf("boots=%u brownouts=%u wdt=%u sw=%u panic=%u\n",
+                      (unsigned)c.boots, (unsigned)c.brownouts,
+                      (unsigned)c.wdtResets, (unsigned)c.swResets,
+                      (unsigned)c.panics);
+        Serial.printf("causa persistida: %s | watchdog: %s (%u s)\n",
+                      hefResetReasonName(c.lastPersisted),
+                      hefWatchdogActive() ? "ativo" : "INATIVO",
+                      (unsigned)hefWatchdogTimeoutS());
+        Serial.printf("motivo do reinicio anterior: %s\n",
+                      hefResetIntentName(bootIntentKind));
     } else {
         Serial.println("Comando desconhecido. Use 'help'.");
     }
@@ -1566,6 +1727,28 @@ void setup() {
     dbg.begin(115200);
 
     dbg.log("Node2 v5.1.0: inicializando");
+
+    // --- Causa do reinicio (v5.1.0, item 1.4) ---
+    // Le a causa ANTES de tudo: e' a primeira informacao que o
+    // operador precisa (um brownout e' problema de energia; um WDT e'
+    // problema de software).
+    uint8_t reason = setupResetTracking();
+
+    // --- Watchdog de tarefa (v5.1.0, item 1.4) ---
+    // Um travamento do loop principal tem de derrubar o dispositivo.
+    // Sem isso, o node ficava "vivo" mas inutil: o HTTP nao respondia
+    // e o log forense parava de crescer, sem nenhuma indicacao.
+    HefWatchdogState wdt = hefWatchdogInit();
+    if (wdt.active) {
+        Serial.printf("watchdog: ativo (timeout %u s%s)\n",
+                      (unsigned)wdt.timeoutS,
+                      wdt.preInitialized ? ", timeout pre-existente" : "");
+    } else {
+        // Falha ABERTA e visivel: um watchdog que nao inicializou e'
+        // pior que nenhum, porque o operador pode acreditar que existe
+        // protecao.
+        Serial.println("watchdog: INATIVO (falha na inicializacao)");
+    }
 
     // Node3 em UART2 (UART0 fica para o console).
     node3Serial.begin(115200, SERIAL_8N1, N2_UART_RX, N2_UART_TX);
@@ -1613,6 +1796,19 @@ void setup() {
     Serial.println("=================================================");
     Serial.printf("node_id: %u\n", nodeId);
     Serial.printf("chave de link: %s\n", keyReady ? "OK" : "AUSENTE - 'psk <64 hex>'");
+    Serial.printf("reinicio: %s | boots=%u brownouts=%u wdt=%u sw=%u panic=%u\n",
+                  hefResetReasonName(reason),
+                  (unsigned)resetTracker.counters().boots,
+                  (unsigned)resetTracker.counters().brownouts,
+                  (unsigned)resetTracker.counters().wdtResets,
+                  (unsigned)resetTracker.counters().swResets,
+                  (unsigned)resetTracker.counters().panics);
+    if (bootIntentKind != HEF_RESET_INTENT_NONE) {
+        // O reinicio anterior foi PEDIDO (ou detectado como falha
+        // automatica): o operador sabe que nao foi um travamento.
+        Serial.printf("motivo do reinicio anterior: %s\n",
+                      hefResetIntentName(bootIntentKind));
+    }
     Serial.printf("HTTP: http://%s/\n",
                   (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP().toString().c_str()
                                               : WiFi.localIP().toString().c_str());
@@ -1704,14 +1900,26 @@ void loop() {
         persistPeerStates();
     }
 
+    // --- Flush dos contadores de reinicio ---
+    // Os contadores que a guarda de desgaste deixou em RAM sao gravados
+    // aqui. Sem isso, um dispositivo que reiniciou 9 vezes por brownout
+    // (sem passar pela janela de 10 boots) perderia a contagem.
+    static uint32_t lastResetFlush = 0;
+    if (now - lastResetFlush >= HEF_RESET_FLUSH_MS) {
+        lastResetFlush = now;
+        if (resetTracker.shouldPersistNow()) persistResetState();
+    }
+
     // --- Watchdog de memoria (reinicio controlado se o heap colapsar) ---
     static uint32_t lastHeapCheck = 0;
     if (now - lastHeapCheck >= 30000UL) {
         lastHeapCheck = now;
         if (ESP.getFreeHeap() < 12000) {
             dbg.logError("Heap critico: reiniciando");
-            delay(100);
-            ESP.restart();
+            // Reinicio CONTROLADO: a causa fica registrada antes de
+            // sair, para que o proximo boot nao pareca um travamento
+            // inexplicado.
+            hefRestart(HEF_RESET_INTENT_FAULT, HEF_RST_PANIC);
         }
     }
 

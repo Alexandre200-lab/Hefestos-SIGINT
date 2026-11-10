@@ -16,7 +16,7 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 
 ## 0. v5.1.0 — anti-replay sobrevivente a reinício + RF viável
 
-Os três primeiros itens do plano de escala militar:
+Os primeiros quatro itens do plano de escala militar:
 
 1. **O anti-replay agora sobrevive a um reinício do receptor** (item 1.1) —
    um frame capturado por SDR não é mais aceito como frame novo depois que
@@ -25,6 +25,9 @@ Os três primeiros itens do plano de escala militar:
    operava com 221,6% de duty cycle, o que é impossível.
 3. **A transmissão passa a ser adaptativa** (item 1.3) — por evento
    (movimento) ou por heartbeat, em vez de periódica.
+4. **O dispositivo sabe por que reiniciou** (item 1.4) — contadores de
+   brownout/WDT/panic persistidos, watchdog de tarefa sobre o loop
+   principal, e reinício controlado com o motivo registrado.
 
 > Os percentuais de duty cycle desta tabela mantêm o ACK atual (33 B) nos
 > dois lados, para isolar o efeito da mudança de SF e de intervalo. O
@@ -42,12 +45,16 @@ Os três primeiros itens do plano de escala militar:
 | Até 3 transmissões por evento | **no máximo 2** (1 + 1 retry) |
 | ACK de 35 B (payload redundante) | **33 B** (flags + RSSI de retorno) |
 | Beacon FM contínuo | **duty cycle próprio (10%) + corte automático < 20% de bateria** |
+| Causa do reinício | **não registrada** (indistinguível de um brownout) | **contadores NVS: boots/brownouts/wdt/sw/panic** |
+| Watchdog do loop principal | **inexistente** (travamento silencioso) | **TWDT de 30 s + progresso nas operações longas** |
+| Reinício por comando | `ESP.restart()` cru (reinício cego) | **`hefRestart()` grava a intenção antes de sair** |
 | Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
-| Testes | 7 grupos | 10 grupos (+213 verificações no host) |
+| Testes | 7 grupos | 11 grupos (548 verificações no host; +515 sobre a v5.0.0) |
 
 Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510),
-[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória) e
-[§9.6](#96-política-de-tx-adaptativa-node-1).
+[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória),
+[§9.6](#96-política-de-tx-adaptativa-node-1) e
+[§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
 
 ---
 
@@ -150,6 +157,19 @@ de qualquer transmissão que viole o limite. Ver [§9.5](#95-orçamento-de-rf-e-
 | Rate limit global bloqueava o próprio operador | Buckets por IP: login (5/min) e comandos (60/min, cooldown 50 ms) |
 | Dashboard montava HTML com dados de RF | Dashboard usa `textContent` (sem `innerHTML`), cabeçalhos `nosniff`/`DENY`/`no-referrer` |
 | Funções de debug podiam imprimir segredos | Nenhuma rotina imprime chave/senha/PSK |
+
+### 2.6 Operação em campo (v5.1.0)
+
+| Falha na v5.0.0 | Correção na v5.1.0 |
+|---|---|
+| Nenhuma registro da causa do reinício: brownout e travamento de software eram indistinguíveis | Contadores NVS por classe (`boots`/`brownouts`/`wdt`/`sw`/`panics`) + causa exata do último boot |
+| Nenhum watchdog sobre o `loop()`: um travamento deixava o aparelho "vivo" mas inútil, em silêncio | TWDT de 30 s inscrito na task do loop; reinício com causa `wdt-tarefa` |
+| Operações longas (cadeia do SD, exportação, gravação do vault) sem progressão: reinício falso ou travamento mascarado | Callback de progresso por ponto de avanço real; o guarda é uma **consulta**, e código travado não o chama |
+| `ESP.restart()` cru: reinício cego, sem motivo | `hefRestart()` grava a intenção antes de sair; nenhum reinício cru restou |
+| Contadores gravados a cada boot: 438 mil escritas/ano num laço de brownout | Guarda de desgaste: grava na mudança de causa ou a cada 10 boots; flush periódico de 5 min |
+| Estado do watchdog nunca exposto | `watchdog_active` + `watchdog_timeout_s` na API e no console — **honestos**: timeout desconhecido é `0`, nunca estimado |
+
+Ver [§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
 
 ---
 
@@ -437,6 +457,9 @@ lib/                     biblioteca compartilhada (Arduino library)
     link_budget.h        tempo no ar, duty cycle e guard de orçamento de RF
     band_plan.h          perfis de banda regionais de referência
     tx_policy.h          política de TX adaptativa (evento/heartbeat) + beacon
+    reset_tracker.h      causa de reinício e contadores de operação
+    watchdog_policy.h    política do watchdog (puro, testável no host)
+    watchdog.h           ligação do watchdog com o ESP-IDF
     totp_auth.h          TOTP RFC 6238
     rate_limiter.h       token buckets por IP
     debug.h              logging sem vazamento de segredos
@@ -450,11 +473,13 @@ tests/
   anti_replay_persistence.cpp  estado anti-replay persistido (host)
   link_budget.cpp       tempo no ar, duty cycle e guard de RF (host)
   tx_policy.cpp         política de TX adaptativa e beacon FM (host)
+  reset_tracker.cpp     causa de reinício e contadores (host)
+  watchdog_policy.cpp   política do watchdog (host)
   stub/HardwareSerial.h stub Arduino mínimo para compilar no host
 tools/
   airtime.py            CLI de cálculo de RF (airtime/duty/energia) + --selftest
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + build
+test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + WDT + build
 ```
 
 ---
@@ -544,7 +569,7 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 
 **Node 2:** `help`, `status`, `budget`, `id`, `psk`, `user`, `pass`, `totp`,
 `wifi`, `settime`, `time`, `enroll <node> <keyid>`, `peers`,
-`sweep on|off|now`, `radio <FM|AM|SW> <kHz>`, `reboot`, `factory`.
+`sweep on|off|now`, `radio <FM|AM|SW> <kHz>`, `resets`, `reboot`, `factory`.
 
 > `budget` (Node 1 e Node 2) imprime o perfil regional, a faixa, o tempo no
 > ar, o intervalo efetivo e o duty cycle consumido na janela de 1 h — ver
@@ -552,9 +577,12 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 >
 > `policy` (Node 1) imprime a política de TX adaptativa e o estado do
 > beacon FM — ver [§9.6](#96-política-de-tx-adaptativa-node-1).
+>
+> `resets` (Node 2 e Node 3) imprime a causa do boot e os contadores de
+> reinício — ver [§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
 
 **Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
-`time <unix>`, `format`, `reboot`.
+`time <unix>`, `format`, `resets`, `reboot`.
 
 ### 9.2 API HTTP (Node 2)
 
@@ -571,7 +599,7 @@ Todas exigem sessão autenticada (cookie `HEF_SID`).
 | POST | `/api/radio?band=FM&freq=100100` | sintoniza |
 | GET | `/api/spectrum` | amostras da varredura |
 | POST | `/api/sweep[?auto=1][&dwell=90]` | inicia varredura |
-| GET | `/api/health` | heap, relógio, contadores |
+| GET | `/api/health` | heap, relógio, contadores, causa do reinício e estado do watchdog |
 | GET | `/api/captures` | capturas do Node 3 (cache) |
 | GET | `/api/logs` | estado do log forense |
 
@@ -868,6 +896,160 @@ ciente da unidade) tem prioridade sobre um beacon audível.
 
 ---
 
+### 9.7 Watchdog, brownout e causa de reinício (Node 2 / Node 3) — v5.1.0
+
+#### 9.7.1 O que estava errado
+
+Na v5.0.0 o dispositivo **não registrava por que reiniciou**. O boot
+imprimia um banner e seguia. Um aparelho que reiniciou 500 vezes por
+*brownout* (queda de alimentação) e um que reiniciou 500 vezes por
+*travamento de software* eram **indistinguíveis** no log — e são falhas de
+naturezas completamente diferentes: uma é problema de energia, a outra é
+bug de software, e tratam-se de formas diferentes.
+
+Pior: **não havia watchdog sobre o loop principal**. O TWDT do IDF só
+vigiava a task idle. Um travamento em `loop()` — onde vive praticamente
+toda a lógica — não era detectado: o aparelho ficava "vivo" mas inútil,
+com o HTTP sem resposta e o log forense parado de crescer, **sem
+qualquer indicação**.
+
+#### 9.7.2 Watchdog de tarefa
+
+| item | valor |
+|---|---|
+| timeout pedido | `HEF_WDT_TIMEOUT_S` = **30 s** |
+| alimentações por janela | `HEF_WDT_FEED_DIVISOR` = 3 (intervalo efetivo 5 s) |
+| detector de brownout | ativo no build (`CONFIG_ESP32_BROWNOUT_DET=y` / `CONFIG_ESP32C3_BROWNOUT_DET=y`) |
+
+O core Arduino-ESP32 2.0.17 alimenta o TWDT **antes de cada `loop()`**
+(quando `loopTaskWDTEnabled` está ligado). Como `enableLoopWDT()`
+inscreve a task do loop, **um travamento dentro de `loop()` não é
+alimentado e o TWDT dispara o panic handler**: o chip reinicia com causa
+`ESP_RST_TASK_WDT` em menos de 30 s.
+
+O estado do watchdog é **reportado com honestidade**:
+
+- `watchdog_active` — o watchdog está realmente inscrito?
+- `watchdog_timeout_s` — o timeout **efetivo**. Se o TWDT já existia
+  (inicializado por outro componente) e o IDF 4.4 não permite ler o
+  timeout em vigor, o valor reportado é **0 (desconhecido)** — nunca uma
+  mentira. O console imprime `timeout pre-existente` nesse caso.
+- Se a inicialização **falhar**, o console imprime
+  `watchdog: INATIVO (falha na inicializacao)`. Um watchdog que não
+  inicializou é pior do que nenhum: o operador poderia acreditar que
+  existe proteção que não existe.
+
+#### 9.7.3 Operações longas: progresso sem mascarar travamento
+
+Operações que podem levar **minutos** (releitura da cadeia de hash do
+log forense, exportação JSONL, gravação do vault) alimentam o watchdog
+durante a execução.
+
+O ponto criticalmente importante: **o progresso só é reportado em pontos
+onde a operação realmente avançou**. Um SD que trava no meio **deixa de
+reportar progresso**, e o watchdog expira normalmente — o travamento vira
+um reinício com causa visível, em vez de ficar mascarado. O guarda de
+progresso (`HefProgressGuard`) é uma **consulta**, não uma ação: ele só
+responde "o WDT precisa de alimentação?"; quem alimenta é o chamador, e
+só depois de um avanço real.
+
+No Node 3 isso é implementado por um callback de progresso no
+`FieldLog`, acionado a cada registro processado.
+
+#### 9.7.4 Contadores de reinício
+
+| contador | significado |
+|---|---|
+| `boots` | total de inicializações |
+| `brownouts` | reinícios por queda de alimentação |
+| `wdt_resets` | reinícios por watchdog (tarefa, interrupção ou genérico) |
+| `sw_resets` | reinícios por software (`ESP.restart()`, deep sleep) |
+| `panics` | reinícios por panic/exceção |
+
+**Guarda de desgaste da NVS.** Cada gravação na NVS consome vida útil da
+partição. Numa operação normal isso é irrelevante, mas num **laço de
+brownout** — a alimentação oscila e o aparelho reinicia 50 vezes por
+hora — a NVS sofreria 438 mil escritas por ano. Por isso:
+
+- a gravação **imediata** só acontece quando a **causa mudou** (um
+  brownout depois de um boot normal é evento novo e relevante) ou a cada
+  `HEF_RESET_PERSIST_EVERY_BOOTS` (10) boots;
+- o resto fica acumulado em RAM e é gravado no flush periódico
+  (`HEF_RESET_FLUSH_MS` = 5 min);
+- a **causa do último reinício é sempre exata** — é ela que o operador
+  precisa, e ela nunca fica defasada.
+
+Os contadores vivem num namespace NVS próprio (`hefrst`), **não** no
+vault cifrado: contadores de operação não são segredo, e o vault é
+reescrito **inteiro** a cada gravação — caro demais para um contador.
+
+#### 9.7.5 Reinício controlado
+
+Um `ESP.restart()` sem registro é um reinício **cego**. Todo reinício
+agora passa por `hefRestart()`, que grava a **intenção** (pedido pelo
+operador? falha automática?) antes de sair. O console mostra o motivo:
+
+```console
+# Node 2
+resets
+causa do boot: brownout (9)
+boots=42 brownouts=7 wdt=1 sw=31 panic=0
+causa persistida: brownout | watchdog: ativo (30 s)
+motivo do reinicio anterior: desconhecida
+```
+
+A **intenção é lida e consumida** no boot seguinte: ela só vale para
+aquele boot (a `sequence` tem de bater com o número do boot) e é
+removida depois de lida. Sem essa checagem, um `reboot` do operador
+deixaria uma intenção "pendente" que continuaria aparecendo em **todos**
+os boots seguintes — dizendo "reinício solicitado pelo operador" em
+reinícios que foram, na verdade, travamentos. Informação errada é pior do
+que a ausência dela.
+
+A causa do boot e o estado do watchdog estão também em
+`GET /api/health` (Node 2) e no JSON de log do Node 3 (visível na base
+pelo painel):
+
+```json
+{
+  "reset_reason": "brownout",
+  "reset_reason_code": 9,
+  "reset_fault": false,
+  "reset_brownout": true,
+  "boots": 42, "brownouts": 7, "wdt_resets": 1, "sw_resets": 31, "panics": 0,
+  "reset_intent": "solicitado pelo operador",
+  "reset_intent_kind": 1,
+  "watchdog_active": true,
+  "watchdog_timeout_s": 30
+}
+```
+
+> ⚠️ **Aceite de bancada pendente.** O critério do item 1.4 é *"travamento
+> real do loop principal provoca reinício em < 30 s com causa `WDT`
+> visível"*. Não há hardware neste ambiente, então o reinício por WDT
+> **não foi exercitado em campo**. Validar em bancada antes de operar:
+> travar o `loop()` de propósito (ex.: um `while(true)` sem `delay`) e
+> confirmar o reinício com causa `wdt-tarefa` no console e em
+> `/api/health`.
+
+#### 9.7.6 Checklist de validação em bancada
+
+| # | Teste | Resultado esperado |
+|---|---|---|
+| 1 | Travar o `loop()` (ex.: `while(true);` sem `delay`) | reinício em **< 30 s** |
+| 2 | Console do boot seguinte | `reinicio: wdt-tarefa` |
+| 3 | `GET /api/health` | `reset_reason: "wdt-tarefa"`, `wdt_resets` incrementado |
+| 4 | Cortar a alimentação durante o boot | boot seguinte com `reinicio: brownout`, contador `brownouts` incrementado |
+| 5 | `reboot` no console | `Reiniciando (intencao=1, causa=software)...` e boot seguinte com `sw_resets` incrementado |
+| 6 | `heap critico` forçado | reinício com `intencao=2` (falha automática) |
+| 7 | Node 3 com log grande: `export` | **sem reinício** (progresso reportado) |
+| 8 | Node 3 com SD travado: `export` | **reinício por WDT** (travamento não mascarado) |
+
+Os testes 7 e 8 são o par que valida a propriedade central do item 1.4:
+**o watchdog distingue "operação lenta legítima" de "operação travada"**.
+
+---
+
 ## 10. Log forense (Node 3)
 
 - Registro binário append-only: `seq`, `utc`, `type`, `len`, `data`.
@@ -886,11 +1068,11 @@ ciente da unidade) tem prioridade sobre um beacon audível.
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + round-trip + RF + politica + build
+./test_functional.sh            # invariantes + round-trip + RF + politica + WDT + build
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (10 grupos):
+Cobertura (11 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -931,7 +1113,27 @@ Cobertura (10 grupos):
    ACK curto está coerente entre os dois nós, que **o contador do emissor
    não pode ser reescrito** e que **o movimento pendente sobrevive a uma
    TX negada**;
-10. build dos três nós.
+10. **causa de reinício e watchdog** (`tests/reset_tracker.cpp`,
+    108 verificações + `tests/watchdog_policy.cpp`, 188 verificações no
+    host): classificação de cada causa do ESP-IDF, contadores por
+    classe, serialização/deserialização do estado (round-trip),
+    saneamento de blob corrompido (fail-safe), guarda de desgaste da
+    NVS, resolução do estado do watchdog a partir do resultado da init
+    (OK / já-inicializado / falha real), **honestidade do timeout
+    reportado** (nunca mente), cálculo do intervalo de alimentação das
+    operações longas com o invariante de que o intervalo cabe na janela
+    do WDT, e a propriedade de que **o guarda é uma consulta** (um
+    código travado não o chama, e portanto o WDT expira — o travamento
+    não é mascarado). O grupo verifica também, por análise estática,
+    que os dois nós iniciam o watchdog e registram a causa do boot,
+    que a causa é **visível na API**, que **todo reinício passa por
+    `hefRestart()`** (nenhum `ESP.restart()` cru), que as operações
+    longas reportam progresso, que os contadores de reinício têm
+    guarda de desgaste e que a **intenção do reinício é lida e
+    consumida** (uma intenção não consumida reapareceria em todos os
+    boots seguintes, dizendo "reinício solicitado pelo operador" em
+    reinícios que foram travamentos);
+11. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
@@ -945,6 +1147,16 @@ apontava. O de TX adaptativa existe porque a política tem **arestas não
 que nunca dispara, contador de frame reusado) que só aparecem em
 simulação.
 
+O teste do watchdog existe porque **códigos de erro errados passam
+invisíveis**. A v5.1.0 usava `-1` e `-12` para `ESP_ERR_INVALID_STATE` e
+`ESP_ERR_NO_MEM`, mas os códigos reais do `esp_err.h` são `0x103` (259) e
+`0x101` (257). Com os valores errados, uma falha de memória era
+classificada como "TWDT já inicializado" e o resolvedor devolvia
+`active = true`: o console e a API passavam a reportar **"watchdog: ativo"**
+num dispositivo **sem watchdog** — a proteção aparecia na telemetria sem
+existir. É a mesma classe de defeito do duty cycle de 221%: nada no build
+nem na revisão de código apontaria.
+
 ---
 
 ## 12. Solução de problemas
@@ -957,6 +1169,10 @@ simulação.
 | `/api/spectrum` vazio | varredura não iniciada | `POST /api/sweep` ou `sweep now` |
 | Node 3 sem log | SD ausente/incompatível | verificar 3,3 V, cartão FAT32, `status` |
 | Node 2 reinicia sozinho | heap crítico | reduzir sessões/varredura; ver `/api/health` |
+| Node reinicia em laço | brownout (energia) | `resets` → ver `brownouts`; revisar fonte |
+| Node reinicia em laço | travamento de software | `resets` → ver `wdt`/`panics`; investigar |
+| `watchdog: INATIVO` no boot | falha na inicialização do TWDT | investigar; o dispositivo está sem proteção |
+| `watchdog_timeout_s: 0` | TWDT pré-existente, timeout desconhecido | estado real, não uma falha (IDF 4.4 não expõe a leitura) |
 | Frame rejeitado como replay | emissor reiniciou sem novo epoch | reiniciar o Node 1 (epoch novo) |
 
 ---
@@ -1023,6 +1239,26 @@ Consequências práticas:
   exercitada neste ambiente (nenhum Si4713 conectado). Confirmar em
   bancada que o beacon cessa de radiar na fase OFF e no corte por bateria
   (§9.6.4).
+- **Watchdog: aceite de bancada pendente.** O critério do item 1.4 é
+  *"travamento real do loop principal provoca reinício em < 30 s com
+  causa `WDT` visível"*. Não há hardware neste ambiente, então o
+  reinício por WDT não foi exercitado. Confirmar em bancada (§9.7.6).
+- **Timeout do watchdog pode ser desconhecido.** Se outro componente já
+  tiver inicializado o TWDT, o IDF 4.4 não expõe a leitura do timeout em
+  vigor: o valor reportado é `0` (desconhecido), não uma estimativa. O
+  IDF 5.x (core 3.x, previsto para a Fase 4) expõe a leitura e resolverá
+  essa limitação.
+- **`setup()` não é protegido pelo watchdog.** O core Arduino alimenta o
+  TWDT apenas **antes de cada `loop()`**; durante o `setup()` a task fica
+  sem alimentação. As operações potencialmente longas do setup (espera
+  pelo Wi-Fi STA, até 15 s; releitura da cadeia do SD) alimentam o WDT
+  explicitamente. Uma falha que travasse o `setup()` **sem ultrapassar
+  os pontos de avanço** só seria detectada por causa do brownout ou por
+  um watchdog externo.
+- **Contadores de reinício podem ficar alguns boots atrás.** A guarda de
+  desgaste da NVS (§9.7.4) adia a gravação para pouvar a partição. A
+  **causa** do último reinício é sempre exata; os **totais** podem
+  defasar em até `HEF_RESET_PERSIST_EVERY_BOOTS` (10) boots.
 - **Consumo real ainda não medido.** O item 1.3 do plano tem aceite
   "≤ 0,5 Ah/dia medido em bancada". As estimativas de firmware cobrem
   **apenas o TX LoRa** (0,053 Ah/dia no pior caso). Os consumos

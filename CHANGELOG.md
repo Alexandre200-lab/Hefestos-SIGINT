@@ -171,9 +171,112 @@
   mais velho que o espelho em RAM; agora a entrada `HEF_TLV_PEER_STATE` é
   sempre reescrita a partir do espelho em RAM (a versão mais recente).
 - `save()` verifica o retorno da escrita na NVS (`putBytes`).
+- **Causa de reinício, contadores de operação e watchdog de tarefa (item 1.4
+  do plano).** A v5.0.0 não registrava **nada** do motivo do reinício: o
+  boot imprimia um banner e seguia. Um dispositivo que reiniciou 500 vezes
+  por *brownout* (queda de alimentação) e um que reiniciou 500 vezes por
+  *travamento de software* eram **indistinguíveis** no log — e são falhas de
+  naturezas completamente diferentes. Pior: **não havia watchdog sobre o
+  loop principal**, onde vive praticamente toda a lógica: um travamento
+  deixava o aparelho "vivo" mas inútil (HTTP sem resposta, log forense
+  parado), **sem nenhuma indicação**.
+  - `lib/src/reset_tracker.h` (novo, puro/testável no host):
+    `HefResetReason` (espelho de `esp_reset_reason_t`), `hefResetReasonName()`,
+    `hefResetIsFault()`, `hefResetIsBrownout()`, `HefResetCounters`,
+    `HefResetTracker` (contadores + guarda de desgaste + serialização de
+    28 B com **fail-safe** na importação) e `HefResetIntent` (intenção do
+    reinício, gravada antes de sair).
+  - `lib/src/watchdog_policy.h` (novo, puro/testável no host):
+    `HefWatchdogState`, `hefWatchdogResolve()` (resolve o estado a partir do
+    resultado da init) e `HefProgressGuard` (margem de segurança de 2× e
+    virada do relógio de 32 bits).
+  - `lib/src/watchdog.h` (novo): ligação com o ESP-IDF, **versionada** para
+    IDF 4.4 (core 2.0.17, atual) e IDF 5.x (core 3.x, previsto para a
+    Fase 4). Usa `enableLoopWDT()` / `feedLoopWDT()` do core Arduino: o core
+    alimenta o TWDT **antes de cada `loop()`**, de modo que um travamento
+    dentro do `loop()` não é alimentado e o TWDT dispara o panic handler.
+  - `lib/src/hefestos_pins.h`: `HEF_NVS_NAMESPACE_RESET` (`hefrst`),
+    `HEF_NVS_KEY_RESET`, `HEF_RESET_PERSIST_EVERY_BOOTS` (10),
+    `HEF_RESET_FLUSH_MS` (5 min), `HEF_WDT_TIMEOUT_S` (30) e
+    `HEF_WDT_FEED_DIVISOR` (3).
+  - `lib/src/field_log.h`: callback de progresso
+    (`FieldLogProgressCb`), acionado a cada registro processado na
+    releitura da cadeia (boot) e na exportação JSONL.
+  - Node 2: causa do boot lida e registrada no primeiro instante do
+    `setup()`; watchdog iniciado; banner de boot com a causa e os
+    contadores; comando `resets`; `/api/health` com `reset_reason`,
+    `reset_reason_code`, `reset_fault`, `reset_brownout`, `boots`,
+    `brownouts`, `wdt_resets`, `sw_resets`, `panics`, `watchdog_active` e
+    `watchdog_timeout_s`; reinício por heap crítico e por comando
+    (`reboot`, `factory`) passando por `hefRestart()`; flush periódico dos
+    contadores; alimentação do WDT durante a espera do Wi-Fi STA (até 15 s,
+    dentro do `setup()`, que o core **não** alimenta) e durante a gravação
+    do vault.
+  - Node 3: mesma integração de causa/contadores/watchdog, com `resets` no
+    console, a causa e o estado do watchdog no JSON de log (visível na base
+    pelo painel), `reboot` passando por `hefRestart()`, flush periódico,
+    callback de progresso alimentando o WDT na releitura da cadeia e na
+    exportação JSONL.
+  - `tests/reset_tracker.cpp` (novo, host): 108 verificações.
+  - `tests/watchdog_policy.cpp` (novo, host): 188 verificações.
+  - `test_functional.sh`: novo grupo 10/11 (causa de reinício e watchdog),
+    com verificações estáticas de que os dois nós iniciam o watchdog e
+    registram a causa do boot, de que a causa é visível na API, de que
+    **todo reinício passa por `hefRestart()`** (nenhum `ESP.restart()`
+    cru), de que as operações longas reportam progresso, de que os
+    contadores têm guarda de desgaste e de que a **intenção do reinício
+    é lida e consumida**.
+- **A intenção do reinício era DADO MORTO.** `hefRestart()` gravava a
+  intenção (`kind`/`reason`/`sequence`) na NVS, mas **ninguém a lia**:
+  o reinício controlado explicava o motivo para ninguém. Pior, apenas
+  lida sem ser consumida, ela reapareceria em **todos** os boots
+  seguintes — dizendo "reinício solicitado pelo operador" em reinícios
+  que foram travamentos. Informação errada é pior do que a ausência
+  dela.
+  - `hefResetIntentMatches()` (novo, em `reset_tracker.h`): a intenção só
+    vale para o boot cuja `sequence` coincide com o número do boot.
+  - Os dois nós leem a intenção no boot, verificam a correspondência e a
+    **removem** da NVS depois de consumida.
+  - A intenção aparece no banner de boot, no comando `resets` e na API
+    (`reset_intent` / `reset_intent_kind`).
+  - `tests/reset_tracker.cpp` cobre o ciclo completo (pedido → boot →
+    consumo → boot posterior não reaproveita a intenção antiga).
+- **Watchdog podia REPORTAR PROTEÇÃO QUE NÃO EXISTIA (bug grave).** Os
+  códigos de erro do ESP-IDF **não** são negativos pequenos: o `esp_err.h`
+  define `ESP_ERR_NO_MEM = 0x101` (257) e `ESP_ERR_INVALID_STATE = 0x103`
+  (259). A v5.1.0 usava `-1` e `-12`. Com os valores errados, uma falha de
+  memória era classificada como "TWDT já inicializado" e o resolvedor
+  devolvia `active = subscribed` — o console e a API passavam a reportar
+  **"watchdog: ativo"** num dispositivo **sem watchdog**. A proteção
+  aparecia na telemetria sem existir.
+  - Os códigos foram corrigidos em `lib/src/watchdog_policy.h` e o erro
+    passou a ser repassado **exatamente** como veio do IDF (sem colapso
+    num único valor).
+  - `tests/watchdog_policy.cpp` tem um bloco de regressão que fixa os
+    valores e prova que uma falha de memória **não** pode ser reportada
+    como watchdog ativo.
+- **Timeout do watchdog podia ser reportado como o pedido sem ser verdade.**
+  Quando o TWDT já existe (inicializado por outro componente), o IDF 4.4
+  não expõe a leitura do timeout em vigor. O valor reportado é **0
+  (desconhecido)** — nunca uma estimativa — e o console marca
+  `timeout pre-existente`. Se a inicialização **falhar**, o console
+  imprime `watchdog: INATIVO (falha na inicializacao)`: um watchdog que
+  não inicializou é pior do que nenhum, porque o operador poderia
+  acreditar que existe proteção.
+- **Progresso do watchdog pode mascarar um travamento.** O `HefProgressGuard`
+  é uma **consulta**, não uma ação: ele só responde "o WDT precisa de
+  alimentação?"; quem alimenta é o chamador, e só depois de um **avanço
+  real**. Um código travado (um SD que nunca responde) deixa de reportar
+  progresso, o WDT expira normalmente e o travamento vira um reinício com
+  causa visível — em vez de ficar mascarado.
 
 ### Documentado
 
+- README §9.7 (novo): "Watchdog, brownout e causa de reinício (Node 2 /
+  Node 3)" — o que estava errado, o watchdog de tarefa e o detector de
+  brownout, o progresso das operações longas sem mascarar travamento, os
+  contadores e a guarda de desgaste da NVS, o reinício controlado, e um
+  **checklist de validação em bancada** (8 testes).
 - README §9.6 (novo): "Política de TX adaptativa (Node 1)" — disparo por
   movimento ou heartbeat, as arestas da política (evento não perdido no
   piso, edge-triggering, ausência de fix), ACK curto, retentativa e beacon
@@ -186,9 +289,12 @@
   residual de 60 s, indicador de migração de vault v5.0.0 e limites do epoch
   de 16 bits.
 - README §5.4 (novo): parâmetros de RF do link LoRa (constantes e origem).
-- README §2.3, §9.1, §11 e §14 atualizados: duty cycle viabilizado,
-  perfis regionais, comandos `budget` e `policy`, 10 grupos de teste
-  (+213 verificações no host) e as novas limitações conhecidas.
+- README §2.6 (novo): "Operação em campo (v5.1.0)" — o que a v5.0.0
+  deixava em aberto em operação real.
+- README §0, §2, §9.1, §9.2, §11, §12 e §14 atualizados: causa de
+  reinício e watchdog, comandos `resets`, 11 grupos de teste
+  (548 verificações no host; +515 sobre a v5.0.0) e as novas limitações
+  conhecidas.
 
 ### Correção de estimativa (documento do plano)
 

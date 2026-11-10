@@ -25,12 +25,17 @@
 #include <HardwareSerial.h>
 #include <ArduinoJson.h>
 #include <esp_efuse.h>
+#include <esp_system.h>
+#include <Preferences.h>
 
 #include <hefestos_pins.h>
 #include <serial_protocol.h>
 #include <link_protocol.h>
 #include <field_log.h>
 #include <debug.h>
+#include <reset_tracker.h>
+#include <watchdog.h>
+#include <watchdog_policy.h>
 
 // =====================================================================
 // Globais
@@ -53,6 +58,12 @@ static uint32_t captureSeq = 0;
 // =====================================================================
 // Ring buffer de capturas (RAM)
 // =====================================================================
+// A definicao do struct fica ANTES de qualquer definicao de funcao:
+// o gerador de prototipos do Arduino Core insere os prototipos no
+// ponto da PRIMEIRA definicao de funcao do sketch. Se `struct Capture`
+// estivesse depois, o prototipo gerado
+// (`static Capture* captureAtAge(uint16_t);`) viria antes do struct e
+// o build quebraria com "'Capture' does not name a type".
 struct Capture {
     bool     valid;
     uint32_t seq;
@@ -64,6 +75,104 @@ struct Capture {
 static Capture captures[HEF_CAPTURE_RING];
 static uint16_t capHead = 0;
 static uint16_t capCount = 0;
+
+// =====================================================================
+// Causa de reinicio e contadores de operacao (v5.1.0, item 1.4)
+// =====================================================================
+// A caixa preta e' o dispositivo que MAIS precisa registrar por que
+// reiniciou: e' ela que guarda a evidencia. Se ela reinicia em laco por
+// brownout, a cadeia de hash do log fica truncada sem que ninguem
+// perceba — e a cadeia truncada e' indistinguivel de uma cadeia
+// manipulada.
+static Preferences     resetPrefs;
+static HefResetTracker resetTracker;
+static uint8_t         bootResetReason = HEF_RST_UNKNOWN;
+static uint8_t         bootIntentKind  = HEF_RESET_INTENT_NONE;
+
+static void persistResetState() {
+    uint8_t blob[HEF_RESET_BLOB_LEN];
+    resetTracker.exportBlob(blob, sizeof(blob));
+    size_t written = resetPrefs.putBytes(HEF_NVS_KEY_RESET, blob,
+                                         sizeof(blob));
+    if (written == sizeof(blob)) {
+        resetTracker.markPersisted();
+    } else {
+        dbg.logWarning("Falha ao gravar o estado de reinicio na NVS");
+    }
+}
+
+// Registra a causa do boot e persiste os contadores (quando a guarda de
+// desgaste permite).
+static uint8_t setupResetTracking() {
+    resetPrefs.begin(HEF_NVS_NAMESPACE_RESET, false);
+
+    uint8_t blob[HEF_RESET_BLOB_LEN];
+    size_t  n = resetPrefs.getBytes(HEF_NVS_KEY_RESET, blob, sizeof(blob));
+    if (n >= HEF_RESET_BLOB_LEN) {
+        if (!resetTracker.importBlob(blob, sizeof(blob))) {
+            dbg.logWarning("Estado de reinicio invalido: contadores zerados");
+        }
+    }
+
+    bootResetReason = (uint8_t)esp_reset_reason();
+    bool gravar = resetTracker.begin(bootResetReason,
+                                     HEF_RESET_PERSIST_EVERY_BOOTS);
+
+    // Le e CONSOME a intencao do reinicio anterior. A sequence tem de
+    // bater com o numero deste boot; depois de lida, a intencao e'
+    // removida para nao reaparecer nos boots seguintes.
+    HefResetIntent intent;
+    memset(&intent, 0, sizeof(intent));
+    size_t ni = resetPrefs.getBytes(HEF_NVS_KEY_RESET_INTENT, &intent,
+                                    sizeof(intent));
+    if (ni == sizeof(intent) &&
+        hefResetIntentMatches(intent, resetTracker.counters().boots)) {
+        bootIntentKind = intent.kind;
+        resetPrefs.remove(HEF_NVS_KEY_RESET_INTENT);
+    }
+
+    if (gravar) persistResetState();
+    return bootResetReason;
+}
+
+// Reinicio controlado: a causa fica registrada antes de sair.
+static void hefRestart(uint8_t intentKind, uint8_t reason) {
+    HefResetIntent intent;
+    memset(&intent, 0, sizeof(intent));
+    intent.kind     = intentKind;
+    intent.reason   = reason;
+    intent.sequence = resetTracker.counters().boots + 1;
+    resetPrefs.putBytes(HEF_NVS_KEY_RESET_INTENT, &intent, sizeof(intent));
+
+    if (resetTracker.shouldPersistNow()) persistResetState();
+
+    Serial.printf("Reiniciando (intencao=%u, causa=%s)...\n",
+                  intentKind, hefResetReasonName(reason));
+    Serial.flush();
+    delay(50);
+    ESP.restart();
+}
+
+// =====================================================================
+// Progresso das operacoes longas no SD (v5.1.0, item 1.4)
+// =====================================================================
+// A releitura da cadeia de hash (no boot) e a exportacao JSONL podem
+// processar dezenas de milhares de registros. Num SD lento isso leva
+// MINUTOS — tempo suficiente para o watchdog de 30 s derrubar o
+// dispositivo no meio de uma operacao legitima.
+//
+// O callback abaixo alimenta o watchdog, mas SO em pontos onde a
+// operacao REALMENTE avancou (um registro processado). Se o SD travar
+// no meio, o callback deixa de ser chamado e o watchdog expira
+// normalmente: o travamento vira um reinicio com causa visivel, em vez
+// de ficar mascarado.
+static void onLogProgress(void* ctx, uint32_t records) {
+    (void)ctx;
+    uint32_t now = (uint32_t)millis();
+    if (hefWatchdogLongOpStep(now)) {
+        dbg.logf("SD: %u registros processados", (unsigned)records);
+    }
+}
 
 static void pushCapture(uint8_t type, const char* data, uint16_t len) {
     Capture& c = captures[capHead];
@@ -149,7 +258,7 @@ static void sendResponse(uint8_t req, const String& json) {
 }
 
 static String buildLogInfo() {
-    DynamicJsonDocument doc(768);
+    DynamicJsonDocument doc(1024);
     doc["records"] = fieldLog.recordCount();
     doc["sd"] = sdOk;
     doc["file"] = "HEFLOG.BIN";
@@ -163,6 +272,25 @@ static String buildLogInfo() {
     doc["ser_ok"] = serRx.framesOk();
     doc["ser_crc"] = serRx.crcErrors();
     doc["ser_ovf"] = serRx.overflows();
+
+    // --- Causa de reinicio e watchdog (v5.1.0, item 1.4) ---
+    // A caixa preta reporta a propria saude de reinicio ao Node2: e'
+    // ela que guarda a evidencia, e uma cadeia truncada por reinicio
+    // em laco precisa ser visivel para quem investiga.
+    const HefResetCounters& rc = resetTracker.counters();
+    doc["reset_reason"] = hefResetReasonName(bootResetReason);
+    doc["reset_reason_code"] = bootResetReason;
+    doc["reset_fault"] = hefResetIsFault(bootResetReason);
+    doc["reset_brownout"] = hefResetIsBrownout(bootResetReason);
+    doc["boots"] = rc.boots;
+    doc["brownouts"] = rc.brownouts;
+    doc["wdt_resets"] = rc.wdtResets;
+    doc["sw_resets"] = rc.swResets;
+    doc["panics"] = rc.panics;
+    doc["reset_intent"] = hefResetIntentName(bootIntentKind);
+    doc["reset_intent_kind"] = bootIntentKind;
+    doc["watchdog_active"] = hefWatchdogActive();
+    doc["watchdog_timeout_s"] = hefWatchdogTimeoutS();
 
     String out;
     serializeJson(doc, out);
@@ -323,7 +451,8 @@ static void printHelp() {
     Serial.println("export         exporta o log para JSONL no SD");
     Serial.println("time <unix>    ajusta o relogio UTC");
     Serial.println("format         apaga HEFLOG.BIN (perde a cadeia)");
-    Serial.println("reboot         reinicia");
+    Serial.println("reboot         reinicia (motivo registrado)");
+    Serial.println("resets         causa do reinicio e contadores");
 }
 
 static void handleConsole(char* line) {
@@ -337,6 +466,22 @@ static void handleConsole(char* line) {
         Serial.printf("frames: data=%u req=%u crc=%u ovf=%u\n",
                       framesData, framesReq, serRx.crcErrors(), serRx.overflows());
         Serial.printf("utc=%u\n", lastUtc);
+        Serial.printf("reinicio=%s watchdog=%s (%u s)\n",
+                      hefResetReasonName(bootResetReason),
+                      hefWatchdogActive() ? "ativo" : "INATIVO",
+                      (unsigned)hefWatchdogTimeoutS());
+        Serial.printf("motivo do reinicio anterior: %s\n",
+                      hefResetIntentName(bootIntentKind));
+    } else if (strncmp(line, "resets", 6) == 0) {
+        const HefResetCounters& c = resetTracker.counters();
+        Serial.printf("causa do boot: %s (%u)\n",
+                      hefResetReasonName(bootResetReason), bootResetReason);
+        Serial.printf("boots=%u brownouts=%u wdt=%u sw=%u panic=%u\n",
+                      (unsigned)c.boots, (unsigned)c.brownouts,
+                      (unsigned)c.wdtResets, (unsigned)c.swResets,
+                      (unsigned)c.panics);
+        Serial.printf("motivo do reinicio anterior: %s\n",
+                      hefResetIntentName(bootIntentKind));
     } else if (strncmp(line, "info", 4) == 0) {
         Serial.println(buildLogInfo());
     } else if (strncmp(line, "caps", 4) == 0) {
@@ -350,6 +495,9 @@ static void handleConsole(char* line) {
         if (!sdOk || !fieldLog.isOpen()) {
             Serial.println("ERRO: SD indisponivel");
         } else {
+            // Operacao longa: alimenta o watchdog durante a exportacao
+            // (so em pontos de avanco real).
+            hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
             bool integrity = false;
             bool ok = fieldLog.exportJsonl("HEFLOG.JSONL", "HEFLOG.HASH", &integrity);
             Serial.printf("export: %s | integridade: %s | registros: %u\n",
@@ -366,12 +514,15 @@ static void handleConsole(char* line) {
         if (SD.exists("HEFLOG.BIN")) SD.remove("HEFLOG.BIN");
         if (SD.exists("HEFLOG.JSONL")) SD.remove("HEFLOG.JSONL");
         if (SD.exists("HEFLOG.HASH")) SD.remove("HEFLOG.HASH");
+        // `begin()` rele a cadeia do arquivo recem-criado: pode ser
+        // uma operacao longa num SD lento.
+        hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
         fieldLog.begin(nodeId, "HEFLOG.BIN");
         Serial.println("OK: log apagado e recriado");
     } else if (strncmp(line, "reboot", 6) == 0) {
-        Serial.println("Reiniciando...");
-        delay(100);
-        ESP.restart();
+        // Reinicio CONTROLADO: a intencao e' gravada antes de sair, para
+        // que o proximo boot nao pareca um travamento inexplicado.
+        hefRestart(HEF_RESET_INTENT_USER, HEF_RST_SW);
     } else {
         Serial.println("Comando desconhecido. Use 'help'.");
     }
@@ -385,14 +536,38 @@ void setup() {
     dbg.begin(115200);
     dbg.log("Node3 v5.1.0: inicializando");
 
+    // --- Causa do reinicio (v5.1.0, item 1.4) ---
+    uint8_t reason = setupResetTracking();
+
+    // --- Watchdog de tarefa ---
+    // A caixa preta escreve no SD: um travamento no meio de uma
+    // gravacao deixa a cadeia de hash truncada SEM AVISO. O watchdog
+    // garante que o travamento vire um reinicio com causa visivel.
+    HefWatchdogState wdt = hefWatchdogInit();
+    if (wdt.active) {
+        Serial.printf("watchdog: ativo (timeout %u s%s)\n",
+                      (unsigned)wdt.timeoutS,
+                      wdt.preInitialized ? ", timeout pre-existente" : "");
+    } else {
+        Serial.println("watchdog: INATIVO (falha na inicializacao)");
+    }
+
     ledInit();
     buzzerInit();
     setupIdentity();
+
+    // O progresso das operacoes longas no SD alimenta o watchdog.
+    fieldLog.setProgressCallback(onLogProgress, nullptr);
 
     // Link com o Node2 em UART1 (UART0 = console).
     node2Serial.begin(115200, SERIAL_8N1, N3_UART_RX, N3_UART_TX);
 
     if (mountSd()) {
+        // A releitura da cadeia de hash pode levar MINUTOS num log
+        // grande (num SD lento). O watchdog e' alimentado durante a
+        // operacao, mas SO em pontos de avanco real: um travamento do
+        // SD continua sendo detectado.
+        hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
         if (fieldLog.begin(nodeId, "HEFLOG.BIN")) {
             dbg.log("SD montado; log aberto");
         } else {
@@ -410,6 +585,17 @@ void setup() {
     Serial.println(" HEFESTOS SIGINT v5.1.0 - NODE 3 (CAIXA PRETA)");
     Serial.println("=================================================");
     Serial.printf("node_id: %u\n", nodeId);
+    Serial.printf("reinicio: %s | boots=%u brownouts=%u wdt=%u sw=%u panic=%u\n",
+                  hefResetReasonName(reason),
+                  (unsigned)resetTracker.counters().boots,
+                  (unsigned)resetTracker.counters().brownouts,
+                  (unsigned)resetTracker.counters().wdtResets,
+                  (unsigned)resetTracker.counters().swResets,
+                  (unsigned)resetTracker.counters().panics);
+    if (bootIntentKind != HEF_RESET_INTENT_NONE) {
+        Serial.printf("motivo do reinicio anterior: %s\n",
+                      hefResetIntentName(bootIntentKind));
+    }
     Serial.printf("SD: %s | log: %s | registros: %u\n",
                   sdOk ? "ok" : "ausente",
                   fieldLog.isOpen() ? "aberto" : "fechado",
@@ -442,10 +628,22 @@ void loop() {
     if (!sdOk && (now - lastSdRetryMs) > 30000UL) {
         lastSdRetryMs = now;
         if (mountSd()) {
+            // Releitura da cadeia: operacao longa possivel.
+            hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
             fieldLog.begin(nodeId, "HEFLOG.BIN");
             digitalWrite(N3_LED_RED, LOW);
             dbg.log("SD recuperado");
         }
+    }
+
+    // --- Flush dos contadores de reinicio ---
+    // Os contadores que a guarda de desgaste deixou em RAM sao gravados
+    // aqui. Sem isso, um dispositivo que reiniciou 9 vezes por brownout
+    // (sem completar a janela de 10 boots) perderia a contagem.
+    static uint32_t lastResetFlush = 0;
+    if (now - lastResetFlush >= HEF_RESET_FLUSH_MS) {
+        lastResetFlush = now;
+        if (resetTracker.shouldPersistNow()) persistResetState();
     }
 
     // LED verde: pisca lento enquanto o link estiver vivo

@@ -33,6 +33,21 @@ struct FieldRecord {
     uint8_t  data[192];
 };
 
+// ---------------------------------------------------------------------
+// Callback de progresso de operacoes longas
+// ---------------------------------------------------------------------
+// A releitura da cadeia (no boot) e a exportacao JSONL podem processar
+// dezenas de milhares de registros. Num SD lento (ou num cartao em uso
+// intenso), isso pode levar MINUTOS — tempo suficiente para o
+// watchdog de 30 s derrubar o dispositivo.
+//
+// O callback e' chamado a cada registro processado, ou seja, apenas
+// quando a operacao REALMENTE avancou. Isso e' o que permite
+// alimentar o watchdog sem mascarar um travamento: um SD que nunca
+// responde para de chamar o callback, e o watchdog expira
+// normalmente.
+typedef void (*FieldLogProgressCb)(void* ctx, uint32_t records);
+
 class FieldLog {
 private:
     bool     open_;
@@ -42,6 +57,8 @@ private:
     uint32_t records_;
     uint16_t nodeId_;
     char     path_[32];
+    FieldLogProgressCb progressCb_;
+    void*         progressCtx_;
 
     static void sha256(const uint8_t* data, size_t len, uint8_t* out) {
         const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -76,9 +93,27 @@ private:
     }
 
 public:
-    FieldLog() : open_(false), seq_(0), utc_(0), records_(0), nodeId_(0) {
+    FieldLog() : open_(false), seq_(0), utc_(0), records_(0), nodeId_(0),
+                  progressCb_(nullptr), progressCtx_(nullptr) {
         memset(chain_, 0, sizeof(chain_));
         strncpy(path_, "HEFLOG.BIN", sizeof(path_) - 1);
+    }
+
+    // Registra o callback de progresso das operacoes longas (releitura
+    // da cadeia no boot e exportacao JSONL). Passar `nullptr` desliga.
+    //
+    // O callback e' chamado a cada registro processado — isto e', em
+    // pontos onde a operacao REALMENTE avancou. O watchdog so pode ser
+    // alimentado nesses pontos: alimentar dentro de uma operacao que
+    // TRAVOU (um SD que nunca responde) mascararia o travamento, e o
+    // dispositivo ficaria "vivo" mas inutil.
+    void setProgressCallback(FieldLogProgressCb cb, void* ctx) {
+        progressCb_  = cb;
+        progressCtx_ = ctx;
+    }
+
+    void reportProgress(uint32_t records) {
+        if (progressCb_) progressCb_(progressCtx_, records);
     }
 
     bool begin(uint16_t nodeId, const char* filePath = "HEFLOG.BIN") {
@@ -124,6 +159,10 @@ public:
                 seq_ = recSeq;
                 records_++;
                 memcpy(chain_, h, HEF_HASH_LEN);
+                // Progresso: a releitura da cadeia pode levar minutos
+                // num log grande. O callback so e' chamado em pontos
+                // onde a operacao avancou de verdade.
+                reportProgress(records_);
             }
             f.close();
         }
@@ -242,6 +281,10 @@ public:
 
             memcpy(prev, body + len, HEF_HASH_LEN);
             count++;
+            // Progresso: a exportacao pode levar minutos num log
+            // grande. O callback e' chamado a cada registro gravado
+            // (ponto de avanco real).
+            reportProgress(count);
         }
 
         out.close();

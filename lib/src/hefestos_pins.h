@@ -246,6 +246,49 @@
 #define HEF_PEER_STATE_FLUSH_MS 60000UL
 
 // ============================================================
+// CAUSA DE REINICIO / WATCHDOG (v5.1.0, item 1.4)
+// ============================================================
+// Namespace NVS proprio para os contadores de reinicio. NAO e' o vault
+// cifrado: contadores de operacao nao sao segredo, e o vault e'
+// reescrito INTEIRO a cada gravacao — caro demais para um contador.
+#define HEF_NVS_NAMESPACE_RESET "hefrst"
+#define HEF_NVS_KEY_RESET      "counters"
+
+// Chave da intencao do reinicio (gravada antes de `ESP.restart()`).
+// E' consumida no boot seguinte e removida: uma intencao nao
+// consumida seria reexibida em todos os boots seguintes, dizendo
+// "reinicio solicitado pelo operador" em reinicios que foram
+// travamentos.
+#define HEF_NVS_KEY_RESET_INTENT "intent"
+
+// Quantos boots podem acontecer sem gravar o estado na NVS.
+//
+// Cada gravacao na NVS consome vida util da particao. Numa operacao
+// normal isso e' irrelevante. Mas num LACO DE BROWNOUT — a
+// alimentacao oscila e o dispositivo reinicia 50 vezes por hora — a
+// NVS sufferia 438 mil escritas por ano.
+//
+// A gravacao imediata so acontece quando a CAUSA MUDOU (um brownout
+// depois de um boot normal e' evento novo e relevante) ou a cada
+// `HEF_RESET_PERSIST_EVERY_BOOTS` boots. O resto fica em RAM e e'
+// gravado no flush periodico.
+#define HEF_RESET_PERSIST_EVERY_BOOTS 10UL
+
+// Flush periodico do estado de reinicio (ms). Garante que os
+// contadores acumulados em RAM sejam persistidos mesmo sem mudanca de
+// causa.
+#define HEF_RESET_FLUSH_MS 300000UL
+
+// Timeout do watchdog de tarefa (segundos). O plano pede 30 s: um
+// travamento do loop principal tem de derrubar o dispositivo em MENOS
+// de 30 s, com a causa visivel.
+#define HEF_WDT_TIMEOUT_S 30
+
+// Quantas alimentacoes do WDT por janela de timeout, nas operacoes
+// longas (SD, exportacao de log, sweep).
+#define HEF_WDT_FEED_DIVISOR 3
+
+// ============================================================
 // LOG FORENSE (Node3)
 // ============================================================
 #define HEF_LOG_MAGIC       0x484C4735   // "HLG5"
