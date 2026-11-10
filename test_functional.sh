@@ -32,7 +32,7 @@ echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/9] Invariantes de pinagem"
+echo "[1/10] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -70,7 +70,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/9] Layout do protocolo LoRa"
+echo "[2/10] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -110,7 +110,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/9] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/10] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -141,7 +141,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/9] Ausencia de legado inseguro"
+echo "[4/10] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -156,7 +156,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/9] Anti-replay estrito e TOTP ativo"
+echo "[5/10] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -176,7 +176,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/9] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/10] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -191,7 +191,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/9] Estado anti-replay persistido (replay pos-reboot)"
+echo "[7/10] Estado anti-replay persistido (replay pos-reboot)"
 REPLAY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -200,7 +200,7 @@ if command -v g++ >/dev/null 2>&1; then
         if /tmp/hef_replay_test > /tmp/hef_replay_run.log 2>&1; then
             grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_replay_run.log | head -8
             echo "  ... (ver /tmp/hef_replay_run.log para o restante)"
-            echo "  [PASS] estado anti-replay persistido (75 verificacoes)"
+            echo "  [PASS] estado anti-replay persistido (85 verificacoes)"
         else
             grep -E "\[FAIL\]" /tmp/hef_replay_run.log || true
             echo "  [FAIL] estado anti-replay persistido"; REPLAY=1
@@ -230,7 +230,7 @@ fi
 [ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[8/9] Orcamento de RF (tempo no ar e duty cycle)"
+echo "[8/10] Orcamento de RF (tempo no ar e duty cycle)"
 BUDGET=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -239,7 +239,7 @@ if command -v g++ >/dev/null 2>&1; then
         if /tmp/hef_budget_test > /tmp/hef_budget_run.log 2>&1; then
             grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_budget_run.log | head -6
             echo "  ... (ver /tmp/hef_budget_run.log para o restante)"
-            echo "  [PASS] orcamento de RF (51 verificacoes)"
+            echo "  [PASS] orcamento de RF (57 verificacoes)"
         else
             grep -E "\[FAIL\]" /tmp/hef_budget_run.log || true
             echo "  [FAIL] orcamento de RF"; BUDGET=1
@@ -282,7 +282,82 @@ fi
 [ $BUDGET -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[9/9] Build dos tres nos"
+echo "[9/10] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
+POLICY=0
+if command -v g++ >/dev/null 2>&1; then
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/tx_policy.cpp" -o /tmp/hef_txpolicy_test 2>/tmp/hef_txpolicy_cc.log; then
+        if /tmp/hef_txpolicy_test > /tmp/hef_txpolicy_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_txpolicy_run.log | head -6
+            echo "  ... (ver /tmp/hef_txpolicy_run.log para o restante)"
+            echo "  [PASS] politica de TX adaptativa (77 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_txpolicy_run.log || true
+            echo "  [FAIL] politica de TX adaptativa"; POLICY=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de politica de TX falhou:"
+        head -20 /tmp/hef_txpolicy_cc.log
+        POLICY=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (teste de politica nao executado)"
+fi
+# O firmware tem de usar a politica adaptativa (nao a TX periodica).
+if grep -q "txPolicy.evaluate" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino"; then
+    echo "  [PASS] Node1 usa a politica de TX adaptativa"
+else
+    echo "  [FAIL] Node1 nao usa a politica de TX adaptativa"; POLICY=1
+fi
+# O piso de intervalo e' derivado do duty cycle e nao de um intervalo fixo.
+if grep -q "effectiveIntervalMs()" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino" &&
+   grep -q "txPolicy.configure" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino"; then
+    echo "  [PASS] piso de intervalo derivado do duty cycle do perfil"
+else
+    echo "  [FAIL] piso de intervalo nao deriva do duty cycle"; POLICY=1
+fi
+# Retentativa limitada a 1 por evento (a v5.0.0 fazia ate 3 transmissoes).
+if grep -q "#define LORA_TX_MAX_RETRIES      1" "$ROOT/lib/src/hefestos_pins.h" &&
+   grep -q "retry < LORA_TX_MAX_RETRIES" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino"; then
+    echo "  [PASS] no maximo 1 retry por evento"
+else
+    echo "  [FAIL] retry nao limitado a 1 por evento"; POLICY=1
+fi
+# O beacon FM precisa de duty cycle PROPRIO e corte por bateria.
+if grep -q "beaconPolicy.evaluate" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino" &&
+   grep -q "FM_BEACON_MIN_BATTERY_PCT" "$ROOT/lib/src/hefestos_pins.h"; then
+    echo "  [PASS] beacon FM com duty cycle proprio e corte por bateria"
+else
+    echo "  [FAIL] beacon FM sem duty cycle proprio ou corte por bateria"; POLICY=1
+fi
+# O ACK curto (2 B) precisa estar coerente entre os dois nos.
+if grep -q "#define HEF_ACK_PAYLOAD_LEN   2" "$ROOT/lib/src/link_protocol.h" &&
+   grep -q "HEF_ACK_FLAG_DUPLICATE" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
+    echo "  [PASS] ACK curto (2 B) com flags, coerente entre os nos"
+else
+    echo "  [FAIL] ACK curto (2 B) nao implementado ou incoerente"; POLICY=1
+fi
+# O contador do emissor NAO pode ser reescrito: um reuso mataria o
+# enlace (a base rejeitaria o frame legitimo como REPLAY).
+if ! grep -qE "void[[:space:]]+setCounter" "$ROOT/lib/src/secure_protocol.h" &&
+   ! grep -q "txSeq.setCounter(" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino"; then
+    echo "  [PASS] contador do emissor e' estritamente monotonico (sem setter)"
+else
+    echo "  [FAIL] contador do emissor pode ser reescrito (risco de replay aceito)"; POLICY=1
+fi
+# Uma transmissao negada NAO pode perder o movimento: o evento fica
+# pendente e o piso e' reprogramado (evita flood de log).
+if grep -q "txPolicy.onTxFailed" "$ROOT/src/Node1_Transmissor_Alvo/Node1_Transmissor_Alvo.ino" &&
+   grep -q "void onTxFailed" "$ROOT/lib/src/tx_policy.h"; then
+    echo "  [PASS] movimento pendente sobrevive a uma TX negada"
+else
+    echo "  [FAIL] movimento pendente e' perdido quando a TX e' negada"; POLICY=1
+fi
+[ $POLICY -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[10/10] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

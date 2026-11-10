@@ -220,8 +220,8 @@ def main() -> int:
                     help="perfil regional a usar (define SF/BW/CR e o limite)")
     ap.add_argument("--payload", type=int, default=54,
                     help="bytes do frame de telemetria (padrao 54)")
-    ap.add_argument("--ack", type=int, default=35,
-                    help="bytes do ACK (padrao 35)")
+    ap.add_argument("--ack", type=int, default=33,
+                    help="bytes do ACK (padrao 33: cabecalho 15 + payload 2 + tag 16)")
     ap.add_argument("--sf", type=int, help="spreading factor (sobrescreve o perfil)")
     ap.add_argument("--bw", type=int, default=125, help="bandwidth em kHz")
     ap.add_argument("--cr", type=int, default=4, help="numerador do CR (4/5/6/7)")

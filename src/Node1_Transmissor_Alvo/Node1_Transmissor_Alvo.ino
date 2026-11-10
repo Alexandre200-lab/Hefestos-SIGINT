@@ -33,6 +33,7 @@
 #include <secure_protocol.h>
 #include <link_budget.h>
 #include <band_plan.h>
+#include <tx_policy.h>
 
 // ---------------------------------------------------------------------
 // Estado global
@@ -59,6 +60,11 @@ static uint32_t retryCount     = 0;
 static uint32_t gpsFixCount    = 0;
 static bool     gpsValid       = false;
 static uint32_t txDenied       = 0;   // transmissoes negadas pelo duty budget
+static uint32_t txEvents       = 0;   // eventos de movimento
+static uint32_t txHeartbeats   = 0;   // heartbeats (alvo parado)
+static uint32_t txSuppressed   = 0;   // eventos de movimento sem frame no ar
+static uint8_t  lastAckFlags   = 0;   // flags do ultimo ACK recebido
+static int16_t  lastAckRssi    = 0;   // RSSI reportado pela base no ACK
 
 // ---------------------------------------------------------------------
 // Orcamento de RF (v5.1.0)
@@ -73,6 +79,14 @@ static uint32_t txDenied       = 0;   // transmissoes negadas pelo duty budget
 // automaticamente ate caber no orcamento.
 static const HefBandProfile* band = HefBandPlan::active();
 static HefDutyGuard dutyGuard;
+
+// Politica de TX adaptativa (v5.1.0): por EVENTO (movimento) ou por
+// HEARTBEAT, sempre respeitando o piso de intervalo e o duty cycle.
+static HefTxPolicy txPolicy;
+
+// Politica do beacon FM: duty cycle PROPRIO e corte automatico por
+// bateria. O beacon e' um transmissor independente do link LoRa.
+static HefBeaconPolicy beaconPolicy;
 
 static HefLinkParams linkParams() {
     HefLinkParams p;
@@ -101,14 +115,11 @@ static uint32_t effectiveIntervalMs() {
 
 // Jitter de +/- LORA_TX_JITTER_PCT: dessincroniza a frota (varias
 // unidades acordando juntas colidiria no mesmo instante).
-static uint32_t jitteredIntervalMs(uint32_t base) {
-    int32_t span = (int32_t)((uint32_t)base * LORA_TX_JITTER_PCT / 100UL);
-    if (span <= 0) return base;
-    uint32_t r = esp_random() % (uint32_t)(2 * span + 1);
-    int32_t v = (int32_t)base + ((int32_t)r - span);
-    if (v < 1000) v = 1000;
-    return (uint32_t)v;
-}
+//
+// Apolitica de TX sorteia o jitter internamente (HefTxPolicy), com a
+// fonte de aleatoriedade injetada. Aqui esta' apenas o adaptador para
+// o RNG do ESP32.
+static uint32_t espRand32() { return (uint32_t)esp_random(); }
 
 // Beacon FM
 static bool     fmBeaconEnabled = false;
@@ -140,13 +151,18 @@ static void processAck(const uint8_t* payload, size_t length) {
     // O ACK e' autenticado: so conta se a tag GCM (com a chave do no)
     // for valida. Sem isso, um atacante poderia suprimir retransmissoes.
     if (!keyReady) return;
-    uint8_t plain[8];
+    uint8_t plain[HEF_ACK_PAYLOAD_LEN];
     AeadGcm ackGcm;
     ackGcm.setKey(linkKey, sizeof(linkKey));
     int pt = ackGcm.decrypt(payload + HEF_HEADER_LEN,
                             length - HEF_HEADER_LEN, plain, sizeof(plain),
                             (uint32_t)nodeId, ackCtr, payload, HEF_HEADER_LEN);
-    if (pt < 0) return;
+    if (pt < (int)HEF_ACK_PAYLOAD_LEN) return;
+
+    // Payload curto (v5.1.0): flags + RSSI quantizado (-130..-3 dBm).
+    lastAckFlags = plain[0];
+    int32_t rssi = (int32_t)plain[1] / 2 - 130;
+    lastAckRssi  = (int16_t)rssi;
 
     gAckCounter = ackCtr;
     gGotAck = true;
@@ -229,7 +245,30 @@ static uint32_t utcFromCivil(int year, int month, int day,
 // ---------------------------------------------------------------
 // Construcao e envio do frame de tracking
 // ---------------------------------------------------------------
-static bool buildAndSendTrack(uint8_t retry) {
+// `counter` e' ALOCADO pelo chamador (uma vez por evento) e REUTILIZADO
+// nas retentativas: a retransmissao leva o MESMO (epoch, counter), que
+// o receptor reconhece como duplicata. Isso e' seguro e e' o que
+// permite o anti-replay estrito do lado da base.
+//
+// Retentativas: LORA_TX_MAX_RETRIES (1) -> no maximo 2 frames por
+// evento. A v5.0.0 fazia ate 3.
+//
+// `gTxFrameSent` e' zerado pelo chamador antes da chamada e posto em
+// `true` no instante em que um frame realmente SAI no ar. E' o que
+// permite distinguir "a transmissao foi negada" de "o frame saiu, mas
+// o ACK nao chegou" — distincao essencial para contar corretamente
+// os eventos de movimento perdidos (ver `txSuppressed`).
+//
+// `gTxLat`/`gTxLon`/`gTxFixValid` guardam a posicao EXATA que foi
+// reportada no frame que saiu. A politica e' atualizada uma unica vez
+// por evento, pelo chamador, com esses valores.
+static bool     gTxFrameSent = false;
+static double   gTxLat       = 0.0;
+static double   gTxLon       = 0.0;
+static bool     gTxFixValid  = false;
+static uint32_t gTxSentMs    = 0;
+
+static bool buildAndSendTrack(uint8_t retry, uint32_t counter) {
     if (!keyReady) return false;
 
     // --- Orcamento de duty cycle ---
@@ -278,7 +317,6 @@ static bool buildAndSendTrack(uint8_t retry) {
                   batt,
                   statusFlags);
 
-    uint32_t counter = txSeq.next();
     uint8_t hdr[HEF_HEADER_LEN];
     if (!linkBuildHeader(hdr, HEF_MSG_TRACK, statusFlags, keyId,
                          nodeId, txSeq.epoch(), counter, HEF_TRACK_PAYLOAD_LEN)) {
@@ -293,7 +331,18 @@ static bool buildAndSendTrack(uint8_t retry) {
                             hdr, HEF_HEADER_LEN);
     if (ctLen < 0) {
         dbg.logError("AEAD encrypt falhou");
-        txSeq.setCounter(counter - 1);
+        // NAO desfaz a alocacao do contador.
+        //
+        // O contador e' alocado pelo CHAMADOR e reutilizado nas
+        // retentativas. Se uma retentativa falhasse na cifragem e
+        // desfizesse a alocacao, o proximo evento reutilizaria um
+        // contador que a base JA TINHA ACEITO -> a base rejeitaria um
+        // frame legitimo como REPLAY, matando o enlace.
+        //
+        // A sequencia de contadores deve ser estritamente monotonica.
+        // Uma alocacao desperdicada apenas abre uma LACUNA, que o
+        // receptor trata normalmente (janela de lacunas + reancoragem
+        // por salto acima de HEF_COUNTER_MAX_GAP).
         return false;
     }
     uint16_t frameLen = (uint16_t)(HEF_HEADER_LEN + ctLen);
@@ -319,6 +368,13 @@ static bool buildAndSendTrack(uint8_t retry) {
 
     // O airtime e' registrado no orcamento assim que o frame parte.
     dutyGuard.record((uint32_t)millis(), airtime);
+    gTxFrameSent = true;
+    // A posicao EXATA reportada neste frame (pode diferir da observada
+    // no loop, se o GNSS atualizou entre a avaliacao e o envio).
+    gTxLat      = gpsValid ? gps.location.lat() : 0.0;
+    gTxLon      = gpsValid ? gps.location.lng() : 0.0;
+    gTxFixValid = gpsValid;
+    gTxSentMs   = (uint32_t)millis();
 
     // Retoma a recepcao para pegar o ACK.
     LoRa.receive();
@@ -326,6 +382,12 @@ static bool buildAndSendTrack(uint8_t retry) {
     txCount++;
     lastTxMs = millis();
     gGotAck = false;
+
+    // NOTA: a politica de TX NAO e' atualizada aqui. Ela e' atualizada
+    // uma unica vez por EVENTO, pelo chamador, depois que a cadeia de
+    // retentativas termina. Atualizar aqui re-sortearia o jitter a cada
+    // tentativa e marcaria o movimento como reportado mesmo que a
+    // retentativa fosse a unica a sair.
 
     // Espera ACK (se o Node2 estiver no alcance). Janela curta e limitada:
     // o Node1 e' um beacon, nao um servidor.
@@ -341,14 +403,14 @@ static bool buildAndSendTrack(uint8_t retry) {
     }
     if (gGotAck) {
         ackCount++;
-    } else if (retry < 2) {
+    } else if (retry < LORA_TX_MAX_RETRIES) {
         retryCount++;
         uint32_t backoff = (1UL << retry) * 200UL + (esp_random() % 150UL);
         delay(backoff);
-        // Reutiliza o MESMO counter (retransmissao e' segura: o
-        // receptor detecta duplicidade pelo contador).
-        txSeq.setCounter(counter - 1);
-        return buildAndSendTrack(retry + 1);
+        // Reutiliza o MESMO counter: a retransmissao e' segura porque o
+        // receptor detecta a duplicidade pelo contador e reenvia o ACK
+        // sem reprocessar o track.
+        return buildAndSendTrack(retry + 1, counter);
     }
     return true;
 }
@@ -356,10 +418,43 @@ static bool buildAndSendTrack(uint8_t retry) {
 // ---------------------------------------------------------------
 // Beacon FM (Si4713)
 // ---------------------------------------------------------------
+// Propriedades do Si4713 (datasheet). A biblioteca Adafruit expoe
+// `setProperty()` (usado com sucesso no powerUp), mas nao define
+// estas constantes.
+#define SI4713_PROP_TX_ENABLE 0x3E06   // 0 = TX desligado, 1 = ligado
+
+// Liga/desliga a radiacao do beacon. O duty cycle do beacon e' um
+// orcamento de ENERGIA (e de espectro): o Si4713 consome dezenas de mA
+// enquanto transmite.
+static void fmSetRadiating(bool on) {
+    fmTx.setProperty(SI4713_PROP_TX_ENABLE, on ? 1 : 0);
+}
+
 static void fmTune() {
     if (!fmBeaconEnabled) return;
     fmTx.setTXpower(fmPower);
     fmTx.tuneFM((uint16_t)(fmFreqKHz / 10));   // API em unidades de 10 kHz
+}
+
+// Aplica a politica do beacon: duty cycle proprio + corte por bateria.
+// Retorna true se o estado de radiacao mudou.
+static bool fmApplyPolicy(uint8_t batteryPct) {
+    HefBeaconAction action = beaconPolicy.evaluate((uint32_t)millis(),
+                                                    fmBeaconEnabled, batteryPct);
+    switch (action) {
+        case HEF_BEACON_ON:
+            fmSetRadiating(true);
+            dbg.logf("Beacon FM ligado (fase ON, %u ms)", FM_BEACON_ON_MS);
+            return true;
+        case HEF_BEACON_OFF:
+            fmSetRadiating(false);
+            if (beaconPolicy.isPoweredOff()) {
+                dbg.logWarning("Beacon FM desligado: bateria abaixo do limite");
+            }
+            return true;
+        default:
+            return false;
+    }
 }
 
 // ---------------------------------------------------------------
@@ -370,11 +465,13 @@ static void printHelp() {
     Serial.println("=== HEFESTOS SIGINT v5 - Node1 (Emissor) ===");
     Serial.println("help              esta ajuda");
     Serial.println("status            estado do link");
+    Serial.println("policy            politica de TX adaptativa e beacon FM");
     Serial.println("budget            orcamento de RF (duty cycle, airtime, perfil)");
     Serial.println("id                node_id deste no");
     Serial.println("psk <64 hex>     define o PSK de deploy (32 bytes hex)");
     Serial.println("psk show          mostra se o PSK esta configurado");
     Serial.println("fm on|off        liga/desliga o beacon FM");
+    Serial.println("fm rearm         rearma o corte por bateria do beacon");
     Serial.println("fm freq <kHz>    sintonia do beacon FM");
     Serial.println("fm power <88-115> potencia do beacon FM (dBuV)");
 }
@@ -387,9 +484,28 @@ static void handleConsole(char* line) {
         Serial.printf("epoch: %u | counter: %u\n", txSeq.epoch(), txSeq.counter());
         Serial.printf("TX: %u | ACK: %u | retry: %u | negadas: %u\n",
                       txCount, ackCount, retryCount, txDenied);
+        Serial.printf("eventos: %u | heartbeats: %u | sem frame no ar: %u\n",
+                      txEvents, txHeartbeats, txSuppressed);
         Serial.printf("GPS fix: %u | sats: %u | hdop: %.1f\n",
                       gpsFixCount, (int)(gps.satellites.isValid() ? gps.satellites.value() : 0),
                       gps.hdop.hdop());
+        Serial.printf("ACK: flags=0x%02X | rssi base=%d dBm\n",
+                      lastAckFlags, (int)lastAckRssi);
+    } else if (strncmp(line, "policy", 6) == 0) {
+        Serial.printf("TX: movimento > %.0f m OU heartbeat %u s | piso %u s +/- %u%%\n",
+                      (double)txPolicy.minMoveM(), txPolicy.heartbeatMs() / 1000,
+                      txPolicy.minIntervalMs() / 1000, txPolicy.jitterPct());
+        Serial.printf("   ultimo: %u ms | proximo permitido: %u ms | distancia: %.1f m\n",
+                      (unsigned)txPolicy.lastTxMs(), (unsigned)txPolicy.nextAllowedMs(),
+                      (double)txPolicy.lastDistanceM());
+        Serial.printf("beacon FM: %s | duty %.1f%% (%u s on / %u s off) | min bateria %u%%\n",
+                      fmBeaconEnabled ? "ligado" : "desligado",
+                      (double)beaconPolicy.dutyPercent(),
+                      beaconPolicy.onMs() / 1000, beaconPolicy.offMs() / 1000,
+                      beaconPolicy.minBatteryPct());
+        if (beaconPolicy.isPoweredOff()) {
+            Serial.println("   beacon: CORTADO por bateria (use 'fm rearm')");
+        }
     } else if (strncmp(line, "budget", 6) == 0) {
         uint32_t track = trackAirtimeMs();
         uint32_t ack   = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, linkParams());
@@ -430,11 +546,20 @@ static void handleConsole(char* line) {
         memset(psk, 0, sizeof(psk));
     } else if (strncmp(line, "fm on", 5) == 0) {
         fmBeaconEnabled = true;
-        fmTune();
-        Serial.println("OK: beacon FM ligado");
+        // Rearma o corte por bateria: o operador pode ter recarregado a
+        // unidade. Se a bateria seguir baixa, o corte sera reaplicado
+        // na proxima avaliacao.
+        beaconPolicy.rearm();
+        fmApplyPolicy(readBatteryPct());
+        Serial.println("OK: beacon FM ligado (duty cycle proprio aplica-se)");
     } else if (strncmp(line, "fm off", 6) == 0) {
         fmBeaconEnabled = false;
+        fmApplyPolicy(readBatteryPct());
         Serial.println("OK: beacon FM desligado");
+    } else if (strncmp(line, "fm rearm", 8) == 0) {
+        beaconPolicy.rearm();
+        fmApplyPolicy(readBatteryPct());
+        Serial.println("OK: corte por bateria rearmado");
     } else if (strncmp(line, "fm freq", 7) == 0) {
         long f = atol(line + 8);
         if (f >= 87500 && f <= 108000) {
@@ -498,6 +623,20 @@ void setup() {
 
     loadSequence();
 
+    // Politica de TX adaptativa (v5.1.0):
+    //   - dispara por MOVIMENTO acima de LORA_MIN_MOVE_M;
+    //   - dispara por HEARTBEAT a cada LORA_HEARTBEAT_TX_MS;
+    //   - piso entre transmissoes = intervalo efetivo do duty cycle,
+    //     com jitter de +/- LORA_TX_JITTER_PCT (anti-sincronismo).
+    txPolicy.configure(LORA_MIN_MOVE_M, LORA_HEARTBEAT_TX_MS,
+                       effectiveIntervalMs());
+    txPolicy.setJitterPct(LORA_TX_JITTER_PCT);
+    txPolicy.setRandomSource(espRand32);
+
+    // Politica do beacon FM: duty cycle PROPRIO e corte por bateria.
+    beaconPolicy.configure(FM_BEACON_ON_MS, FM_BEACON_OFF_MS,
+                           FM_BEACON_MIN_BATTERY_PCT);
+
     Serial.println();
     Serial.println("=================================================");
     Serial.println(" HEFESTOS SIGINT v5.1.0 - NODE 1 (EMISSOR)");
@@ -544,18 +683,67 @@ void loop() {
         gpsFixCount++;
     }
 
-    // Transmissao periodica (o intervalo efetivo ja incorpora o duty
-    // cycle exigido pelo perfil regional; o jitter dessincroniza a frota).
     uint32_t now = millis();
-    static uint32_t txIntervalMs = 0;
-    if (txIntervalMs == 0) txIntervalMs = effectiveIntervalMs();
-    if (now - lastTxMs >= txIntervalMs) {
-        lastTxMs = now;
-        txIntervalMs = jitteredIntervalMs(effectiveIntervalMs());
+
+    // --- Beacon FM: duty cycle PROPRIO + corte automatico por bateria ---
+    // O beacon e' um transmissor independente do link LoRa: tem o proprio
+    // orcamento de energia e de espectro.
+    static uint32_t lastBeaconCheck = 0;
+    if (now - lastBeaconCheck >= 1000UL) {
+        lastBeaconCheck = now;
+        fmApplyPolicy(readBatteryPct());
+    }
+
+    // --- Transmissao ADAPTATIVA (v5.1.0) ---
+    // Transmite por EVENTO: a posicao alterou mais que LORA_MIN_MOVE_M
+    // ou passou LORA_HEARTBEAT_TX_MS. O piso de intervalo (derivado do
+    // duty cycle do perfil) e' respeitado pela propria politica.
+    uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    bool fixNow = gps.location.isValid() && sats >= GPS_MIN_SATS &&
+                  gps.location.age() < GPS_FIX_MAX_AGE_MS;
+    double latNow = fixNow ? gps.location.lat() : 0.0;
+    double lonNow = fixNow ? gps.location.lng() : 0.0;
+
+    HefTxTrigger trig = txPolicy.evaluate(now, fixNow, latNow, lonNow);
+    if (trig == HEF_TX_TRIGGER_MOVE) {
+        txEvents++;
+        txPolicy.noteTrigger(trig);
+        dbg.logf("Evento: alvo se moveu %.1f m", txPolicy.lastDistanceM());
+    } else if (trig == HEF_TX_TRIGGER_HEARTBEAT) {
+        txHeartbeats++;
+        txPolicy.noteTrigger(trig);
+    }
+
+    if (trig != HEF_TX_TRIGGER_NONE) {
         if (keyReady) {
-            buildAndSendTrack(0);
+            // O contador e' alocado UMA VEZ por evento e reutilizado nas
+            // retentativas.
+            uint32_t counter = txSeq.next();
+            gTxFrameSent = false;
+            buildAndSendTrack(0, counter);
+
+            if (gTxFrameSent) {
+                // A politica e' atualizada UMA VEZ por evento, com a
+                // posicao EXATA que foi reportada no frame que saiu e o
+                // instante real do envio (nao o de agora: a cadeia de
+                // retentativas pode ter demorado).
+                txPolicy.onTransmitted(gTxSentMs, gTxFixValid, gTxLat, gTxLon);
+            } else {
+                txSuppressed++;
+                // O movimento PENDENTE e' preservado pela politica: ele
+                // sera reportado na proxima oportunidade. O piso de
+                // intervalo e' reprogramado para que a proxima tentativa
+                // nao vire um flood de log.
+                txPolicy.onTxFailed((uint32_t)millis());
+                dbg.logWarning("Evento sem frame no ar: posicao nao reportada");
+            }
         } else {
-            dbg.logWarning("Transmissao suspensa: sem chave de link");
+            // Sem chave: avisa, mas nao a cada iteracao do loop.
+            static uint32_t lastNoKeyWarn = 0;
+            if (now - lastNoKeyWarn >= 5000UL) {
+                lastNoKeyWarn = now;
+                dbg.logWarning("Transmissao suspensa: sem chave de link");
+            }
         }
     }
 }

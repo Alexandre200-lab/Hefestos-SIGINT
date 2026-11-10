@@ -16,26 +16,38 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 
 ## 0. v5.1.0 — anti-replay sobrevivente a reinício + RF viável
 
-Os dois primeiros itens do plano de escala militar:
+Os três primeiros itens do plano de escala militar:
 
 1. **O anti-replay agora sobrevive a um reinício do receptor** (item 1.1) —
    um frame capturado por SDR não é mais aceito como frame novo depois que
    o receptor reinicia.
 2. **O link LoRa passa a ser fisicamente viável** (item 1.2) — a v5.0.0
-   operava com 225,7% de duty cycle, o que é impossível.
+   operava com 221,6% de duty cycle, o que é impossível.
+3. **A transmissão passa a ser adaptativa** (item 1.3) — por evento
+   (movimento) ou por heartbeat, em vez de periódica.
+
+> Os percentuais de duty cycle desta tabela mantêm o ACK atual (33 B) nos
+> dois lados, para isolar o efeito da mudança de SF e de intervalo. O
+> firmware v5.0.0 usava um ACK de 35 B: com ele, eram **225,7%** e
+> **6,50 Ah/dia**. Ver [§9.5.2](#952-configuração-adotada).
 
 | v5.0.0 | v5.1.0 |
 |---|---|
 | Estado anti-replay | só em RAM | **persistido no vault cifrado** (TLV `0x0A`) |
 | Frame capturado, replay após reinício | **aceito** | **rejeitado** (`REPLAY` / `STALE_EPOCH`) |
 | Queda longa de link | enlace morria (`FAR`) | reancora o high-water |
-| SF10 a 1 Hz → **225,7% de duty cycle** (inviável) | **SF8 a 1/30 s → 1,88%** |
+| SF10 a 1 Hz → **221,6% de duty cycle** (inviável) | **SF8 a 1/30 s → 1,85%** |
 | Nenhuma verificação de conformidade de RF | **perfis regionais + firmware impede violar o duty cycle** |
+| TX **periódica** (1 frame/30 s) | **adaptativa**: movimento > 10 m ou heartbeat 60 s |
+| Até 3 transmissões por evento | **no máximo 2** (1 + 1 retry) |
+| ACK de 35 B (payload redundante) | **33 B** (flags + RSSI de retorno) |
+| Beacon FM contínuo | **duty cycle próprio (10%) + corte automático < 20% de bateria** |
 | Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
-| Testes | 7 grupos | 9 grupos (+126 verificações no host) |
+| Testes | 7 grupos | 10 grupos (+213 verificações no host) |
 
-Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510) e
-[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
+Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510),
+[§9.5](#95-orçamento-de-rf-e-conformidade-regulatória) e
+[§9.6](#96-política-de-tx-adaptativa-node-1).
 
 ---
 
@@ -424,6 +436,7 @@ lib/                     biblioteca compartilhada (Arduino library)
     peer_state.h         estado anti-replay persistido por par
     link_budget.h        tempo no ar, duty cycle e guard de orçamento de RF
     band_plan.h          perfis de banda regionais de referência
+    tx_policy.h          política de TX adaptativa (evento/heartbeat) + beacon
     totp_auth.h          TOTP RFC 6238
     rate_limiter.h       token buckets por IP
     debug.h              logging sem vazamento de segredos
@@ -436,11 +449,12 @@ tests/
   serial_roundtrip.cpp  teste de round-trip do protocolo serial (host)
   anti_replay_persistence.cpp  estado anti-replay persistido (host)
   link_budget.cpp       tempo no ar, duty cycle e guard de RF (host)
+  tx_policy.cpp         política de TX adaptativa e beacon FM (host)
   stub/HardwareSerial.h stub Arduino mínimo para compilar no host
 tools/
   airtime.py            CLI de cálculo de RF (airtime/duty/energia) + --selftest
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + anti-replay + RF + build
+test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + build
 ```
 
 ---
@@ -525,8 +539,8 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 
 ### 9.1 Console serial
 
-**Node 1:** `help`, `status`, `budget`, `id`, `psk <hex>`, `psk show`,
-`fm on|off`, `fm freq <kHz>`, `fm power <0-255>`.
+**Node 1:** `help`, `status`, `policy`, `budget`, `id`, `psk <hex>`, `psk show`,
+`fm on|off|rearm`, `fm freq <kHz>`, `fm power <0-255>`.
 
 **Node 2:** `help`, `status`, `budget`, `id`, `psk`, `user`, `pass`, `totp`,
 `wifi`, `settime`, `time`, `enroll <node> <keyid>`, `peers`,
@@ -535,6 +549,9 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 > `budget` (Node 1 e Node 2) imprime o perfil regional, a faixa, o tempo no
 > ar, o intervalo efetivo e o duty cycle consumido na janela de 1 h — ver
 > [§9.5](#95-orçamento-de-rf-e-conformidade-regulatória).
+>
+> `policy` (Node 1) imprime a política de TX adaptativa e o estado do
+> beacon FM — ver [§9.6](#96-política-de-tx-adaptativa-node-1).
 
 **Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
 `time <unix>`, `format`, `reboot`.
@@ -585,6 +602,10 @@ ocupava **2256,9 ms de tempo no ar a cada 1000 ms** — um **duty cycle de
 tempo). O resultado prático era colisão permanente, fila no driver LoRa e
 **6,5 Ah/dia só de transmissão** — mais que a bateria de 6,6 Ah do nó.
 
+> Esses são os números do firmware v5.0.0 **como ele era** (ACK de 35 B,
+> payload de 4 B). A tabela de [§9.5.2](#952-configuração-adotada) mantém o
+> ACK atual nos dois lados, para isolar o efeito de SF e intervalo.
+
 > **Correção de uma estimativa do próprio plano de escala.** O plano
 >(original) calculava 4564 ms de tempo no ar para SF10/54 B e deduzia
 > 757% de duty cycle. Esse número estava **errado**: a tabela oficial de
@@ -603,26 +624,33 @@ tempo). O resultado prático era colisão permanente, fila no driver LoRa e
 |---|---|---|
 | Spreading factor | SF10 | **SF8** |
 | Intervalo de TX | 1 s (via `GPS_POLL_INTERVAL_MS`, constante enganosa) | **30 s** (`LORA_TX_INTERVAL_MIN_MS`) |
+| Política de TX | **periódica** (1 frame/30 s) | **adaptativa**: por movimento ou heartbeat (§9.6) |
 | Jitter | nenhum | **±10%** (`LORA_TX_JITTER_PCT`) |
+| Tamanho do ACK | 35 B (payload redundante de 4 B) | **33 B** (payload de 2 B: flags + RSSI) |
 | Tempo no ar (telemetria 54 B) | 1312,8 ms | **328,2 ms** |
-| Tempo no ar (ACK 35 B) | 944,1 ms | **236,0 ms** |
-| Ciclo completo | 2256,9 ms | **564,2 ms** |
-| **Duty cycle** | **225,7%** (inviável) | **1,88%** |
-| TX por dia (120 mA @ 20 dBm) | 6,5 Ah | **0,054 Ah** |
+| Tempo no ar (ACK 33 B) | 903,2 ms | **225,8 ms** |
+| Ciclo completo | 2215,9 ms | **554,0 ms** |
+| **Duty cycle** | **221,6%** (inviável) | **1,85%** |
+| TX por dia (120 mA @ 20 dBm) | 6,38 Ah | **0,053 Ah** |
 
 SF8 também entrega **≈3× mais alcance** que SF10 para a mesma potência
 (ganho de ~10,5 dB no enlace) — o que, no contexto de uma frota, vale mais
 do que a taxa bruta.
 
+> **Como ler a tabela.** A coluna "v5.0.0" mantém o **ACK atual de 33 B**
+> para isolar o efeito da mudança de SF e de intervalo. O firmware v5.0.0
+> usava um ACK de **35 B**: com ele, o duty cycle era **225,7%** e o consumo
+> **6,50 Ah/dia**. Os dois valores são inviáveis — a magnitude é que muda.
+
 > O firmware arredonda o airtime **para cima** (ms inteiros) ao aplicar o
-> orçamento: 329 + 237 = 566 ms, o que dá 1,887% — 0,006 p.p. acima do
-> valor exato de 1,881% da tabela. É uma folga deliberada a favor do
+> orçamento: 329 + 226 = 555 ms, o que dá 1,850% — 0,003 p.p. acima do
+> valor exato de 1,847% da tabela. É uma folga deliberada a favor do
 > operador.
 
-> O item 1.3 do plano (transmissão por evento) ainda não está implementado:
-> hoje o Node 1 transmite **periodicamente** a cada 30 s. O duty cycle
-> mostrado acima é o do regime periódico; com TX por evento o consumo cai
-> proporcionalmente ao número de eventos.
+> Com a TX adaptativa (§9.6), o duty cycle e o consumo acima passam a ser
+> o **pior caso**: um alvo parado transmite só o heartbeat (1 frame/60 s),
+> ou seja ~0,9% de duty cycle e 0,026 Ah/dia. O alvo em movimento
+> permanente fica no regime de 30 s.
 
 #### 9.5.3 Perfis regionais de referência
 
@@ -664,10 +692,12 @@ transmissão quando ela violaria o limite do perfil.
   transmissão** e consome espectro. Contador: `acksDenied`.
 - O **intervalo efetivo** entre ciclos é o maior entre: o configurado, o
   mínimo do perfil e o intervalo que o duty cycle exige. Com o perfil
-  `868-ETSI` (1%), o intervalo é automaticamente alongado para ~56,6 s
-  (o firmware arredonda o airtime para cima: 566 ms × 100 / 1%).
+  `868-ETSI` (1%), o intervalo é automaticamente alongado para ~55,5 s
+  (o firmware arredonda o airtime para cima: 555 ms × 100 / 1%).
 - O **jitter de ±10%** dessincroniza a frota: várias unidades acordando
-  juntas colidiriam no mesmo instante.
+  juntas colidiriam no mesmo instante. O jitter é sorteado dentro da
+  política de TX (§9.6), com a fonte de aleatoriedade injetada — assim a
+  lógica é testável no host com RNG determinístico.
 
 Falha fechada: em caso de dúvida (parâmetros inválidos, limite zero), o
 firmware **não transmite**.
@@ -679,21 +709,21 @@ firmware **não transmite**.
 budget
 perfil: 915-ANATEL (Brasil (ANATEL))
 faixa: 915.000-928.000 MHz | SF8 BW125 CR4/5 | EIRP<=30 dBm
-airtime: track=329 ms ack=237 ms ciclo=566 ms
-intervalo: 30000 ms | duty: 1.887% (limite 10.0%)
-energia TX: 0.0189 mAh/ciclo | 54.337 mAh/dia (120 mA)
+airtime: track=329 ms ack=226 ms ciclo=555 ms
+intervalo: 30000 ms | duty: 1.850% (limite 10.0%)
+energia TX: 0.0185 mAh/ciclo | 53.280 mAh/dia (120 mA)
 duty na janela de 1h: 0.009% | transmissoes negadas: 0
 
 # Node 2 — console serial
 budget
 perfil: 915-ANATEL (Brasil (ANATEL))
 faixa: 915.000-928.000 MHz | SF8 BW125 | EIRP<=30 dBm | 915 kHz OK
-airtime: track=329 ms ack=237 ms
-energia TX (ACK): 0.0079 mAh/ACK (120 mA)
-duty 1h: 0.007% (limite 10.0%) | ACKs negados: 0
+airtime: track=329 ms ack=226 ms
+energia TX (ACK): 0.0075 mAh/ACK (120 mA)
+duty 1h: 0.006% (limite 10.0%) | ACKs negados: 0
 ```
 
-> O `duty` de regime (1,887%) é o do ciclo **periódico**; o `duty na janela
+> O `duty` de regime (1,850%) é o do ciclo **periódico**; o `duty na janela
 > de 1 h` é o consumo **acumulado** desde o boot.
 
 ```bash
@@ -710,10 +740,131 @@ A API do Node 2 expõe o orçamento em `/api/status`:
 "rf_budget": {
   "profile": "915-ANATEL", "region": "Brasil (ANATEL)",
   "freq_min_khz": 915000, "freq_max_khz": 928000, "eirp_max_dbm": 30,
-  "sf": 8, "bw_khz": 125, "airtime_ack_ms": 237,
-  "duty_limit_pct": 10.0, "duty_used_pct": 0.007, "freq_ok": true
+  "sf": 8, "bw_khz": 125, "airtime_ack_ms": 226,
+  "duty_limit_pct": 10.0, "duty_used_pct": 0.006, "freq_ok": true
 }
 ```
+
+### 9.6 Política de TX adaptativa (Node 1)
+
+Até a v5.1.0 o Node 1 transmitia **periodicamente**: um frame a cada 30 s,
+importando ou não o alvo ter se movido. Numa frota, isso é desperdício de
+espectro e de energia — e, pior, **não distingue um alvo parado de um
+alvo que saiu de campo**.
+
+Agora a transmissão é **por evento**:
+
+```
+transmite se:   posição alterou > LORA_MIN_MOVE_M (10 m)
+             OU passou LORA_HEARTBEAT_TX_MS (60 s) desde a última TX
+             E o piso de intervalo (30 s, derivado do duty cycle) passou
+```
+
+O **heartbeat** é indispensável: é ele que mantém a base ciente de que a
+unidade está viva. Sem ele, um alvo parado seria indistinguível de um alvo
+que ficou sem bateria ou saiu da área de cobertura.
+
+| evento | contador | console |
+|---|---|---|
+| posição alterou além do limiar | `txEvents` | `Evento: alvo se moveu 44.5 m` |
+| heartbeat (alvo parado) | `txHeartbeats` | — |
+| suprimido pelo duty cycle | `txDenied` | `TX suspensa: duty cycle ...` |
+| **evento sem frame no ar** | `txSuppressed` | `Evento sem frame no ar: posicao nao reportada` |
+
+```console
+# Node 1
+policy
+TX: movimento > 10 m OU heartbeat 60 s | piso 30 s +/- 10%
+   ultimo: 120000 ms | proximo permitido: 149375 ms | distancia: 44.5 m
+beacon FM: ligado | duty 10.0% (3 s on / 27 s off) | min bateria 20%
+```
+
+#### 9.6.1 Detalhes que importam
+
+- **A referência de posição é a do último frame REPORTADO**, não a da
+  última posição observada. Consequência direta: **se a transmissão for
+  negada (duty cycle, erro), o movimento não é perdido** — ele continua
+  pendente e é reportado na próxima oportunidade. O contador
+  `txSuppressed` torna visível quantos eventos ficaram sem frame no ar.
+- **O piso de intervalo é verificado antes de consumir o evento.** Um
+  movimento ocorrido durante o piso não é descartado: a posição corrente
+  continua pendente e o evento é detectado na primeira avaliação após o
+  piso.
+- **A transmissão negada reprograma o piso** (`onTxFailed()`). Sem isso, o
+  loop principal — que chama `evaluate()` milhares de vezes por segundo —
+  re-tentaria a cada iteração, cada tentativa incrementando `txDenied` e
+  escrevendo no log. Um flood assim, sozinho, esgota a flash e o buffer
+  da serial. O piso vale **também antes do primeiro contato**.
+- **Sem fix GNSS, só o heartbeat dispara.** Não é possível estimar
+  movimento sem posição; e é justamente nesses casos que a base mais
+  precisa saber que o nó está online.
+- **A primeira posição válida é reportada como evento.** Se o nó
+  transmissions sem fix (num túnel, por exemplo), a referência fica
+  inválida e a próxima posição válida é tratada como "primeira posição":
+  a base ainda não conhece **nenhuma** posição daquele nó, e precisa
+  recebê-la.
+
+#### 9.6.2 ACK curto (2 bytes)
+
+O ACK da base passou de **4 bytes de payload para 2**:
+
+| byte | conteúdo |
+|---|---|
+| 0 | flags: `OK`, `DUPLICATE`, `GPS_VALID` |
+| 1 | RSSI do frame recebido, quantizado (0..255 ⇒ −130..−3 dBm) |
+
+Os 4 bytes anteriores eram **redundantes**: repetiam o contador, que já
+está no cabeçalho do frame — e o cabeçalho é autenticado como AAD pelo
+GCM. O payload de 2 bytes carrega informação **nova**: o emissor passa a
+saber a qualidade do link vista pela base (antes era cego).
+
+O frame no ar cai de 35 B para 33 B e o tempo no ar do ACK de 236,0 ms
+para 225,8 ms (SF8).
+
+#### 9.6.3 Retentativa: 1 por evento
+
+A v5.0.0 fazia até **3 transmissões** por evento (1 original + 2 retries).
+Agora são no máximo **2** (1 original + 1 retry).
+
+O retry reutiliza o **mesmo `(epoch, counter)`**: a retransmissão é
+segura porque a base reconhece a duplicidade pelo contador, reenvia o ACK
+sem reprocessar o track, e o anti-replay permanece estrito.
+
+O contador é alocado **uma vez por evento** e repassado à retentativa.
+Isso eliminou um bug latente da v5.0.0: o `TxSequence` tinha um
+`setCounter()` que permitia "desfazer" a alocação, e a retransmissão o
+usava para reescrever o contador. Se a reescrita ocorresse **depois** de
+um frame já ter saído, o próximo evento reutilizaria um contador que a
+base **já tinha aceito** — e a base rejeitaria um frame legítimo como
+`REPLAY`, matando o enlace. O setter foi **removido**: a sequência de
+contadores é estritamente monotônica, e uma alocação desperdiçada apenas
+abre uma lacuna, que o receptor trata normalmente.
+
+> O teste `tests/anti_replay_persistence.cpp` demonstra o ciclo completo:
+> a base aceita o contador 1, o emissor o reusa, e a base **rejeita** o
+> frame (`REPLAY`) — provando que qualquer reuso de contador é fatal.
+
+#### 9.6.4 Beacon FM: duty cycle próprio e corte por bateria
+
+O beacon FM (Si4713) é um transmissor **independente** do link LoRa: tem
+o próprio orçamento de energia e de espectro.
+
+| parâmetro | valor | efeito |
+|---|---|---|
+| `FM_BEACON_ON_MS` | 3 000 ms | fase ligada |
+| `FM_BEACON_OFF_MS` | 27 000 ms | fase desligada → **10% de duty** |
+| `FM_BEACON_MIN_BATTERY_PCT` | 20% | abaixo disso, **desliga** |
+
+O corte por bateria é **automático e travado**: o beacon não se religa
+sozinho (nem com a voltando a 90%) — é preciso `fm rearm` no console,
+depois de uma recarga. Preservar o link LoRa (que é o que mantém a base
+ciente da unidade) tem prioridade sobre um beacon audível.
+
+> ⚠️ **Validação de bancada pendente.** O corte de radiação usa a
+> propriedade `PROP_TX_ENABLE` (0x3E06) do Si4713, que não pôde ser
+> exercitada neste ambiente (nenhum Si4713 conectado). **Validar em
+> bancada** que o beacon realmente cessa de radiar na fase OFF e no corte
+> por bateria antes de operar em campo.
 
 ---
 
@@ -735,11 +886,11 @@ A API do Node 2 expõe o orçamento em `/api/status`:
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + round-trip + orçamento de RF + build
+./test_functional.sh            # invariantes + round-trip + RF + politica + build
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (9 grupos):
+Cobertura (10 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -751,29 +902,48 @@ Cobertura (9 grupos):
 5. anti-replay estrito e TOTP verificado no login;
 6. dashboard sem injeção de HTML e ausência de chaves hardcoded;
 7. **estado anti-replay persistido** (`tests/anti_replay_persistence.cpp`,
-   75 verificações no host): serialização do estado por par, reidratação,
+   85 verificações no host): serialização do estado por par, reidratação,
    rejeição de epoch anterior, rejeição de contador repetido, salto acima do
-   limite, e o cenário crítico de replay de frame capturado após reinício do
-   receptor — com um bloco que demonstra explicitamente que **sem** a
-   reidratação o mesmo frame seria aceito (a vulnerabilidade da v5.0.0);
-8. **orçamento de RF** (`tests/link_budget.cpp`, 51 verificações no host):
+   limite, **monotonicidade do contador do emissor** (com o ciclo completo
+   em que a base rejeita um contador reusado), e o cenário crítico de
+   replay de frame capturado após reinício do receptor — com um bloco que
+   demonstra explicitamente que **sem** a reidratação o mesmo frame seria
+   aceito (a vulnerabilidade da v5.0.0);
+8. **orçamento de RF** (`tests/link_budget.cpp`, 57 verificações no host):
    tempo no ar contra as 9 referências da tabela oficial do RP002, lei de
    escalonamento `2^ΔSF`, valores do projeto, parâmetros inválidos,
-   intervalo mínimo por perfil, e o **guard de duty cycle** (que precisa
+   intervalo mínimo por perfil, **coerência entre o tamanho real do frame
+   e o cálculo de airtime**, e o **guard de duty cycle** (que precisa
    *recusar* a transmissão que violaria o limite). O grupo também executa
    `tools/airtime.py --selftest` (mesma fórmula, lado Python) e verifica
    estaticamente que os parâmetros do firmware são viáveis e que o guard
    está aplicado no Node 1 **e** no Node 2;
-9. build dos três nós.
+9. **política de TX adaptativa** (`tests/tx_policy.cpp`, 77 verificações no
+   host): distância por Haversine, disparo por movimento, supressão abaixo do
+   limiar, heartbeat com o alvo parado, comportamento sem fix GNSS, piso de
+   intervalo sob movimento perpétuo, **evento não perdido durante o piso**,
+   **movimento pendente preservado quando a TX é negada** (com o piso
+   reprogramado para evitar flood), **primeira posição válida reportada**,
+   **piso válido antes do primeiro contato**, jitter do piso (com RNG
+   determinístico), e a política do beacon FM (duty cycle próprio e corte
+   por bateria). O grupo verifica também, por análise estática, que o Node 1
+   usa a política adaptativa, que o retry é limitado a 1 por evento, que o
+   ACK curto está coerente entre os dois nós, que **o contador do emissor
+   não pode ser reescrito** e que **o movimento pendente sobrevive a uma
+   TX negada**;
+10. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
 compilava e o link Node2↔Node3 simplesmente nunca funcionava em campo. O
 teste de anti-replay existe pelo mesmo motivo: a falha era **silenciosa** e
 só apareceu em análise do modelo de ameaça, não em nenhum teste. O teste de
-orçamento de RF existe pelo mesmo motivo: um duty cycle de 225% é
+orçamento de RF existe pelo mesmo motivo: um duty cycle de 221% é
 **matematicamente impossível** e nenhuma compilação ou revisão de código o
-apontava.
+apontava. O de TX adaptativa existe porque a política tem **arestas não
+óbvias** (movimento perdido quando a TX é negada, flood de log, heartbeat
+que nunca dispara, contador de frame reusado) que só aparecem em
+simulação.
 
 ---
 
@@ -844,10 +1014,22 @@ Consequências práticas:
 - **Epoch de 16 bits:** o emissor sorteia um epoch novo por boot. Após ~65 536
   boots o epoch pode dar a volta (aritmética de número de série). Migrar para
   epoch de 32 bits na v6.
-- **Duty cycle do link:** viabilizado na v5.1.0 (SF8 a 1/30 s → 1,88%).
-  Porém a transmissão ainda é **periódica**, não por evento: o item 1.3 do
-  plano (TX por movimento/heartbeat) ainda não está implementado. O
-  orçamento do perfil continua sendo respeitado em ambos os regimes.
+- **Duty cycle do link:** viabilizado na v5.1.0 (SF8 a 1/30 s → 1,85%).
+  A TX é **adaptativa** (§9.6): um alvo parado transmite só o heartbeat
+  (1 frame/60 s). O número de frames observados em campo depende do
+  movimento real da unidade e não pode ser previsto por firmware.
+- **Beacon FM: validação de bancada pendente.** O corte de radiação usa a
+  propriedade `PROP_TX_ENABLE` (0x3E06) do Si4713, que não pôde ser
+  exercitada neste ambiente (nenhum Si4713 conectado). Confirmar em
+  bancada que o beacon cessa de radiar na fase OFF e no corte por bateria
+  (§9.6.4).
+- **Consumo real ainda não medido.** O item 1.3 do plano tem aceite
+  "≤ 0,5 Ah/dia medido em bancada". As estimativas de firmware cobrem
+  **apenas o TX LoRa** (0,053 Ah/dia no pior caso). Os consumos
+  dominantes — **GNSS** (tracking contínuo a 1 Hz) e **RX do SX1276** em
+  espera de ACK — são ordens de grandeza maiores e dependem do item 1.7
+  (deep sleep). Sem o item 1.7, a autonomia de 14 dias **não é
+  atingível**, mesmo com a TX adaptativa.
 - **Perfis de banda são referência de engenharia, não parecer jurídico.**
   Os limites de duty cycle de `915-ANATEL`/`915-FCC` são auto-impostos e
   conservadores; o operador deve confirmar o perfil aplicável e os limites

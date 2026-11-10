@@ -57,9 +57,25 @@ enum HefTrackStatus {
 // --- Payload de tracking (23 bytes) ---
 #define HEF_TRACK_PAYLOAD_LEN 23
 
+// --- Payload do ACK: 2 bytes (v5.1.0, item 1.3) ---
+// A v5.0.0 enviava 4 bytes contendo o contador do frame confirmado.
+// Isso era REDUNDANTE: o contador ja esta no CABECALHO do frame, que
+// e' autenticado como AAD pelo GCM. O payload foi reduzido para 2 bytes
+// que carregam informacao NOVA:
+//   byte 0: flags (ver HefAckFlag)
+//   byte 1: RSSI do frame recebido, quantizado (0..255 => -130..-3 dBm)
+// O ganho e' pequeno em tempo no ar (a tag GCM de 16 B domina o frame),
+// mas o ACK passa a devolver QUALIDADE DE LINK ao emissor - o que antes
+// era cego.
+#define HEF_ACK_PAYLOAD_LEN   2
+
+// Flags do ACK (payload byte 0).
+#define HEF_ACK_FLAG_OK        0x01  // frame aceito e processado
+#define HEF_ACK_FLAG_DUPLICATE 0x02  // frame ja processado (retransmissao)
+#define HEF_ACK_FLAG_GPS_VALID 0x04  // o frame tinha fix GNSS valido
+
 // --- Tamanho completo dos frames no ar (cabecalho + payload + tag GCM) ---
 // Usado pelo calculo de tempo no ar / duty cycle (link_budget.h).
-#define HEF_ACK_PAYLOAD_LEN   4
 #define HEF_TRACK_FRAME_LEN  (HEF_HEADER_LEN + HEF_TRACK_PAYLOAD_LEN + HEF_TAG_LEN)
 #define HEF_ACK_FRAME_LEN    (HEF_HEADER_LEN + HEF_ACK_PAYLOAD_LEN + HEF_TAG_LEN)
 

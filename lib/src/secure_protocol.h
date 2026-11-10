@@ -210,9 +210,18 @@ public:
     uint16_t epoch()   const { return epoch_; }
     uint32_t counter() const { return counter_; }
 
+    // O contador avanca SOMENTE para frente. A v5.0.0/v5.1.0 oferecia um
+    // `setCounter()` que permitia REESCREVER o contador para "desfazer"
+    // uma alocacao. Isso era uma armadilha: se a reescrita acontecesse
+    // depois de um frame ja ter saído (por exemplo, numa retentativa
+    // cujo frame anterior chegou a base), o proximo evento reutilizaria
+    // um contador que a base JA TINHA ACEITO — e a base rejeitaria um
+    // frame legitimo como REPLAY, matando o enlace.
+    //
+    // Nao ha mais setter: a sequencia e' estritamente monotonica. Uma
+    // alocacao desperdicada apenas abre uma lacuna, que o receptor
+    // trata normalmente.
     uint32_t next() { return ++counter_; }
-
-    void setCounter(uint32_t c) { counter_ = c; }
 };
 
 #endif // HEF_SECURE_PROTOCOL_H

@@ -20,6 +20,7 @@
 #include "framework.h"
 #include "link_budget.h"
 #include "band_plan.h"
+#include "link_protocol.h"
 
 // ---------------------------------------------------------------------
 // Referencia oficial: RP002 EU868 (DR0=SF7/125, DR2=SF10/125, DR5=SF12/125)
@@ -102,16 +103,17 @@ static void testProjectValues() {
     sf10.sf = 10; sf10.bwKHz = 125; sf10.crNum = 4;
 
     uint32_t track8  = HefLinkBudget::airtimeMs(54, sf8);
-    uint32_t ack8    = HefLinkBudget::airtimeMs(35, sf8);
+    uint32_t ack8    = HefLinkBudget::airtimeMs(33, sf8);
     uint32_t track10 = HefLinkBudget::airtimeMs(54, sf10);
-    uint32_t ack10   = HefLinkBudget::airtimeMs(35, sf10);
+    uint32_t ack10   = HefLinkBudget::airtimeMs(33, sf10);
 
     // Valores de referencia (tools/airtime.py --selftest confere a
     // equivalencia com a tabela oficial).
+    // ACK = cabecalho 15 + payload 2 + tag GCM 16 = 33 bytes (v5.1.0).
     CHECK(track8 == 329UL, "SF8 telemetria (54 B) = 329 ms");
-    CHECK(ack8   == 237UL, "SF8 ACK (35 B) = 237 ms");
+    CHECK(ack8   == 226UL, "SF8 ACK (33 B) = 226 ms");
     CHECK(track10 == 1313UL, "SF10 telemetria (54 B) = 1313 ms");
-    CHECK(ack10   == 945UL, "SF10 ACK (35 B) = 945 ms");
+    CHECK(ack10   == 904UL, "SF10 ACK (33 B) = 904 ms");
 
     // A configuracao antiga (SF10 a 1 Hz) era fisicamente impossivel.
     float dutyOld = HefLinkBudget::dutyCyclePercent(track10 + ack10, 1000);
@@ -163,7 +165,7 @@ static void testDutyBudget() {
 
     HefLinkParams p;
     p.sf = 8; p.bwKHz = 125; p.crNum = 4;
-    uint32_t cycle = HefLinkBudget::airtimeMs(54, p) + HefLinkBudget::airtimeMs(35, p);
+    uint32_t cycle = HefLinkBudget::airtimeMs(54, p) + HefLinkBudget::airtimeMs(33, p);
 
     // Perfil 915-ANATEL: 10% de orcamento -> 30 s basta.
     const HefBandProfile* anatel = HefBandPlan::byName("915-ANATEL");
@@ -207,7 +209,42 @@ static void testDutyBudget() {
 }
 
 // ---------------------------------------------------------------------
-// 6) Guard de duty cycle: o firmware IMPEDE a violacao
+// 7) Coerencia entre o protocolo e o calculo de airtime
+// ---------------------------------------------------------------------
+// O tempo no ar depende do tamanho REAL do frame no ar. Se o payload do
+// ACK mudar sem que os testes de airtime sejam atualizados, o duty
+// cycle real passa a divergir do planejado sem ninguem perceber.
+static void testProtocolCoherence() {
+    SECTION("Coerencia protocolo <-> airtime");
+
+    // Cabecalho 15 + payload + tag GCM 16.
+    CHECK(HEF_TRACK_FRAME_LEN == 54,
+          "frame de telemetria = 54 B (cabecalho 15 + payload 23 + tag 16)");
+    CHECK(HEF_ACK_FRAME_LEN == 33,
+          "frame de ACK = 33 B (cabecalho 15 + payload 2 + tag 16)");
+
+    // O ACK curto e' o motivo do tamanho: 4 B -> 2 B.
+    CHECK(HEF_ACK_PAYLOAD_LEN == 2,
+          "payload do ACK reduzido para 2 B (flags + RSSI)");
+
+    // O calculo usa exatamente o tamanho do protocolo.
+    HefLinkParams p;
+    p.sf = 8; p.bwKHz = 125; p.crNum = 4;
+    CHECK(HefLinkBudget::airtimeMs(HEF_TRACK_FRAME_LEN, p) == 329UL,
+          "airtime da telemetria usa HEF_TRACK_FRAME_LEN");
+    CHECK(HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, p) == 226UL,
+          "airtime do ACK usa HEF_ACK_FRAME_LEN");
+
+    // O ACK curto economiza tempo no ar em relacao ao payload de 4 B.
+    uint32_t ackLong = HefLinkBudget::airtimeMs(
+        HEF_HEADER_LEN + 4 + HEF_TAG_LEN, p);
+    uint32_t ackShort = HefLinkBudget::airtimeMs(HEF_ACK_FRAME_LEN, p);
+    CHECK(ackShort < ackLong,
+          "ACK de 2 B e' mais curto no ar que o de 4 B");
+}
+
+// ---------------------------------------------------------------------
+// 8) Guard de duty cycle: o firmware IMPEDE a violacao
 // ---------------------------------------------------------------------
 static void testDutyGuard() {
     SECTION("Guard de duty cycle (janela de 1 h)");
@@ -249,6 +286,7 @@ int main() {
     testProjectValues();
     testInvalidParams();
     testDutyBudget();
+    testProtocolCoherence();
     testDutyGuard();
 
     return heftest::summary("orcamento de RF");

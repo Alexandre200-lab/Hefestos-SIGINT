@@ -181,6 +181,70 @@ static void testSequenceRules() {
 }
 
 // ---------------------------------------------------------------------
+// 3-bis) TxSequence: o contador do emissor e' estritamente monotonico
+// ---------------------------------------------------------------------
+// O emissor aloca o contador UMA VEZ por evento e o reutiliza nas
+// retentativas. Nao existe mais setter que permita "desfazer" a
+// alocacao (a v5.1.0 tinha `setCounter()`, que era exatamente a
+// armadilha).
+//
+// POR QUE ISSO E' CRITICO
+//   Se uma alocacao fosse desfeita DEPOIS de um frame ja ter saido
+//   (por exemplo, numa retentativa cuja cifragem falhou depois do
+//   primeiro envio ter chegada a base), o proximo evento reutilizaria
+//   um contador que a base JA TINHA ACEITO. A base rejeitaria o frame
+//   legitimo como REPLAY e o enlace MORRERIA.
+//
+//   Este teste demonstra o ciclo completo: emissor envia, base aceita,
+//   o contador do emissor "recomeca" (como num reboot com estado
+//   corrompido) e a base rejeita o frame como REPLAY — proving que
+//   qualquer reuso de contador e' fatal e que a monotonicidade e'
+//   obrigatoria.
+static void testTxSequenceMonotonic() {
+    SECTION("TxSequence - contador estritamente monotonico");
+
+    TxSequence tx;
+    tx.begin(100, 0);
+
+    CHECK(tx.next() == 1, "primeiro contador alocado = 1");
+    CHECK(tx.next() == 2, "contadores sao consecutivos");
+    CHECK(tx.counter() == 2, "o contador reflects o ultimo alocado");
+
+    // rollEpoch reinicia a sessao (epoch novo = sessao nova).
+    tx.rollEpoch(101);
+    CHECK(tx.counter() == 0, "epoch novo reinicia o contador");
+    CHECK(tx.next() == 1, "contador comeca em 1 na nova sessao");
+
+    // --- O QUE ACONTECERIA SE O CONTADOR FOSSE REESCRITO ---
+    // A base ja aceitou o contador 1 da epoch 101.
+    RxSequence base;
+    uint32_t lost = 0;
+    CHECK(base.accept(101, 1, &lost) == LINK_RX_ACCEPT, "base aceita o contador 1");
+
+    // O emissor, por um bug, reusa o contador 1.
+    CHECK(base.accept(101, 1, &lost) == LINK_RX_REPLAY,
+          "base REJEITA o contador reusado (o enlace morreria)");
+    CHECK(base.accept(101, 2, &lost) == LINK_RX_ACCEPT,
+          "base aceita o contador seguinte (enlace se recupera)");
+
+    // --- A GARANTIA DA MONOTONICIDADE ---
+    // Nao existe setter: o compilador impede a reescrita. O que a
+    // sequencia oferece e' apenas `next()`, que avancia. Uma
+    // alocacao desperdicada (frame que nunca saiu) abre uma LACUNA,
+    // e a base trata lacunas normalmente.
+    TxSequence tx2;
+    tx2.begin(200, 5);
+    CHECK(tx2.next() == 6, "a sequencia continua de onde parou apos o boot");
+
+    // Lacuna: o contador 6 e' alocado mas o frame nao sai; o 7 e' o
+    // proximo. A base aceita o 7 (lacuna dentro da janela).
+    RxSequence base2;
+    base2.accept(200, 6, &lost);
+    CHECK(base2.accept(200, 7, &lost) == LINK_RX_ACCEPT,
+          "lacuna (contador alocado e nao usado) e' tolerada pela base");
+}
+
+// ---------------------------------------------------------------------
 // 4) PeerReplayGuard: hidratacao e sinalizacao de persistencia
 // ---------------------------------------------------------------------
 static void testGuardFlags() {
@@ -383,6 +447,7 @@ int main() {
     testStoreBasics();
     testStoreSerialization();
     testSequenceRules();
+    testTxSequenceMonotonic();
     testGuardFlags();
     testReplayAfterReboot();
     testVulnerableBaseline();

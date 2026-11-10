@@ -313,7 +313,13 @@ static bool persistPeerStates() {
 // =====================================================================
 // Link LoRa
 // =====================================================================
-static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter) {
+// ACK curto (v5.1.0): payload de 2 bytes.
+//   byte 0: flags (HEF_ACK_FLAG_*)
+//   byte 1: RSSI do frame recebido, quantizado (0..255 => -130..-3 dBm)
+// O contador confirmado NAO e' repetido aqui: ele ja esta no cabecalho,
+// que e' autenticado como AAD pelo GCM.
+static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter,
+                    uint8_t flags, int16_t rssi) {
     if (!peer) return;
 
     // Orcamento de duty cycle: o ACK e' uma transmissao e nao pode
@@ -328,7 +334,12 @@ static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter) {
 
     uint8_t hdr[HEF_HEADER_LEN];
     uint8_t payload[HEF_ACK_PAYLOAD_LEN];
-    putU32(payload, counter);
+    payload[0] = flags;
+    // RSSI quantizado: -130 dBm -> 0, -3 dBm -> 254 (satura em 255).
+    int32_t q = ((int32_t)rssi + 130) * 2;
+    if (q < 0) q = 0;
+    if (q > 255) q = 255;
+    payload[1] = (uint8_t)q;
 
     if (!linkBuildHeader(hdr, HEF_MSG_TRACK_ACK, 0, peer->keyId,
                          nodeId, epoch, counter, sizeof(payload))) {
@@ -448,7 +459,7 @@ static void processTrack(const uint8_t* frame, uint16_t frameLen,
         // contador quando o ACK se perde. Reenviamos o ACK, mas NAO
         // reprocessamos o track (anti-replay preservado).
         if (res == LINK_RX_REPLAY && ctr == peer->rx.highest()) {
-            sendAck(peer, epoch, ctr);
+            sendAck(peer, epoch, ctr, HEF_ACK_FLAG_OK | HEF_ACK_FLAG_DUPLICATE, rssi);
             return;
         }
         peer->replays++;
@@ -486,7 +497,9 @@ static void processTrack(const uint8_t* frame, uint16_t frameLen,
     jam.onPacket(rssi, snr, nowMs());
     applyTrackTime(t);
     forwardTrackToNode3(peer, t, rssi, snr);
-    sendAck(peer, epoch, ctr);
+    uint8_t ackFlags = HEF_ACK_FLAG_OK;
+    if (t.statusFlags & HEF_TRACK_GPS_VALID) ackFlags |= HEF_ACK_FLAG_GPS_VALID;
+    sendAck(peer, epoch, ctr, ackFlags, rssi);
 
     // --- Estado anti-replay: persistencia ---
     // O estado (epoch + high-water) e' a defesa contra replay pos-reboot.

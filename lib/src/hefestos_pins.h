@@ -131,6 +131,40 @@
 // Corrente de TX usada nas estimativas de energia (SX1276 @ 20 dBm).
 #define LORA_TX_CURRENT_MA      120.0f
 
+// ---------------------------------------------------------------
+// Politica de TX adaptativa (v5.1.0, item 1.3 do plano)
+// ---------------------------------------------------------------
+// A v5.0.0 transmitia PERIODICAMENTE: um frame a cada 30 s, sem
+// importar se o alvo tinha se movido. Agora a transmissao e' por
+// EVENTO: a posicao alterou mais que LORA_MIN_MOVE_M **ou** passou
+// LORA_HEARTBEAT_TX_MS desde a ultima transmissao.
+//
+// O heartbeat e' indispensavel: sem ele, um alvo PARADO seria
+// indistinguivel de um alvo que saiu de campo (ou ficou sem bateria).
+//
+// O piso LORA_TX_INTERVAL_MIN_MS continua valendo: um alvo em
+// movimento perpetuo nao pode inundar o enlace.
+#define LORA_MIN_MOVE_M          10.0f    // limiar de movimento (metros)
+#define LORA_HEARTBEAT_TX_MS     60000UL  // heartbeat maximo sem transmitir
+
+// Retentativas: 1 retry por evento (1 transmissao original + 1 retry
+// = 2 frames). A v5.0.0 fazia ate 3 transmissoes por evento.
+#define LORA_TX_MAX_RETRIES      1
+
+// ---------------------------------------------------------------
+// Beacon FM (Si4713) - v5.1.0
+// ---------------------------------------------------------------
+// O beacon e' um transmissor COM CONTINUO: dezenas de mA enquanto esta
+// em ON. Por isso ele tem duty cycle PROPRIO (independente do link
+// LoRa) e corte automatico por bateria.
+//
+// O corte por bateria tem prioridade sobre a telemetria: preservar o
+// link LoRa (que e' o que mantem a base ciente da unidade) vale mais
+// que um beacon audivel.
+#define FM_BEACON_ON_MS           3000UL   // 3 s ligado
+#define FM_BEACON_OFF_MS         27000UL   // 27 s desligado -> 10% de duty
+#define FM_BEACON_MIN_BATTERY_PCT  20      // abaixo disso: beacon desliga
+
 // ============================================================
 // GPS
 // ============================================================
