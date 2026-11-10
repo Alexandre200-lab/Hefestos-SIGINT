@@ -41,7 +41,7 @@
 #define N2_LORA_SS        5
 #define N2_LORA_RST      14
 #define N2_LORA_DIO0     26
-#define N2_RX_RST        12
+#define N2_RX_RST        13
 #define N2_I2C_SDA       21
 #define N2_I2C_SCL       22
 #define N2_UART_TX       17
@@ -53,15 +53,19 @@
 // Node 3 - Caixa Preta / Logger forense (ESP32-C3)
 //
 // Pins 4/5/6/10 = FSPI padrao do ESP32-C3 (SCK/MISO/MOSI/CS).
-// Evitados: GPIO2/8/9 (strapping), GPIO12-17 (bus SPI0 do flash),
-//           GPIO18/19 (USB-JTAG).
+// UART0 (console) usa os pinos padrao 20/21, portanto o link com o Node2
+// vai para GPIO0 (RX) e GPIO2 (TX). GPIO2 e' strapping (precisa estar em
+// nivel alto no boot) e a linha TX ociosa da UART ja' fica em nivel alto;
+// recomenda-se pull-up externo de 10k em GPIO2.
+// Evitados: GPIO8/9 (strapping), GPIO12-17 (bus SPI0 do flash),
+//           GPIO18/19 (USB-JTAG), GPIO20/21 (UART0).
 // ============================================================
 #define N3_SD_CS         10
 #define N3_SD_MOSI        6
 #define N3_SD_MISO        5
 #define N3_SD_SCK         4
-#define N3_UART_RX       20
-#define N3_UART_TX       21
+#define N3_UART_RX        0
+#define N3_UART_TX        2
 #define N3_LED_GREEN      7
 #define N3_LED_RED        1
 #define N3_BUZZER         3

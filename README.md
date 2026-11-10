@@ -262,7 +262,7 @@ esperando o Node 3.
 | LoRa NSS | 5 |
 | LoRa RESET | 14 |
 | LoRa DIO0 | 26 |
-| Si4735 RESET | 12 |
+| Si4735 RESET | 13 |
 | I2C SDA | 21 |
 | I2C SCL | 22 |
 | UART2 TX → Node 3 RX | 17 |
@@ -277,16 +277,19 @@ esperando o Node 3.
 | SD MOSI | 6 |
 | SD MISO | 5 |
 | SD SCK | 4 |
-| UART1 RX ← Node 2 TX | 20 |
-| UART1 TX → Node 2 RX | 21 |
+| UART1 RX ← Node 2 TX | 0 |
+| UART1 TX → Node 2 RX | 2 |
 | LED verde | 7 |
 | LED vermelho | 1 |
 | Buzzer | 3 |
 | Console | UART0 |
 
-> O ESP32-C3 usa o barramento FSPI nativo nesses pinos. GPIO2/8/9 (strapping),
-> GPIO12–17 (flash) e GPIO18/19 (USB-JTAG) são evitados. O teste
-> `test_functional.sh` falha se essa regra for violada.
+> O ESP32-C3 usa o barramento FSPI nativo nesses pinos. O console UART0 usa os
+> pinos padrão 20/21, então o link com o Node 2 vai para GPIO0 (RX) e GPIO2 (TX).
+> GPIO2 é pino de strapping (precisa estar alto no boot) e a linha TX ociosa já
+> fica alta; recomenda-se pull-up externo de 10 kΩ. GPIO8/9 (strapping),
+> GPIO12–17 (flash), GPIO18/19 (USB-JTAG) e GPIO20/21 (UART0) são evitados. O
+> teste `test_functional.sh` falha se essa regra for violada.
 
 ---
 

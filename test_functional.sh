@@ -52,7 +52,8 @@ for g, pins in groups.items():
 if ok:
     print("  [PASS] nenhuma pinagem duplicada por no")
 
-forbidden = set(range(12, 18)) | {2, 8, 9, 18, 19}
+# GPIO2 e' permitido apenas como N3_UART_TX (TX ociosa = nivel alto).
+forbidden = {8, 9} | set(range(12, 20))
 bad = [(n, v) for n, v in defines.items()
        if n.startswith("N3_") and "SERIAL" not in n and int(v) in forbidden]
 if bad:

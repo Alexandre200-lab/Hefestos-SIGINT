@@ -436,8 +436,13 @@ public:
         memset(out + 20, 0, 16);
         memcpy(out + 36, cipher, (size_t)ctLen);
 
-        prefs_.putBytes(HEF_NVS_KEY_VAULT, out, 36 + (size_t)ctLen);
-        secretsLoaded_ = false;   // invalida cache; proximo get() recarrega
+        if (prefs_.putBytes(HEF_NVS_KEY_VAULT, out, 36 + (size_t)ctLen) == 0) {
+            return false;
+        }
+        // Recarrega o cache IMEDIATAMENTE. Sem isso, um save() posterior
+        // (enrollNode/setDeploymentPsk) gravaria os campos de cache vazios
+        // e apagaria as credenciais recem-gravadas.
+        load();
         return true;
     }
 
