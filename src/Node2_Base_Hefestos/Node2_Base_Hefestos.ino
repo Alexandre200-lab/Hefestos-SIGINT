@@ -43,6 +43,7 @@
 #include <link_protocol.h>
 #include <provisioning.h>
 #include <secure_protocol.h>
+#include <peer_state.h>
 #include <rate_limiter.h>
 #include <totp_auth.h>
 #include <radio_si4735.h>
@@ -88,13 +89,15 @@ struct PeerState {
     uint16_t  nodeId;
     uint8_t   keyId;
     uint8_t   key[HEF_KEY_LEN];
-    RxSequence rx;
+    PeerReplayGuard rx;
     HefTrack  last;
     bool      haveTrack;
     uint32_t  lastSeenMs;
     uint32_t  framesOk;
     uint32_t  framesBad;
     uint32_t  replays;
+    uint32_t  staleEpochs;
+    uint32_t  resyncs;
     int16_t   lastRssi;
     float     lastSnr;
 };
@@ -207,6 +210,77 @@ static void wipePeers() {
 static void resetPeers() {
     wipePeers();
     loraFramesOk = loraFramesBad = loraReplays = acksSent = 0;
+}
+
+// =====================================================================
+// Rehidratacao do estado anti-replay (boot do receptor)
+// =====================================================================
+// Sem isto, um frame capturado por SDR antes de um reinicio do Node2 seria
+// aceito como frame novo: a tabela de pares volta vazia, o par nao tem
+// epoch/contador e o RxSequence fica inativo (accept = TOFU).
+//
+// Os pares sao reconstruidos a partir dos enrollments persistidos no vault
+// (a chave de cada par e' derivada de forma DETERMINISTICA do PSK de
+// deploy + node_id) e o estado anti-replay e' hidratado do vault cifrado.
+static void restorePeerStates() {
+    const uint8_t* psk = vault.getPsk();
+    if (!psk) return;
+
+    uint8_t n = vault.enrollmentCount();
+    for (uint8_t i = 0; i < n; i++) {
+        uint16_t nid = 0;
+        uint8_t  kid = 0;
+        if (!vault.getEnrollment(i, &nid, &kid)) continue;
+
+        PeerState* p = peerByNodeId(nid);
+        if (!p) {
+            uint8_t key[HEF_KEY_LEN];
+            if (!deriveNodeKey(psk, HEF_KEY_LEN, nid, key, sizeof(key))) continue;
+            p = peerCreate(nid, kid, key, HEF_KEY_LEN);
+            memset(key, 0, sizeof(key));
+            if (!p) continue;
+        }
+
+        uint16_t epoch = 0;
+        uint32_t ctr   = 0;
+        if (vault.getPeerState(nid, &epoch, &ctr)) {
+            p->rx.hydrate(epoch, ctr);
+            dbg.logf("Par %u reidratado: epoch=%u counter=%u",
+                     nid, epoch, (unsigned)ctr);
+        } else {
+            // Par enrolled sem estado anti-replay (migracao de um vault
+            // v5.0.0). O primeiro frame valido sera aceito por TOFU e
+            // persistido; a partir dai o replay pos-reboot e' bloqueado.
+            dbg.logf("Par %u sem estado anti-replay (migracao)", nid);
+        }
+    }
+}
+
+// =====================================================================
+// Persistencia do estado anti-replay
+// =====================================================================
+// Grava no vault (RAM + flash) o estado (epoch + high-water) de todos os
+// pares que avancaram desde a ultima gravacao.
+// Retorna true se houve gravacao e ela foi bem-sucedida.
+static bool persistPeerStates() {
+    bool dirty = false;
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        if (!peers[i].used) continue;
+        if (!peers[i].rx.isDirty()) continue;
+        vault.putPeerState(peers[i].nodeId, peers[i].rx.epoch(),
+                           peers[i].rx.highest());
+        dirty = true;
+    }
+    if (!dirty) return false;
+
+    if (!vault.save()) {
+        dbg.logWarning("Falha ao gravar o estado anti-replay no vault");
+        return false;   // as flags continuam sujas: tenta de novo
+    }
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        if (peers[i].used) peers[i].rx.clearPersistFlags();
+    }
+    return true;
 }
 
 // =====================================================================
@@ -329,6 +403,7 @@ static void processTrack(const uint8_t* frame, uint16_t frameLen,
     }
 
     uint32_t lost = 0;
+    uint32_t resyncsBefore = peer->rx.resyncs();
     LinkRxResult res = peer->rx.accept(epoch, ctr, &lost);
     if (res != LINK_RX_ACCEPT) {
         // Duplicata da ULTIMA transmissao: o Node1 reenvia com o MESMO
@@ -340,7 +415,23 @@ static void processTrack(const uint8_t* frame, uint16_t frameLen,
         }
         peer->replays++;
         loraReplays++;
+        if (res == LINK_RX_STALE_EPOCH) {
+            // Epoch anterior ao estado conhecido: e' o replay pos-reboot
+            // (o frame capturado antes do reinicio do receptor).
+            peer->staleEpochs++;
+            dbg.logf("REPLAY pos-reboot bloqueado: node=%u epoch=%u (conhecido %u)",
+                     src, epoch, peer->rx.epoch());
+        }
         return;
+    }
+
+    if (peer->rx.resyncs() != resyncsBefore) {
+        // Salto grande do contador dentro da mesma epoch: o enlace havia
+        // ficado sem receptionar frames. Evento de seguranca relevante
+        // (pode indicar captura/replay de um frame distante).
+        peer->resyncs++;
+        dbg.logf("Reancoragem de sequencia: node=%u epoch=%u counter=%u",
+                 src, epoch, (unsigned)ctr);
     }
 
     HefTrack t;
@@ -358,6 +449,15 @@ static void processTrack(const uint8_t* frame, uint16_t frameLen,
     applyTrackTime(t);
     forwardTrackToNode3(peer, t, rssi, snr);
     sendAck(peer, epoch, ctr);
+
+    // --- Estado anti-replay: persistencia ---
+    // O estado (epoch + high-water) e' a defesa contra replay pos-reboot.
+    // Mudanca de epoch (novo boot do emissor) e' gravada IMEDIATAMENTE;
+    // o contador avanca e' gravado no flush periodico.
+    vault.putPeerState(src, peer->rx.epoch(), peer->rx.highest());
+    if (peer->rx.needsImmediatePersist()) {
+        persistPeerStates();
+    }
 
     dbg.logf("TRACK node=%u ctr=%u lost=%u rssi=%d snr=%.1f",
              src, (unsigned)ctr, (unsigned)lost, (int)rssi, (double)snr);
@@ -777,7 +877,12 @@ static String jsonPeers() {
         o["frames_ok"] = p.framesOk;
         o["frames_bad"] = p.framesBad;
         o["replays"] = p.replays;
+        o["stale_epoch"] = p.staleEpochs;
+        o["resyncs"] = p.resyncs;
         o["gaps"] = p.rx.gaps();
+        o["epoch"] = p.rx.epoch();
+        o["counter"] = p.rx.highest();
+        o["state_persisted"] = vault.getPeerState(p.nodeId, nullptr, nullptr);
         o["have_track"] = p.haveTrack;
         if (p.haveTrack) {
             o["utc"] = p.last.epochUtc;
@@ -1300,6 +1405,11 @@ static void handleConsole(char* line) {
                           peers[i].nodeId, peers[i].keyId, peers[i].lastRssi,
                           (double)peers[i].lastSnr, peers[i].framesOk,
                           peers[i].framesBad, peers[i].replays);
+            Serial.printf("   epoch=%u counter=%u stale=%u resync=%u persistido=%s\n",
+                          peers[i].rx.epoch(), (unsigned)peers[i].rx.highest(),
+                          peers[i].staleEpochs, peers[i].resyncs,
+                          vault.getPeerState(peers[i].nodeId, nullptr, nullptr)
+                              ? "sim" : "nao");
         }
     } else if (strncmp(line, "sweep on", 8) == 0) {
         autoSweep = true;
@@ -1369,7 +1479,7 @@ void setup() {
     Serial.begin(115200);
     dbg.begin(115200);
 
-    dbg.log("Node2 v5.0.0: inicializando");
+    dbg.log("Node2 v5.1.0: inicializando");
 
     // Node3 em UART2 (UART0 fica para o console).
     node3Serial.begin(115200, SERIAL_8N1, N2_UART_RX, N2_UART_TX);
@@ -1378,6 +1488,10 @@ void setup() {
     vault.begin();
     nodeId = vault.nodeId();
     keyReady = (vault.getPsk() != nullptr);
+
+    // Reidrata o estado anti-replay dos pares conhecidos (fecha o replay
+    // pos-reboot: um frame capturado antes de um reinicio e' rejeitado).
+    restorePeerStates();
 
     ensureCredentials();
     setupRadio();
@@ -1409,7 +1523,7 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================================");
-    Serial.println(" HEFESTOS SIGINT v5.0.0 - NODE 2 (BASE)");
+    Serial.println(" HEFESTOS SIGINT v5.1.0 - NODE 2 (BASE)");
     Serial.println("=================================================");
     Serial.printf("node_id: %u\n", nodeId);
     Serial.printf("chave de link: %s\n", keyReady ? "OK" : "AUSENTE - 'psk <64 hex>'");
@@ -1491,6 +1605,17 @@ void loop() {
                 memset(&s, 0, sizeof(s));
             }
         }
+    }
+
+    // --- Persistencia periodica do estado anti-replay ---
+    // O epoch novo e' gravado IMEDIATAMENTE (no processTrack). Aqui o
+    // high-water do contador e' gravado no maximo a cada
+    // HEF_PEER_STATE_FLUSH_MS. Intervalo maior = menos desgaste de flash;
+    // intervalo menor = janela menor de replay intra-epoch pos-reboot.
+    static uint32_t lastPeerFlush = 0;
+    if (now - lastPeerFlush >= HEF_PEER_STATE_FLUSH_MS) {
+        lastPeerFlush = now;
+        persistPeerStates();
     }
 
     // --- Watchdog de memoria (reinicio controlado se o heap colapsar) ---

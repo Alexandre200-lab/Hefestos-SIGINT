@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# Hefestos SIGINT v5.0.0 - build de todos os nos
+# Hefestos SIGINT v5.1.0 - build de todos os nos
 #
 # Requisitos:
 #   - arduino-cli >= 0.35
@@ -53,6 +53,6 @@ compile_node "node3" "esp32:esp32:esp32c3" "$ROOT/src/Node3_Caixa_Preta_ESP32C3"
 
 echo
 echo "====================================================="
-echo " BUILD OK - Hefestos SIGINT v5.0.0 (3/3 nos)"
+echo " BUILD OK - Hefestos SIGINT v5.1.0 (3/3 nos)"
 echo " Artefatos em: $BUILD_DIR"
 echo "====================================================="

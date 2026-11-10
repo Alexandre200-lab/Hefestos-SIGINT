@@ -44,6 +44,7 @@
 #include "hefestos_pins.h"
 #include "crypto_gcm.h"
 #include "debug.h"
+#include "peer_state.h"
 
 #define HEF_TLV_WIFI_PASS 0x01
 #define HEF_TLV_CLI_USER  0x02
@@ -54,8 +55,7 @@
 #define HEF_TLV_NODE_ID   0x07
 #define HEF_TLV_TZ_MIN    0x08
 #define HEF_TLV_WIFI_SSID 0x09
-
-#define HEF_VAULT_BUF 512
+#define HEF_TLV_PEER_STATE 0x0A   // estado anti-replay por par (epoch + high-water)
 
 #define HEF_FLAG_PROVISIONED 0x01
 #define HEF_FLAG_DEBUG       0x02
@@ -75,6 +75,10 @@ private:
     uint16_t nodeId_;
     HefEnrollment enroll_[HEF_MAX_ENROLLMENTS];
     uint8_t enrollCount_;
+    // Estado anti-replay persistido por par (epoch + high-water).
+    // Sem isso, um frame capturado antes de um reinicio do receptor seria
+    // aceito como frame novo (o par comecaria sem epoch/contador).
+    PeerStateStore peerStates_;
     bool loaded_;
 
     // Cache dos segredos em RAM (decifrados uma vez no boot).
@@ -176,6 +180,7 @@ public:
         havePsk_ = false;
         enrollCount_ = 0;
         flags_ = 0;
+        peerStates_.clear();
 
         size_t blobLen = prefs_.getBytesLength(HEF_NVS_KEY_VAULT);
         if (blobLen < 52) return false;   // header 36 + tag GCM 16 (payload vazio)
@@ -227,6 +232,9 @@ public:
             memcpy(&stored, v, 2);
             if (stored != 0) nodeId_ = stored;
         }
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_PEER_STATE, &v, &l)) {
+            peerStates_.deserialize(v, l);
+        }
 
         // Cache dos segredos em RAM
         wifiSsid_[0] = wifiPass_[0] = cliUser_[0] = cliPass_[0] = 0;
@@ -255,9 +263,32 @@ public:
     }
 
     bool save() {
-        // Monta TLV
+        // Monta TLV.
+        //
+        // IMPORTANTE: o tamanho e' calculado ANTES de escrever. O
+        // tlvAppend() historicamente devolvia o mesmo `pos` quando o
+        // espaco faltava, o que descartaria a entrada SILENCIOSAMENTE.
+        // Para o estado anti-replay isso seria uma falha de seguranca
+        // (o par perderia o epoch persistido e o replay pos-reboot
+        // voltaria a ser aceito). Agora o vault falha FECHADO.
         uint8_t plain[HEF_VAULT_BUF];
         size_t pos = 0;
+
+        size_t need = 0;
+        if (havePsk_)                      need += 3 + HEF_KEY_LEN;
+        if (enrollCount_ > 0)              need += 3 + (size_t)enrollCount_ * sizeof(HefEnrollment);
+        need += 3 + 2;                                       // node_id
+        if (wifiSsid_[0])                  need += 3 + strlen(wifiSsid_) + 1;
+        if (wifiPass_[0])                  need += 3 + strlen(wifiPass_) + 1;
+        if (cliUser_[0])                   need += 3 + strlen(cliUser_) + 1;
+        if (cliPass_[0])                   need += 3 + strlen(cliPass_) + 1;
+        if (totpLen_ > 0)                  need += 3 + totpLen_;
+        size_t peerLen = peerStates_.serializedSize();
+        if (peerLen > 0)                   need += 3 + peerLen;
+        // O blob final e' header (36) + ciphertext + tag GCM (16).
+        // Precisa caber em HEF_VAULT_BUF: sem espaco, falha FECHADA
+        // (descartar a entrada em silencio seria uma falha de seguranca).
+        if (need > HEF_VAULT_MAX_PLAIN) return false;
 
         if (havePsk_) {
             pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_PSK, masterPsk_, HEF_KEY_LEN);
@@ -285,14 +316,24 @@ public:
         if (totpLen_ > 0) pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_TOTP,
                                           totpSecret_, totpLen_);
 
+        // Estado anti-replay por par.
+        if (peerLen > 0) {
+            uint8_t pbuf[HEF_MAX_ENROLLMENTS * HEF_PEER_STATE_REC_LEN];
+            size_t wrote = peerStates_.serialize(pbuf, sizeof(pbuf));
+            if (wrote != peerLen) return false;   // falha fechada
+            pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_PEER_STATE, pbuf, peerLen);
+        }
+
         // Cifra
         uint8_t iv[HEF_IV_LEN];
         esp_fill_random(iv, sizeof(iv));
         uint8_t cipher[HEF_VAULT_BUF];
         AeadGcm gcm;
         gcm.setKey(vaultKey_, sizeof(vaultKey_));
+        if (pos != need) return false;   // inconsistencia: falha fechada
         int ctLen = gcm.encrypt(plain, pos, cipher, sizeof(cipher), 0, 0, NULL, 0);
         if (ctLen < 0) return false;
+        if (36 + (size_t)ctLen > HEF_VAULT_BUF) return false;   // falha fechada
 
         uint8_t out[HEF_VAULT_BUF];
         uint32_t magic = HEF_VAULT_MAGIC;
@@ -404,6 +445,11 @@ public:
         if (plainLen == 0) plainLen = 0;
 
         // Remove entrada existente e reconstroi o TLV.
+        //
+        // O estado anti-replay (HEF_TLV_PEER_STATE) e' SEMPRE reescrito a
+        // partir do espelho em RAM, nunca do plaintext gravado: o flush
+        // periodico pode nao ter ocorrido ainda e o plaintext pode estar
+        // mais velho que o estado real dos pares.
         uint8_t rebuilt[HEF_VAULT_BUF];
         size_t pos = 0;
         size_t p = 0;
@@ -411,12 +457,29 @@ public:
             uint8_t  t = plain[p];
             uint16_t l = (uint16_t)plain[p + 1] | ((uint16_t)plain[p + 2] << 8);
             if (p + 3 + l > plainLen) break;
-            if (t != type) {
+            if (t != type && t != HEF_TLV_PEER_STATE) {
+                size_t before = pos;
                 pos = tlvAppend(rebuilt, sizeof(rebuilt), pos, t, plain + p + 3, l);
+                if (pos != before + 3 + (size_t)l) return false;  // sem espaco
             }
             p += 3 + l;
         }
-        if (val && len) pos = tlvAppend(rebuilt, sizeof(rebuilt), pos, type, val, len);
+        if (val && len) {
+            size_t before = pos;
+            pos = tlvAppend(rebuilt, sizeof(rebuilt), pos, type, val, len);
+            if (pos != before + 3 + len) return false;   // sem espaco
+        }
+        size_t peerLen = peerStates_.serializedSize();
+        if (peerLen > 0) {
+            uint8_t pbuf[HEF_MAX_ENROLLMENTS * HEF_PEER_STATE_REC_LEN];
+            size_t wrote = peerStates_.serialize(pbuf, sizeof(pbuf));
+            if (wrote != peerLen) return false;
+            size_t before = pos;
+            pos = tlvAppend(rebuilt, sizeof(rebuilt), pos, HEF_TLV_PEER_STATE, pbuf, peerLen);
+            if (pos != before + 3 + peerLen) return false;   // sem espaco
+        }
+        // O blob final e' header (36) + ciphertext + tag GCM (16).
+        if (pos > HEF_VAULT_MAX_PLAIN) return false;   // falha fechada
 
         // Re-cifra preservando PSK/enroll/nodeId guardados em RAM.
         uint8_t iv[HEF_IV_LEN];
@@ -426,6 +489,7 @@ public:
         gcm.setKey(vaultKey_, sizeof(vaultKey_));
         int ctLen = gcm.encrypt(rebuilt, pos, cipher, sizeof(cipher), 0, 0, NULL, 0);
         if (ctLen < 0) return false;
+        if (36 + (size_t)ctLen > HEF_VAULT_BUF) return false;   // falha fechada
 
         uint8_t out[HEF_VAULT_BUF];
         uint32_t magic = HEF_VAULT_MAGIC;
@@ -444,6 +508,8 @@ public:
         // Recarrega o cache IMEDIATAMENTE. Sem isso, um save() posterior
         // (enrollNode/setDeploymentPsk) gravaria os campos de cache vazios
         // e apagaria as credenciais recem-gravadas.
+        // O estado anti-replay e' preservado: ele foi gravado no blob acima
+        // a partir do espelho em RAM, que e' a versao mais recente.
         load();
         return true;
     }
@@ -483,6 +549,15 @@ public:
         return false;
     }
 
+    // Enumera os pares enrolled (necessario para reidratar o estado
+    // anti-replay no boot do receptor).
+    bool getEnrollment(uint8_t index, uint16_t* nodeIdOut, uint8_t* keyIdOut) const {
+        if (index >= enrollCount_) return false;
+        if (nodeIdOut) *nodeIdOut = enroll_[index].nodeId;
+        if (keyIdOut)  *keyIdOut  = enroll_[index].keyId;
+        return true;
+    }
+
     // Lookup inverso: keyId (campo do cabecalho do frame) -> node_id.
     // O receptor precisa do node_id ANTES de decifrar, para derivar a chave.
     bool nodeIdForKeyId(uint8_t keyId, uint16_t* out) const {
@@ -496,6 +571,22 @@ public:
     }
 
     uint8_t enrollmentCount() const { return enrollCount_; }
+
+    // ---- Estado anti-replay por par (persistido no vault cifrado) ----
+    //
+    // get/put mexem apenas na RAM (espelho). A gravacao efetiva na flash
+    // acontece em save(), que o Node2 chama quando o epoch muda (urgente)
+    // ou periodicamente (HEF_PEER_STATE_FLUSH_MS).
+
+    bool getPeerState(uint16_t nodeId, uint16_t* epoch, uint32_t* counter) const {
+        return peerStates_.get(nodeId, epoch, counter);
+    }
+
+    bool putPeerState(uint16_t nodeId, uint16_t epoch, uint32_t counter) {
+        return peerStates_.put(nodeId, epoch, counter);
+    }
+
+    uint8_t peerStateCount() const { return peerStates_.count(); }
 
     // ---- Flags / estado ----
 
@@ -522,6 +613,9 @@ public:
         enrollCount_ = 0;
         flags_ = 0;
         memset(enroll_, 0, sizeof(enroll_));
+        // O estado anti-replay tambem e' apagado: um vault novo com pares
+        // novos nao pode herdar epoch/contador de pares antigos.
+        peerStates_.clear();
         memset(wifiSsid_, 0, sizeof(wifiSsid_));
         memset(wifiPass_, 0, sizeof(wifiPass_));
         memset(cliUser_, 0, sizeof(cliUser_));

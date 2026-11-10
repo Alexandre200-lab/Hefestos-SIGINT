@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# Hefestos SIGINT v5.0.0 - testes funcionais automatizados
+# Hefestos SIGINT v5.1.0 - testes funcionais automatizados
 #
 # Uso:
 #   ./test_functional.sh            # checagens estaticas + build dos 3 nos
@@ -10,6 +10,7 @@
 #   - pinagem duplicada / pinos proibidos no ESP32-C3
 #   - layout do cabecalho do protocolo LoRa
 #   - round-trip REAL do protocolo serial Node2<->Node3 (executado no host)
+#   - estado anti-replay persistido (replay pos-reboot bloqueado)
 #   - ausencia de Telnet, EEPROM e include relativo quebrado
 #   - anti-replay estrito (sem caminho de "resync")
 #   - TOTP realmente chamado no login
@@ -27,11 +28,11 @@ pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; FAILED=$((FAILED + 1)); }
 
 echo "====================================================="
-echo " Hefestos SIGINT v5.0.0 - testes funcionais"
+echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/7] Invariantes de pinagem"
+echo "[1/8] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -69,7 +70,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/7] Layout do protocolo LoRa"
+echo "[2/8] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -109,7 +110,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/7] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/8] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -140,7 +141,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/7] Ausencia de legado inseguro"
+echo "[4/8] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -155,7 +156,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/7] Anti-replay estrito e TOTP ativo"
+echo "[5/8] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -175,7 +176,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/7] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/8] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -190,7 +191,46 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/7] Build dos tres nos"
+echo "[7/8] Estado anti-replay persistido (replay pos-reboot)"
+REPLAY=0
+if command -v g++ >/dev/null 2>&1; then
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/anti_replay_persistence.cpp" -o /tmp/hef_replay_test 2>/tmp/hef_replay_cc.log; then
+        if /tmp/hef_replay_test > /tmp/hef_replay_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_replay_run.log | head -8
+            echo "  ... (ver /tmp/hef_replay_run.log para o restante)"
+            echo "  [PASS] estado anti-replay persistido (75 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_replay_run.log || true
+            echo "  [FAIL] estado anti-replay persistido"; REPLAY=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste anti-replay falhou:"
+        head -20 /tmp/hef_replay_cc.log
+        REPLAY=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (teste anti-replay nao executado)"
+fi
+# Checagens estruturais: o estado anti-replay PRECISA ser persistido no
+# vault cifrado e PRECISA ser reidratado no boot do receptor.
+if grep -q "HEF_TLV_PEER_STATE" "$ROOT/lib/src/config.h" &&
+   grep -q "putPeerState" "$ROOT/lib/src/config.h"; then
+    echo "  [PASS] estado anti-replay gravado no vault cifrado (TLV 0x0A)"
+else
+    echo "  [FAIL] estado anti-replay nao e' persistido no vault"; REPLAY=1
+fi
+if grep -q "restorePeerStates" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino" &&
+   grep -q "hydrate" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
+    echo "  [PASS] receptor rehidrata o estado anti-replay no boot"
+else
+    echo "  [FAIL] receptor nao rehidrata o estado anti-replay"; REPLAY=1
+fi
+[ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[8/8] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

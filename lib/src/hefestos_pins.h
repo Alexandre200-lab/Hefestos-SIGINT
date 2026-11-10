@@ -15,9 +15,9 @@
 // FIRMWARE
 // ============================================================
 #define HEF_FW_VERSION_MAJOR 5
-#define HEF_FW_VERSION_MINOR 0
+#define HEF_FW_VERSION_MINOR 1
 #define HEF_FW_VERSION_PATCH 0
-#define HEF_FW_VERSION_STR "5.0.0"
+#define HEF_FW_VERSION_STR "5.1.0"
 
 // ============================================================
 // Node 1 - Transmissor / Alvo (ESP32-WROOM-32)
@@ -84,6 +84,13 @@
 #define HEF_MAX_PAYLOAD       200
 #define HEF_MAX_FRAME         (HEF_HEADER_LEN + HEF_MAX_PAYLOAD + HEF_TAG_LEN)
 #define HEF_COUNTER_WINDOW    1024    // bits do bitmap anti-replay
+// Salto maximo aceito do contador dentro da MESMA epoch.
+// O bitmap de 1024 bits serve para CONTAR pacotes perdidos (diagnostico),
+// nao para rejeitar: uma queda de link longa produz um salto maior que a
+// janela e ainda e' um frame legitimo. Acima deste limite o frame e'
+// rejeitado (falha fechada) e o enlace so ressincroniza com um epoch novo
+// (o emissor reiniciado).
+#define HEF_COUNTER_MAX_GAP   65536UL
 
 // ============================================================
 // LORA
@@ -139,9 +146,27 @@
 #define HEF_NVS_KEY_NODE    "nodeid"
 #define HEF_VAULT_MAGIC     0x48464643   // "HFFC"
 #define HEF_VAULT_VERSION   5
+#define HEF_VAULT_BUF       512         // tamanho maximo do blob NVS
+#define HEF_VAULT_HEADER_LEN 36         // magic+version+flags+len+iv+reservado
 #define HEF_MAX_ENROLLMENTS 8
 #define HEF_TOTP_SECRET_MAX 32
 #define HEF_KEY_ID_MAX      255
+
+// Capacidade do plaintext do vault (TLV) = blob - header - tag GCM.
+// O vault falha FECHADO quando o conteudo nao cabe: descartar uma entrada
+// em silencio seria uma falha de seguranca (o par perderia o epoch
+// persistido e o replay pos-reboot voltaria a ser aceito).
+#define HEF_VAULT_MAX_PLAIN (HEF_VAULT_BUF - HEF_VAULT_HEADER_LEN - HEF_TAG_LEN)
+
+// Persistencia do estado anti-replay por par (epoch + high-water).
+// Mudanca de epoch e' persistida IMEDIATAMENTE (e' o que fecha o replay
+// pos-reboot do receptor). O contador high-water e' persistido no maximo
+// a cada HEF_PEER_STATE_FLUSH_MS: 60 s => 1440 escritas/dia no NVS
+// (~6 anos de endurance com o wear-leveling do NVS do ESP32).
+// O intervalo e' o limite do risco residual: apos um reinicio, um replay
+// de frame do MESMO epoch com contador ate HEF_PEER_STATE_FLUSH_MS atras
+// ainda pode ser aceito. Replay de epoch ANTERIOR e' sempre rejeitado.
+#define HEF_PEER_STATE_FLUSH_MS 60000UL
 
 // ============================================================
 // LOG FORENSE (Node3)

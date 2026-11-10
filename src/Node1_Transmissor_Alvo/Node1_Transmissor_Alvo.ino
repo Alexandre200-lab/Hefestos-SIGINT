@@ -370,7 +370,7 @@ void setup() {
     Serial.begin(115200);
     dbg.begin(115200);
 
-    dbg.log("Node1 v5.0.0: inicializando");
+    dbg.log("Node1 v5.1.0: inicializando");
 
     // GPS em UART2 (UART0 fica reservado ao console)
     gpsSerial.begin(9600, SERIAL_8N1, N1_GPS_RX, N1_GPS_TX);
@@ -405,7 +405,7 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================================");
-    Serial.println(" HEFESTOS SIGINT v5.0.0 - NODE 1 (EMISSOR)");
+    Serial.println(" HEFESTOS SIGINT v5.1.0 - NODE 1 (EMISSOR)");
     Serial.println("=================================================");
     Serial.printf("node_id: %u\n", nodeId);
     Serial.printf("chave de link: %s\n", keyReady ? "OK" : "AUSENTE - defina o PSK ('psk <64 hex>')");

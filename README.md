@@ -1,4 +1,4 @@
-# Hefestos SIGINT — v5.0.0
+# Hefestos SIGINT — v5.1.0
 
 Sistema de rastreamento e monitoramento de espectro em três nós ESP32, com link
 LoRa autenticado (AES-256-GCM), base com dashboard HTTP autenticado (senha + TOTP)
@@ -11,6 +11,23 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 > autorização é ilegal na maioria das jurisdições. O operador é o único
 > responsável pelo uso e pelas licenças (ex.: Anatel no Brasil, FCC nos EUA).
 > Use apenas em equipamentos e frequências que você está autorizado a operar.
+
+---
+
+## 0. v5.1.0 — estado anti-replay sobrevivente a reinício
+
+O primeiro item do plano de escala militar: **o anti-replay agora sobrevive a
+um reinício do receptor**.
+
+| | v5.0.0 | v5.1.0 |
+|---|---|---|
+| Estado anti-replay | só em RAM | **persistido no vault cifrado** (TLV `0x0A`) |
+| Frame capturado, replay após reinício | **aceito** | **rejeitado** (`REPLAY` / `STALE_EPOCH`) |
+| Queda longa de link | enlace morria (`FAR`) | reancora o high-water |
+| Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
+| Testes | 7 grupos | 8 grupos (+75 verificações no host) |
+
+Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510).
 
 ---
 
@@ -200,12 +217,59 @@ Formato (big-endian), 15 bytes de cabeçalho + payload + tag:
 `RxSequence` por par `(node_id)`:
 
 - `counter <= maior_visto` → `REPLAY` (sempre rejeitado).
-- `counter > maior + 1024` → `FAR` (rejeitado).
+- `counter > maior + 65536` → `FAR` (rejeitado, falha fechada).
 - `epoch` anterior → `STALE_EPOCH` (rejeitado).
 - `epoch` novo → nova sessão do emissor, janela reiniciada.
 
-A janela de 1024 bits serve apenas para **contar lacunas** (diagnóstico), nunca
-para aceitar pacotes atrasados.
+A janela de 1024 bits (`HEF_COUNTER_WINDOW`) serve apenas para **contar
+lacunas** (diagnóstico), nunca para aceitar pacotes atrasados. Saltos maiores
+que a janela, mas menores que `HEF_COUNTER_MAX_GAP` (65536), reancoram o
+high-water: são frames legítimos de um enlace que ficou horas sem receptionar.
+Acima de `HEF_COUNTER_MAX_GAP` o frame é rejeitado e o enlace só ressincroniza
+com um `epoch` novo (emissor reiniciado).
+
+#### 3.5.1 Estado persistido (replay pós-reboot) — v5.1.0
+
+Até a v5.0.0 o estado anti-replay vivia **apenas em RAM**. Um frame capturado
+por SDR — com tag GCM legítima, portanto criptograficamente autenticado — era
+**aceito como frame novo** depois que o receptor reiniciava, porque o par
+recomeçava sem `epoch`/contador. O replay passava por todas as verificações.
+
+Agora o Node 2 persiste o estado por par no **vault cifrado** (TLV
+`HEF_TLV_PEER_STATE`, `0x0A`):
+
+| campo | tam | descrição |
+|---|---:|---|
+| `node_id` | u16 LE | par |
+| `epoch` | u16 LE | sessão conhecida do emissor |
+| `counter` | u32 LE | high-water aceito |
+
+No boot, `restorePeerStates()` reconstrói os pares a partir dos enrollments
+persistidos (a chave de cada par é derivada de forma determinística do PSK de
+deploy + `node_id`) e hidrata o estado com `RxSequence::hydrate()`. Resultado:
+
+- frame capturado **do epoch anterior** → `STALE_EPOCH` (rejeitado);
+- frame capturado **do epoch atual** → `REPLAY` (rejeitado).
+
+**Política de gravação:**
+
+| evento | gravação |
+|---|---|
+| epoch novo (emissor reiniciou) ou primeiro contato | **imediata** |
+| contador avançou | a cada `HEF_PEER_STATE_FLUSH_MS` (60 s) |
+
+O intervalo de 60 s é o **limite do risco residual**: após um reinício, um
+replay de frame do *mesmo* epoch com contador até 60 s atrás ainda pode ser
+aceito. Replay de epoch anterior é sempre rejeitado. O custo é de ~1440
+escritas/dia no NVS (~6 anos de endurance com o wear-leveling do ESP32).
+
+Indicadores no console e em `/api/peers`: `stale_epoch` (replays pós-reboot
+bloqueados) e `resyncs` (reancoragens por salto grande — evento de segurança
+relevante, pode indicar captura/replay de frame distante).
+
+> **Migração de um vault v5.0.0:** pares enrolled sem estado persistido são
+> aceitos por TOFU no primeiro frame válido e passam a ser persistidos. A
+> partir daí a proteção é integral.
 
 ### 3.6 Autenticação HTTP
 
@@ -326,6 +390,7 @@ lib/                     biblioteca compartilhada (Arduino library)
     spectrum.h           varredura não-bloqueante
     jamming_detector.h   detecção real de interferência
     field_log.h          log forense com hash chain
+    peer_state.h         estado anti-replay persistido por par
     totp_auth.h          TOTP RFC 6238
     rate_limiter.h       token buckets por IP
     debug.h              logging sem vazamento de segredos
@@ -334,10 +399,12 @@ src/
   Node2_Base_Hefestos/
   Node3_Caixa_Preta_ESP32C3/
 tests/
-  serial_roundtrip.cpp    teste de round-trip do protocolo serial (host)
-  stub/HardwareSerial.h   stub Arduino mínimo para compilar no host
+  framework.h           micro-framework de teste no host
+  serial_roundtrip.cpp  teste de round-trip do protocolo serial (host)
+  anti_replay_persistence.cpp  estado anti-replay persistido (host)
+  stub/HardwareSerial.h stub Arduino mínimo para compilar no host
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + build
+test_functional.sh       invariantes + round-trip + anti-replay + build
 ```
 
 ---
@@ -491,7 +558,7 @@ não de contadores que nunca eram atualizados.
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (7 grupos):
+Cobertura (8 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -502,11 +569,19 @@ Cobertura (7 grupos):
 4. ausência de Telnet/EEPROM/include relativo;
 5. anti-replay estrito e TOTP verificado no login;
 6. dashboard sem injeção de HTML e ausência de chaves hardcoded;
-7. build dos três nós.
+7. **estado anti-replay persistido** (`tests/anti_replay_persistence.cpp`,
+   75 verificações no host): serialização do estado por par, reidratação,
+   rejeição de epoch anterior, rejeição de contador repetido, salto acima do
+   limite, e o cenário crítico de replay de frame capturado após reinício do
+   receptor — com um bloco que demonstra explicitamente que **sem** a
+   reidratação o mesmo frame seria aceito (a vulnerabilidade da v5.0.0);
+8. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
-compilava e o link Node2↔Node3 simplesmente nunca funcionava em campo.
+compilava e o link Node2↔Node3 simplesmente nunca funcionava em campo. O
+teste de anti-replay existe pelo mesmo motivo: a falha era **silenciosa** e
+só apareceu em análise do modelo de ameaça, não em nenhum teste.
 
 ---
 
@@ -569,6 +644,17 @@ Consequências práticas:
   irreversível).
 - O SoftAP deriva a senha do MAC do chip. Quem tiver acesso físico ao console
   serial vê a senha — trate o console como interface privilegiada.
+- **Janela residual de replay intra-epoch:** o high-water do contador é
+  persistido a cada 60 s. Um reinício dentro dessa janela permite que um frame
+  capturado do *mesmo* epoch, com contador até 60 s atrás, seja aceito. Epoch
+  anterior é sempre rejeitado. Reduzir `HEF_PEER_STATE_FLUSH_MS` estreita a
+  janela ao custo de desgaste de flash (ver §3.5.1).
+- **Epoch de 16 bits:** o emissor sorteia um epoch novo por boot. Após ~65 536
+  boots o epoch pode dar a volta (aritmética de número de série). Migrar para
+  epoch de 32 bits na v6.
+- **Duty cycle do link ainda é inviável na taxa atual** (`LORA_SF 10`,
+  `GPS_POLL_INTERVAL_MS 1000`): o tempo no ar exige ~757% de duty cycle. A
+  correção de SF/intervalo é o próximo item do plano de escala.
 
 ---
 

@@ -383,7 +383,7 @@ static void handleConsole(char* line) {
 void setup() {
     Serial.begin(115200);
     dbg.begin(115200);
-    dbg.log("Node3 v5.0.0: inicializando");
+    dbg.log("Node3 v5.1.0: inicializando");
 
     ledInit();
     buzzerInit();
@@ -407,7 +407,7 @@ void setup() {
 
     Serial.println();
     Serial.println("=================================================");
-    Serial.println(" HEFESTOS SIGINT v5.0.0 - NODE 3 (CAIXA PRETA)");
+    Serial.println(" HEFESTOS SIGINT v5.1.0 - NODE 3 (CAIXA PRETA)");
     Serial.println("=================================================");
     Serial.printf("node_id: %u\n", nodeId);
     Serial.printf("SD: %s | log: %s | registros: %u\n",

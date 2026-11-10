@@ -1,5 +1,64 @@
 # CHANGELOG — Hefestos SIGINT
 
+## v5.1.0 — 2026-11-10
+
+### Adicionado
+
+- **Estado anti-replay persistido por par (fecha a vulnerabilidade de replay
+  pós-reboot).** O estado (`epoch` + high-water do contador) vivia apenas em
+  RAM: um frame capturado por SDR — com tag GCM legítima, portanto
+  criptograficamente autenticado — era **aceito como frame novo** depois que
+  o receptor reiniciava, porque o par recomeçava sem `epoch`/contador.
+  - `lib/src/peer_state.h` (novo): `PeerStateStore` (formato serializado
+    little-endian, 8 bytes por par) e `PeerReplayGuard` (estado em RAM +
+    sinalização de persistência urgente).
+  - `lib/src/config.h`: novo TLV `HEF_TLV_PEER_STATE` (`0x0A`) no vault
+    cifrado, com `getPeerState()` / `putPeerState()` / `getEnrollment()`.
+  - `lib/src/secure_protocol.h`: `RxSequence::hydrate()` e `exportState()`.
+  - `src/Node2_Base_Hefestos`: `restorePeerStates()` reidrata os pares
+    conhecidos no boot; gravação **imediata** quando o epoch muda e flush
+    periódico a cada `HEF_PEER_STATE_FLUSH_MS` (60 s) para o contador.
+  - `tests/anti_replay_persistence.cpp` (novo, host): 75 verificações,
+    incluindo o cenário crítico de replay após reinício simulado e um bloco
+    que demonstra que **sem** a reidratação o mesmo frame seria aceito.
+  - `tests/framework.h` (novo): micro-framework de teste reutilizável no host.
+  - Indicadores novos em `/api/peers` e no console: `stale_epoch`, `resyncs`,
+    `epoch`, `counter`, `state_persisted`.
+
+### Corrigido
+
+- **Enlace morria após uma queda longa de link.** O salto do contador dentro
+  da mesma epoch era comparado com a janela de bits (1024) e rejeitado como
+  `FAR` — sem caminho de recuperação. Agora a janela de bits serve apenas
+  para contar lacunas e existe um segundo limite (`HEF_COUNTER_MAX_GAP`,
+  65536): saltos maiores que a janela reancoram o high-water (frame legítimo
+  de um enlace que ficou horas sem réceptionar); acima do limite máximo o
+  frame é rejeitado (falha fechada) e o enlace só ressincroniza com um epoch
+  novo.
+- **Vault: falha fechada em vez de descarte silencioso.** `tlvAppend()`
+  devolvia o mesmo `pos` quando o espaço acabava, descartando a entrada
+  silenciosamente. Para o estado anti-replay isso seria uma falha de
+  segurança (o par perderia o epoch persistido). Agora `save()` e
+  `setSecret()` calculam o tamanho antes de escrever e **recusam** a gravação
+  se não couber. O limite `HEF_VAULT_MAX_PLAIN` (blob − header − tag GCM)
+  passa a ser a referência única, e um teste de host prova que o pior caso
+  (todos os campos no máximo + 8 pares) cabe.
+- **Vault: o estado anti-replay não regride ao rodar `setSecret()`.**
+  `setSecret()` reescreve o TLV a partir do plaintext gravado, que pode estar
+  mais velho que o espelho em RAM; agora a entrada `HEF_TLV_PEER_STATE` é
+  sempre reescrita a partir do espelho em RAM (a versão mais recente).
+- `save()` verifica o retorno da escrita na NVS (`putBytes`).
+
+### Documentado
+
+- README §3.5.1: estado anti-replay persistido, política de gravação, janela
+  residual de 60 s, indicador de migração de vault v5.0.0 e limites do epoch
+  de 16 bits.
+- README §14: limitações conhecidas atualizadas (janela residual de replay,
+  epoch de 16 bits, duty cycle ainda inviável).
+
+---
+
 ## v5.0.0 — 2026-11-10
 
 Reescrita completa a partir da v4.1. A v4.1 **não compilava** e anunciava
