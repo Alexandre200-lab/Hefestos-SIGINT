@@ -6,8 +6,8 @@
 //   - Constantes do protocolo de link LoRa
 //   - Limites operacionais (sessoes, filas, buffers)
 //
-// QUALQUER alteracao de pin aqui DEVE ser refletida em README.md (tabela de
-// pinagem) e em OPERATION_MANUAL.md (secoes de hardware).
+// QUALQUER alteracao de pin aqui DEVE ser refletida no README.md
+// (secao 5 - Hardware e pinagem).
 #ifndef HEFESTOS_PINS_H
 #define HEFESTOS_PINS_H
 
