@@ -56,6 +56,9 @@
 #include <reset_tracker.h>
 #include <watchdog.h>
 #include <watchdog_policy.h>
+#include <time_source.h>
+#include <rtc_pcf8563.h>
+#include <esp_sntp.h>
 
 // =====================================================================
 // Objetos globais
@@ -84,7 +87,6 @@ static RateLimiter cmdLimiter(RATE_CMD_BUCKET, RATE_CMD_WINDOW_MS, RATE_CMD_COOL
 
 static uint16_t nodeId = 0;
 static bool     keyReady = false;
-static bool     clockSynced = false;
 static bool     autoSweep = false;
 
 // =====================================================================
@@ -165,6 +167,174 @@ static LoginFail loginFails[8];
 // dos structs e o build quebraria.
 static const HefBandProfile* band = HefBandPlan::active();
 static HefDutyGuard dutyGuard;
+
+// =====================================================================
+// Origem do tempo (v5.1.0, item 1.5)
+// =====================================================================
+// Precedencia (item 1.5 do plano):
+//   1. RTC externo PCF8563 (I2C 0x51) — sobrevive a falta de energia
+//   2. SNTP (STA com internet) — precisa de rede, mas e' UTC de
+//      referencia
+//   3. Holdover da NVS — ultima hora valida persistida; se a idade
+//      assumida exceder o limite, o TOTP e' recusado (fail closed)
+//   4. GNSS (ja existia) — epochUtc do frame de tracking
+//
+// A decisao sobre "a hora e' valida?" sai do modulo puro
+// `time_source.h`. Aqui ficam apenas as fontes (I2C, SNTP, NVS).
+static HefTimeSource timeSource;
+static Preferences   timePrefs;
+static bool          rtcPresent = false;
+static uint32_t      lastRtcReadMs = 0;
+static uint32_t      lastTimePersistMs = 0;
+
+// Namespace/chave NVS do holdover de tempo.
+#ifndef HEF_NVS_NAMESPACE_TIME
+#define HEF_NVS_NAMESPACE_TIME "heftime"
+#endif
+#ifndef HEF_NVS_KEY_HOLDOVER
+#define HEF_NVS_KEY_HOLDOVER "holdover"
+#endif
+
+// Leitura periodica do RTC (60 s). A cada leitura o relogio do sistema
+// e' resincronizado com o UTC do chip — que e' mais estavel que o
+// cristal do ESP32.
+#ifndef HEF_TIME_RTC_POLL_MS
+#define HEF_TIME_RTC_POLL_MS 60000UL
+#endif
+
+// Persistencia do holdover (5 min). O holdover e' o que permite ao
+// dispositivo manter uma hora "boa o suficiente" apos um reinicio sem
+// GNSS e sem rede.
+#ifndef HEF_TIME_HOLDOVER_FLUSH_MS
+#define HEF_TIME_HOLDOVER_FLUSH_MS 300000UL
+#endif
+
+// Downtime maximo assumido apos um power cycle sem RTC.
+// A hora estimada NAO recebe salto artificial, mas a IDADE reportada e'
+// conservadora: `valid()` expira mais cedo do que o necessario, nunca
+// mais tarde. Ver README 9.8.5.
+#ifndef HEF_TIME_MAX_DOWNTIME_S
+#define HEF_TIME_MAX_DOWNTIME_S 900UL
+#endif
+
+// Idade maxima do holdover em runtime (12 h). Depois disso o TOTP e'
+// recusado (fail closed).
+#ifndef HEF_TIME_MAX_AGE_S
+#define HEF_TIME_MAX_AGE_S 43200UL
+#endif
+
+// Limite da deriva estimada (ppm).
+#ifndef HEF_TIME_MAX_DRIFT_PPM
+#define HEF_TIME_MAX_DRIFT_PPM 500
+#endif
+
+static void persistTimeHoldover() {
+    if (!timeSource.haveSync()) return;
+    if (!timeSource.valid(nowMs())) return;
+    uint8_t blob[HEF_TIME_BLOB_LEN];
+    timeSource.exportBlob(blob, sizeof(blob));
+    timePrefs.putBytes(HEF_NVS_KEY_HOLDOVER, blob, sizeof(blob));
+    lastTimePersistMs = nowMs();
+}
+
+static bool loadTimeHoldover() {
+    timePrefs.begin(HEF_NVS_NAMESPACE_TIME, false);
+    uint8_t blob[HEF_TIME_BLOB_LEN];
+    size_t n = timePrefs.getBytes(HEF_NVS_KEY_HOLDOVER, blob, sizeof(blob));
+    if (n < HEF_TIME_BLOB_LEN) return false;
+    return timeSource.importBlob(blob, sizeof(blob));
+}
+
+static bool i2cDevicePresent(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+
+static bool readRtcPcf8563(uint32_t* outUtc) {
+    if (!outUtc) return false;
+    if (!i2cDevicePresent(HEF_PCF8563_I2C_ADDR)) return false;
+
+    Wire.beginTransmission(HEF_PCF8563_I2C_ADDR);
+    Wire.write((uint8_t)HEF_PCF8563_REG_TIME);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    uint8_t regs[HEF_PCF8563_TIME_REGS];
+    size_t got = Wire.requestFrom((uint8_t)HEF_PCF8563_I2C_ADDR,
+                                  (uint8_t)HEF_PCF8563_TIME_REGS);
+    if (got != HEF_PCF8563_TIME_REGS) return false;
+    for (int i = 0; i < HEF_PCF8563_TIME_REGS; i++) {
+        regs[i] = Wire.read();
+    }
+    return hefPcf8563ToUnix(regs, outUtc);
+}
+
+static bool writeRtcPcf8563(uint32_t utc) {
+    if (!i2cDevicePresent(HEF_PCF8563_I2C_ADDR)) return false;
+
+    // Garante que o contador esta rodando em modo 24 h.
+    Wire.beginTransmission(HEF_PCF8563_I2C_ADDR);
+    Wire.write((uint8_t)HEF_PCF8563_REG_CTRL1);
+    Wire.write(hefPcf8563Ctrl1Start());
+    if (Wire.endTransmission() != 0) return false;
+
+    uint8_t regs[HEF_PCF8563_TIME_REGS];
+    if (!hefUnixToPcf8563(utc, regs)) return false;
+
+    Wire.beginTransmission(HEF_PCF8563_I2C_ADDR);
+    Wire.write((uint8_t)HEF_PCF8563_REG_TIME);
+    Wire.write(regs, HEF_PCF8563_TIME_REGS);
+    if (Wire.endTransmission() != 0) return false;
+
+    // Read-back: um RTC que aceitou a escrita mas devolve outra coisa
+    // (I2C ruidoso, chip travado, outro dispositivo no endereco)
+    // nao pode ser considerado confiavel.
+    Wire.beginTransmission(HEF_PCF8563_I2C_ADDR);
+    Wire.write((uint8_t)HEF_PCF8563_REG_TIME);
+    if (Wire.endTransmission(false) != 0) return false;
+    uint8_t rb[HEF_PCF8563_TIME_REGS];
+    size_t got = Wire.requestFrom((uint8_t)HEF_PCF8563_I2C_ADDR,
+                                  (uint8_t)HEF_PCF8563_TIME_REGS);
+    if (got != HEF_PCF8563_TIME_REGS) return false;
+    for (int i = 0; i < HEF_PCF8563_TIME_REGS; i++) rb[i] = Wire.read();
+    return hefPcf8563ReadMatches(regs, rb);
+}
+
+static void syncSystemClock(uint32_t utc, uint8_t source) {
+    if (utc <= 1704067200UL) return;
+    struct timeval tv;
+    tv.tv_sec  = (time_t)utc;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    timeSource.sync(source, utc, nowMs());
+}
+
+static void trySyncFromRtc(bool logOk) {
+    uint32_t utc = 0;
+    if (!readRtcPcf8563(&utc)) return;
+    syncSystemClock(utc, HEF_TIME_RTC);
+    if (logOk) {
+        dbg.logf("Relogio sincronizado pelo RTC: utc=%u", utc);
+    }
+}
+
+static void onSntpSync(struct timeval* tv) {
+    if (!tv) return;
+    uint32_t utc = (uint32_t)tv->tv_sec;
+    if (utc <= 1704067200UL) return;
+    // SNTP ja ajustou o relogio do sistema; a abstracao precisa saber.
+    timeSource.sync(HEF_TIME_SNTP, utc, nowMs());
+    if (rtcPresent) writeRtcPcf8563(utc);
+    hefSendTimeToNode3(utc);
+}
+
+// Configura SNTP quando o Wi-Fi STA esta conectado. Em SoftAP nao ha
+// acesso a internet, entao o SNTP nao e' iniciado.
+static void startSntpIfSta() {
+    if (WiFi.getMode() != WIFI_MODE_STA &&
+        WiFi.getMode() != WIFI_MODE_APSTA) return;
+    sntp_set_time_sync_notification_cb(onSntpSync);
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.nist.gov");
+}
 
 // =====================================================================
 // Causa de reinicio e contadores de operacao (v5.1.0, item 1.4)
@@ -282,9 +452,16 @@ static HefLinkParams linkParams() {
 // =====================================================================
 static uint32_t nowMs() { return (uint32_t)millis(); }
 
-static uint32_t currentUtc() { return (uint32_t)time(nullptr); }
+// UTC corrente: preferir a abstracao da origem do tempo (item 1.5),
+// que considera idade, origem e holdover. Se ela nao tiver sync,
+// cai para o relogio do sistema.
+static uint32_t currentUtc() {
+    uint32_t ms = nowMs();
+    if (timeSource.haveSync()) return timeSource.utc(ms);
+    return (uint32_t)time(nullptr);
+}
 
-static bool timeLooksValid() { return TotpAuth::clockLooksValid(currentUtc()); }
+static bool timeLooksValid() { return timeSource.valid(nowMs()); }
 
 static void randomHex(char* out, size_t bytes) {
     uint8_t raw[32];
@@ -482,20 +659,29 @@ static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter,
 static void applyTrackTime(const HefTrack& t) {
     if (t.epochUtc < 1704067200UL) return;   // antes de 2024: invalido
 
-    time_t sysNow = time(nullptr);
-    long long delta = (long long)t.epochUtc - (long long)sysNow;
-    if (delta < 0) delta = -delta;
-    if (delta <= 2) { clockSynced = true; return; }
+    // A fonte de tempo decide se a sincronizacao e' util: ela mede a
+    // deriva do relogio local e so atualiza quando faz sentido.
+    uint32_t ms = nowMs();
+    uint32_t before = timeSource.utc(ms);
+    bool hadSync = timeSource.haveSync();
 
-    struct timeval tv;
-    tv.tv_sec  = (time_t)t.epochUtc;
-    tv.tv_usec = 0;
-    settimeofday(&tv, nullptr);
-    clockSynced = true;
-
-    // Propaga o tempo ao Node3 (log forense com UTC absoluto).
-    hefSendTimeToNode3(t.epochUtc);
-    dbg.logf("Relogio sincronizado pelo GNSS: utc=%u", t.epochUtc);
+    // Sincroniza o relogio do sistema e a abstracao.
+    // A abstracao aceita a hora do GNSS (referencia externa).
+    if (!hadSync || (t.epochUtc > before ? t.epochUtc - before : before - t.epochUtc) > 2) {
+        syncSystemClock(t.epochUtc, HEF_TIME_GNSS);
+        // Propaga o tempo ao Node3 (log forense com UTC absoluto).
+        hefSendTimeToNode3(t.epochUtc);
+        if (rtcPresent) {
+            // Mantem o RTC externo atualizado: ele e' o que sobrevive
+            // a um power cycle sem GNSS e sem rede.
+            writeRtcPcf8563(t.epochUtc);
+        }
+        dbg.logf("Relogio sincronizado pelo GNSS: utc=%u", t.epochUtc);
+    } else {
+        // Mesmo sem ajuste visivel, registra que a hora foi confirmada
+        // (renova a validade / a idade).
+        timeSource.sync(HEF_TIME_GNSS, t.epochUtc, ms);
+    }
 }
 
 static void forwardTrackToNode3(const PeerState* peer, const HefTrack& t,
@@ -938,6 +1124,7 @@ static bool startNetwork() {
         if (WiFi.status() == WL_CONNECTED) {
             Serial.print("WiFi STA conectado. IP: ");
             Serial.println(WiFi.localIP());
+            startSntpIfSta();
             return true;
         }
         Serial.println("WiFi STA falhou; caindo para SoftAP.");
@@ -988,8 +1175,15 @@ static String jsonStatus() {
     w["rssi"] = WiFi.RSSI();
 
     JsonObject t = doc.createNestedObject("time");
+    uint32_t ms = nowMs();
     t["utc"] = currentUtc();
-    t["synced"] = clockSynced && timeLooksValid();
+    t["valid"] = timeLooksValid();
+    t["source"] = hefTimeSourceName(timeSource.source());
+    t["age_s"] = timeSource.ageSeconds(ms);
+    t["drift_ppm"] = timeSource.driftPpm();
+    t["age_assumed"] = timeSource.ageIsAssumed();
+    t["assumed_downtime_s"] = timeSource.assumedDowntimeS();
+    t["rtc_present"] = rtcPresent;
 
     JsonObject l = doc.createNestedObject("lora");
     l["frames_ok"] = loraFramesOk;
@@ -1125,8 +1319,15 @@ static String jsonHealth() {
     doc["heap_min"] = ESP.getMinFreeHeap();
     doc["uptime_s"] = (uint32_t)(nowMs() / 1000UL);
     doc["node_id"] = nodeId;
-    doc["clock_utc"] = currentUtc();
-    doc["clock_valid"] = timeLooksValid();
+    JsonObject tm = doc.createNestedObject("time");
+    uint32_t ms = nowMs();
+    tm["utc"] = currentUtc();
+    tm["valid"] = timeLooksValid();
+    tm["source"] = hefTimeSourceName(timeSource.source());
+    tm["age_s"] = timeSource.ageSeconds(ms);
+    tm["drift_ppm"] = timeSource.driftPpm();
+    tm["age_assumed"] = timeSource.ageIsAssumed();
+    tm["rtc_present"] = rtcPresent;
     doc["enrollments"] = vault.enrollmentCount();
     doc["ser_crc_errors"] = serRx.crcErrors();
     doc["ser_overflows"] = serRx.overflows();
@@ -1334,7 +1535,7 @@ async function refresh(){
     kv('#status',[
       ['firmware',s.fw],['uptime',s.uptime_s+' s'],
       ['UTC',s.time.utc?(new Date(s.time.utc*1000).toISOString()):'-'],
-      ['relogio',s.time.synced?'sincronizado':'NAO sincronizado',s.time.synced?'ok':'bad'],
+      ['relogio',s.time.valid?(s.time.source+' ('+s.time.age_s+'s)'):'invalido',s.time.valid?'ok':'bad'],
       ['chave link',s.lora.key,s.lora.key==='ok'?'ok':'bad'],
       ['pares',s.lora.peers],['frames ok',s.lora.frames_ok],
       ['frames ruins',s.lora.frames_bad],['replays',s.lora.replays],['ACKs',s.lora.acks_sent],
@@ -1539,9 +1740,12 @@ static void handleConsole(char* line) {
     if (strncmp(line, "help", 4) == 0) {
         printHelp();
     } else if (strncmp(line, "status", 6) == 0) {
-        Serial.printf("node_id=%u chave=%s clock=%s\n", nodeId,
+        uint32_t ms = nowMs();
+        Serial.printf("node_id=%u chave=%s relogio=%s (%s, %us)\n", nodeId,
                       keyReady ? "ok" : "ausente",
-                      timeLooksValid() ? "ok" : "invalido");
+                      timeLooksValid() ? "ok" : "invalido",
+                      hefTimeSourceName(timeSource.source()),
+                      (unsigned)timeSource.ageSeconds(ms));
         Serial.printf("pares=%u frames_ok=%u ruins=%u replays=%u\n",
                       peerCount(), loraFramesOk, loraFramesBad, loraReplays);
         Serial.printf("Node3: ok=%u crc=%u drops=%u fila=%u\n",
@@ -1593,17 +1797,30 @@ static void handleConsole(char* line) {
         if (u < 1704067200UL) {
             Serial.println("ERRO: epoch invalido");
         } else {
-            struct timeval tv;
-            tv.tv_sec = (time_t)u;
-            tv.tv_usec = 0;
-            settimeofday(&tv, nullptr);
-            clockSynced = true;
+            syncSystemClock(u, HEF_TIME_MANUAL);
             hefSendTimeToNode3(u);
-            Serial.println("OK: relogio ajustado");
+            if (rtcPresent) {
+                if (writeRtcPcf8563(u)) {
+                    Serial.println("OK: relogio ajustado (RTC atualizado)");
+                } else {
+                    Serial.println("OK: relogio ajustado (RTC nao respondeu)");
+                }
+            } else {
+                Serial.println("OK: relogio ajustado");
+            }
         }
     } else if (strncmp(line, "time", 4) == 0) {
-        Serial.printf("UTC: %u (%s)\n", currentUtc(),
-                      timeLooksValid() ? "valido" : "invalido");
+        uint32_t ms = nowMs();
+        Serial.printf("UTC: %u (%s) | fonte=%s idade=%us deriva=%d ppm\n",
+                      currentUtc(),
+                      timeLooksValid() ? "valido" : "invalido",
+                      hefTimeSourceName(timeSource.source()),
+                      (unsigned)timeSource.ageSeconds(ms),
+                      (int)timeSource.driftPpm());
+        Serial.printf("RTC: %s | idade assumida: %s (%u s)\n",
+                      rtcPresent ? "presente" : "ausente",
+                      timeSource.ageIsAssumed() ? "sim" : "nao",
+                      (unsigned)timeSource.assumedDowntimeS());
     } else if (strncmp(line, "enroll ", 7) == 0) {
         char* sp = strchr(line + 7, ' ');
         if (!sp) {
@@ -1758,12 +1975,47 @@ void setup() {
     nodeId = vault.nodeId();
     keyReady = (vault.getPsk() != nullptr);
 
+    // --- Origem do tempo (v5.1.0, item 1.5) ---
+    // A abstracao e' configurada ANTES de qualquer fonte: ela decide
+    // se o holdover importado da NVS ainda e' valido (e marca a idade
+    // como assumida, porque o downtime real e' desconhecido).
+    timeSource.configure(HEF_TIME_MAX_AGE_S, HEF_TIME_MAX_DOWNTIME_S,
+                         HEF_TIME_MAX_DRIFT_PPM);
+    if (loadTimeHoldover()) {
+        Serial.printf("Holdover de tempo: %s (%us, assumido=%s)\n",
+                      hefTimeSourceName(timeSource.source()),
+                      (unsigned)timeSource.ageSeconds(nowMs()),
+                      timeSource.ageIsAssumed() ? "sim" : "nao");
+    }
+
     // Reidrata o estado anti-replay dos pares conhecidos (fecha o replay
     // pos-reboot: um frame capturado antes de um reinicio e' rejeitado).
     restorePeerStates();
 
     ensureCredentials();
     setupRadio();
+
+    // RTC externo PCF8563 (I2C 0x51) — preferencia 1 do plano.
+    // O barramento I2C ja foi inicializado em setupRadio() (SDA=21,
+    // SCL=22). O Si4735 esta em 0x11; a lib PU2CLR nao varre o
+    // barramento, entao o PCF8563 em 0x51 e' seguro.
+    rtcPresent = i2cDevicePresent(HEF_PCF8563_I2C_ADDR);
+    if (rtcPresent) {
+        uint32_t rtcUtc = 0;
+        if (readRtcPcf8563(&rtcUtc)) {
+            syncSystemClock(rtcUtc, HEF_TIME_RTC);
+            Serial.printf("RTC PCF8563: presente (utc=%u)\n", rtcUtc);
+        } else {
+            // O chip respondeu no barramento, mas a hora e' inconfiavel
+            // (OSF ligado, data invalida, etc.). Continua marcado como
+            // presente: uma sincronizacao posterior (GNSS/SNTP/manual)
+            // vai atualiza-lo.
+            Serial.println("RTC PCF8563: presente, hora inconfiavel");
+        }
+    } else {
+        Serial.println("RTC PCF8563: ausente");
+    }
+
     setupLoRa();
     startNetwork();
 
@@ -1908,6 +2160,21 @@ void loop() {
     if (now - lastResetFlush >= HEF_RESET_FLUSH_MS) {
         lastResetFlush = now;
         if (resetTracker.shouldPersistNow()) persistResetState();
+    }
+
+    // --- RTC externo (item 1.5) ---
+    // Leitura periodica: o RTC e' mais estavel que o cristal do ESP32,
+    // entao resincronizar periodicamente reduz a deriva acumulada.
+    if (rtcPresent && (now - lastRtcReadMs >= HEF_TIME_RTC_POLL_MS)) {
+        lastRtcReadMs = now;
+        trySyncFromRtc(false);
+    }
+
+    // --- Holdover de tempo (item 1.5) ---
+    // Persiste a ultima hora valida para que ela sobreviva a um
+    // reinicio sem GNSS e sem rede.
+    if (now - lastTimePersistMs >= HEF_TIME_HOLDOVER_FLUSH_MS) {
+        persistTimeHoldover();
     }
 
     // --- Watchdog de memoria (reinicio controlado se o heap colapsar) ---

@@ -16,7 +16,7 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 
 ## 0. v5.1.0 — anti-replay sobrevivente a reinício + RF viável
 
-Os primeiros quatro itens do plano de escala militar:
+Os primeiros cinco itens do plano de escala militar:
 
 1. **O anti-replay agora sobrevive a um reinício do receptor** (item 1.1) —
    um frame capturado por SDR não é mais aceito como frame novo depois que
@@ -28,6 +28,9 @@ Os primeiros quatro itens do plano de escala militar:
 4. **O dispositivo sabe por que reiniciou** (item 1.4) — contadores de
    brownout/WDT/panic persistidos, watchdog de tarefa sobre o loop
    principal, e reinício controlado com o motivo registrado.
+5. **O tempo sobrevive a falhas de GNSS e rede** (item 1.5) — RTC externo
+   PCF8563, SNTP, holdover NVS com idade assumida e modelo de deriva, para
+   que o TOTP continue funcionando sem GNSS.
 
 > Os percentuais de duty cycle desta tabela mantêm o ACK atual (33 B) nos
 > dois lados, para isolar o efeito da mudança de SF e de intervalo. O
@@ -48,13 +51,16 @@ Os primeiros quatro itens do plano de escala militar:
 | Causa do reinício | **não registrada** (indistinguível de um brownout) | **contadores NVS: boots/brownouts/wdt/sw/panic** |
 | Watchdog do loop principal | **inexistente** (travamento silencioso) | **TWDT de 30 s + progresso nas operações longas** |
 | Reinício por comando | `ESP.restart()` cru (reinício cego) | **`hefRestart()` grava a intenção antes de sair** |
+| Tempo sem GNSS/rede após reinício | **relógio volta a 1970, TOTP recusado** | **RTC PCF8563 / SNTP / holdover NVS com idade assumida** |
+| Validação do tempo | binária ("passou de 2024?") | **origem, idade e modelo de deriva** |
 | Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
-| Testes | 7 grupos | 11 grupos (548 verificações no host; +515 sobre a v5.0.0) |
+| Testes | 7 grupos | 12 grupos (937 verificações no host; +904 sobre a v5.0.0) |
 
 Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510),
 [§9.5](#95-orçamento-de-rf-e-conformidade-regulatória),
-[§9.6](#96-política-de-tx-adaptativa-node-1) e
-[§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
+[§9.6](#96-política-de-tx-adaptativa-node-1),
+[§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510) e
+[§9.8](#98-origem-do-tempo-e-holdover-node-2--v510).
 
 ---
 
@@ -460,6 +466,8 @@ lib/                     biblioteca compartilhada (Arduino library)
     reset_tracker.h      causa de reinício e contadores de operação
     watchdog_policy.h    política do watchdog (puro, testável no host)
     watchdog.h           ligação do watchdog com o ESP-IDF
+    time_source.h        abstração da origem do tempo (origem, idade, deriva, holdover)
+    rtc_pcf8563.h        codec puro dos registros BCD do RTC PCF8563
     totp_auth.h          TOTP RFC 6238
     rate_limiter.h       token buckets por IP
     debug.h              logging sem vazamento de segredos
@@ -475,11 +483,13 @@ tests/
   tx_policy.cpp         política de TX adaptativa e beacon FM (host)
   reset_tracker.cpp     causa de reinício e contadores (host)
   watchdog_policy.cpp   política do watchdog (host)
+  time_source.cpp       abstração da origem do tempo (host)
+  rtc_pcf8563.cpp       codec do RTC PCF8563 (host)
   stub/HardwareSerial.h stub Arduino mínimo para compilar no host
 tools/
   airtime.py            CLI de cálculo de RF (airtime/duty/energia) + --selftest
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + WDT + build
+test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + WDT + tempo/RTC + build
 ```
 
 ---
@@ -580,6 +590,10 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 >
 > `resets` (Node 2 e Node 3) imprime a causa do boot e os contadores de
 > reinício — ver [§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
+>
+> `time` (Node 2) imprime o UTC, a fonte, a idade e a deriva do relógio;
+> `settime <unix>` ajusta manualmente e atualiza o RTC externo quando
+> presente — ver [§9.8](#98-origem-do-tempo-e-holdover-node-2--v510).
 
 **Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
 `time <unix>`, `format`, `resets`, `reboot`.
@@ -1050,6 +1064,129 @@ Os testes 7 e 8 são o par que valida a propriedade central do item 1.4:
 
 ---
 
+### 9.8 Origem do tempo e holdover (Node 2) — v5.1.0
+
+#### 9.8.1 O que estava errado
+
+Na v5.0.0 o Node 2 só sabia se o relógio era "válido" de forma **binária**
+(`timeLooksValid`: "passou de 2024?"). Não havia noção de idade, nem de
+origem, nem de deriva.
+
+Consequências:
+
+- **Reinício sem GNSS/rede**: o relógio voltava para 1970 e o TOTP era
+  recusado até o próximo frame com GNSS — mesmo que o aparelho tivesse
+  ficado desligado por poucos minutos.
+- **Relógio parado**: sem qualquer fonte, um relógio "válido" continuava
+  sendo aceito indefinidamente, porque a validade era apenas "o ano > 2024?".
+- **Sem visibilidade**: o operador não sabia há quanto tempo a hora tinha
+  sido confirmada.
+
+#### 9.8.2 Precedência das fontes
+
+| prioridade | fonte | quando está disponível | persiste a falta de energia? |
+|---|---|---|---|
+| 1 | **RTC externo PCF8563** (I2C `0x51`) | sempre que o chip responder | **sim** (com supercap/bateria) |
+| 2 | **SNTP** | em modo STA com internet | não |
+| 3 | **Holdover NVS** | após reinício, se havia hora válida | sim (NVS) |
+| 4 | **GNSS** | quando um frame do Node 1 traz `epochUtc` válido | não |
+| — | **Manual** (`settime`) | operador no console | não (mas atualiza o RTC e o holdover) |
+
+O GNSS continua sendo a fonte primária em campo (o Node 1 envia a hora no
+frame de tracking). O RTC é o que **sobrevive a um power cycle** sem GNSS e
+sem rede — é ele que fecha o critério de aceite do item 1.5.
+
+#### 9.8.3 Abstração (`lib/src/time_source.h`)
+
+O módulo puro (testável no host) expõe:
+
+- `valid(nowMs)` — a hora pode ser usada (inclusive pelo TOTP)? *Fail
+  closed*: sem sincronização, com idade expirada ou com UTC anterior a 2024,
+  a hora **não** é válida.
+- `utc(nowMs)` — o UTC estimado agora.
+- `ageSeconds(nowMs)` — há quanto tempo a hora foi **confirmada**.
+- `source()` / `driftPpm()` / `ageIsAssumed()` — diagnóstico.
+
+O Node 2 passa a usar essa abstração para `timeLooksValid()` e para
+`currentUtc()`: o TOTP e o log forense dependem dela.
+
+#### 9.8.4 Modelo de deriva
+
+O relógio local (`millis()`, cristal de 40 MHz do ESP32) tem deriva típica
+de 10–20 ppm (0,9–1,7 s/dia), podendo chegar a 50 ppm em campo. A cada
+sincronização com uma fonte externa o módulo compara o UTC observado com o
+previsto pelo relógio local e atualiza a estimativa de deriva (limitada a
+±500 ppm; intervalos curtos e erros > 5 min não geram medida).
+
+A deriva medida é aplicada na extrapolação durante o holdover. Sem o modelo,
+um holdover de ~18 dias faria o TOTP sair da janela de 30 s; com o modelo,
+o erro fica na casa de poucos segundos por semana.
+
+#### 9.8.5 Holdover após reinício e downtime assumido
+
+Após um **power cycle** o tempo de permanência desligado é **desconhecido**
+(o relógio local morreu com a alimentação). Não há como saber se o aparelho
+ficou 1 minuto ou 3 dias desligado.
+
+A solução adotada é uma **assunção explícita e limitada**
+(`HEF_TIME_MAX_DOWNTIME_S`, padrão 900 s = 15 min):
+
+- a hora estimada **não** recebe um salto artificial (seria inventar um
+  tempo);
+- a **idade** é contada como se o downtime tivesse sido o máximo
+  admissível, e isso é marcado (`age_assumed = true`,
+  `assumed_downtime_s`);
+- `valid()` expira **mais cedo** do que o necessário, nunca mais tarde
+  (*fail closed*).
+
+Consequência prática: quem opera com o aparelho desligado por mais de
+15 min **sem RTC externo** precisa de um `settime` manual ou de um novo fix
+GNSS/SNTP após o boot. Com o PCF8563 alimentado por supercap/bateria, o
+downtime real é conhecido pelo próprio RTC e essa limitação não se aplica.
+
+O holdover é persistido na NVS (namespace `heftime`) a cada 5 min, apenas
+quando a hora é válida.
+
+#### 9.8.6 RTC PCF8563 (`lib/src/rtc_pcf8563.h`)
+
+- Endereço I2C `0x51`, barramento compartilhado com o Si4735 (`0x11`, SDA 21,
+  SCL 22).
+- Codec puro (host-testável): conversão BCD↔Unix, flag OSF (oscilador parado /
+  alimentação perdida), flag de século, validação de data (inclui 29/02 em ano
+  bissexto), coerência do dia da semana, rejeição de bits reservados e do
+  modo 12 h.
+- **Offset de registros correto**: o bloco de data/hora começa em `0x02`
+  (0x00/0x01 são controle/status). Um offset errado leria os controles como
+  data.
+- Escrita com **read-back**: um RTC que aceita a escrita mas devolve outra
+  coisa não é considerado confiável.
+- Leitura periódica a cada 60 s para resincronizar o relógio do sistema com
+  o chip (mais estável que o cristal do ESP32).
+
+#### 9.8.7 Integração com o SNTP
+
+Em modo STA com internet, o Node 2 inicia o SNTP (`pool.ntp.org`,
+`time.google.com`, `time.nist.gov`). O callback de sincronização atualiza a
+abstração de tempo, propaga o UTC ao Node 3 e atualiza o RTC externo quando
+presente. Em SoftAP o SNTP não é iniciado.
+
+#### 9.8.8 Visibilidade
+
+- Console: `time` mostra UTC, validade, fonte, idade, deriva, presença do RTC
+  e se a idade é assumida.
+- `GET /api/status` → `time.{utc,valid,source,age_s,drift_ppm,age_assumed,assumed_downtime_s,rtc_present}`.
+- `GET /api/health` → `time.{utc,valid,source,age_s,drift_ppm,age_assumed,rtc_present}`.
+
+> ⚠️ **Aceite de bancada pendente.** O critério do item 1.5 é *"após 10 min
+> sem GNSS e sem rede, o Node 2 mantém hora válida (±30 s) e o login por
+> TOTP continua funcionando"*. Sem hardware (PCF8563, GNSS, rede) neste
+> ambiente, o critério **não foi exercitado em campo**. Validar em bancada:
+> com RTC presente e alimentado, desligar por 10 min sem GNSS/rede, religar e
+> confirmar `time` válido e login TOTP aceito; repetir sem RTC para confirmar
+> que o holdover NVS respeita o downtime assumido.
+
+---
+
 ## 10. Log forense (Node 3)
 
 - Registro binário append-only: `seq`, `utc`, `type`, `len`, `data`.
@@ -1068,11 +1205,11 @@ Os testes 7 e 8 são o par que valida a propriedade central do item 1.4:
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + round-trip + RF + politica + WDT + build
+./test_functional.sh            # invariantes + round-trip + RF + politica + WDT + tempo/RTC + build
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (11 grupos):
+Cobertura (12 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -1130,10 +1267,22 @@ Cobertura (11 grupos):
     `hefRestart()`** (nenhum `ESP.restart()` cru), que as operações
     longas reportam progresso, que os contadores de reinício têm
     guarda de desgaste e que a **intenção do reinício é lida e
-    consumida** (uma intenção não consumida reapareceria em todos os
-    boots seguintes, dizendo "reinício solicitado pelo operador" em
-    reinícios que foram travamentos);
-11. build dos três nós.
+    consumida**;
+11. **origem do tempo e RTC PCF8563** (`tests/time_source.cpp`,
+    85 verificações + `tests/rtc_pcf8563.cpp`, 304 verificações no host):
+    classificação das fontes, validade e expiração por idade, modelo de
+    deriva (medição, limite, aplicação na extrapolação e rejeição de
+    medições inválidas), holdover persistido com **downtime assumido**
+    (*fail closed*: a idade expira mais cedo, nunca mais tarde), round-trip
+    do blob, recusa de blob corrompido, precedência das fontes e virada do
+    relógio de 32 bits; codec PCF8563 com BCD, round-trip Unix↔registros,
+    flag OSF, datas impossíveis (29/02 em ano não bissexto, mês 13, dia 0/32),
+    bits reservados, rejeição do modo 12 h, coerência do dia da semana,
+    flag de século e recusa de entradas inválidas. O grupo verifica também,
+    por análise estática, que o Node 2 usa a abstração de tempo, integra o
+    RTC (leitura, escrita e read-back), integra SNTP, persiste o holdover
+    na NVS e aceita GNSS e ajuste manual;
+12. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
@@ -1157,6 +1306,14 @@ num dispositivo **sem watchdog** — a proteção aparecia na telemetria sem
 existir. É a mesma classe de defeito do duty cycle de 221%: nada no build
 nem na revisão de código apontaria.
 
+O teste de tempo/RTC existe pelo mesmo motivo: um offset de registro errado
+(ler `0x00` em vez de `0x02`) faria o codec parecer funcionar mas devolver
+uma hora **errada** — e uma hora errada quebra a autenticação TOTP de forma
+silenciosa (o operador é aceito ou recusado por um relógio que mente). O
+downtime desconhecido após power cycle é outra aresta: inventar um tempo
+seria mentir; a solução é assumir uma idade conservadora e expirar *fail
+closed*.
+
 ---
 
 ## 12. Solução de problemas
@@ -1165,7 +1322,7 @@ nem na revisão de código apontaria.
 |---|---|---|
 | `chave de link: AUSENTE` | PSK não gravado | `psk <64 hex>` e reiniciar |
 | Node 2 não autentica tracks | PSK diferente entre nós | regravar o mesmo PSK |
-| Login recusa TOTP | relógio não sincronizado | `settime <unix>` ou aguardar GNSS |
+| Login recusa TOTP | relógio não sincronizado | `settime <unix>` ou aguardar GNSS/SNTP; ver `time` (fonte/idade/RTC) — §9.8 |
 | `/api/spectrum` vazio | varredura não iniciada | `POST /api/sweep` ou `sweep now` |
 | Node 3 sem log | SD ausente/incompatível | verificar 3,3 V, cartão FAT32, `status` |
 | Node 2 reinicia sozinho | heap crítico | reduzir sessões/varredura; ver `/api/health` |
@@ -1173,6 +1330,9 @@ nem na revisão de código apontaria.
 | Node reinicia em laço | travamento de software | `resets` → ver `wdt`/`panics`; investigar |
 | `watchdog: INATIVO` no boot | falha na inicialização do TWDT | investigar; o dispositivo está sem proteção |
 | `watchdog_timeout_s: 0` | TWDT pré-existente, timeout desconhecido | estado real, não uma falha (IDF 4.4 não expõe a leitura) |
+| Relógio inválido após reinício | sem RTC e downtime > holdover assumido | `settime <unix>` ou aguardar GNSS/SNTP; instalar RTC PCF8563 para persistir a hora — §9.8 |
+| `RTC PCF8563: presente, hora inconfiavel` | OSF ligado (alimentação perdida) ou data inválida | sincronizar por GNSS/SNTP/`settime`; o RTC será atualizado |
+| `time` mostra `age_assumed: sim` | hora veio do holdover NVS após power cycle | normal; a idade é conservadora (downtime assumido). Confirme com GNSS/SNTP/RTC quando possível |
 | Frame rejeitado como replay | emissor reiniciou sem novo epoch | reiniciar o Node 1 (epoch novo) |
 
 ---
@@ -1256,9 +1416,19 @@ Consequências práticas:
   os pontos de avanço** só seria detectada por causa do brownout ou por
   um watchdog externo.
 - **Contadores de reinício podem ficar alguns boots atrás.** A guarda de
-  desgaste da NVS (§9.7.4) adia a gravação para pouvar a partição. A
+  desgaste da NVS (§9.7.4) adia a gravação para poupar a partição. A
   **causa** do último reinício é sempre exata; os **totais** podem
   defasar em até `HEF_RESET_PERSIST_EVERY_BOOTS` (10) boots.
+- **Tempo: downtime desconhecido após power cycle sem RTC.** O holdover NVS
+  assume um downtime máximo (`HEF_TIME_MAX_DOWNTIME_S`, padrão 15 min) e
+  marca a idade como assumida (`age_assumed`): `valid()` expira *mais cedo*
+  do que o necessário, nunca mais tarde (§9.8.5). Quem opera com o aparelho
+  desligado por mais de 15 min **sem RTC PCF8563** precisa de `settime`
+  manual ou de um novo fix GNSS/SNTP após o boot.
+- **Tempo/RTC: aceite de bancada pendente.** O critério do item 1.5 (*"após
+  10 min sem GNSS e sem rede, hora válida ±30 s e login TOTP funcionando"*)
+  não foi exercitado em campo neste ambiente (sem PCF8563, GNSS ou rede).
+  Validar em bancada (§9.8.8).
 - **Consumo real ainda não medido.** O item 1.3 do plano tem aceite
   "≤ 0,5 Ah/dia medido em bancada". As estimativas de firmware cobrem
   **apenas o TX LoRa** (0,053 Ah/dia no pior caso). Os consumos

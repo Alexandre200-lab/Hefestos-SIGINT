@@ -269,9 +269,53 @@
   real**. Um código travado (um SD que nunca responde) deixa de reportar
   progresso, o WDT expira normalmente e o travamento vira um reinício com
   causa visível — em vez de ficar mascarado.
+- **Origem do tempo, RTC PCF8563, SNTP e holdover (item 1.5 do plano).** A
+  v5.0.0 só sabia se o relógio era "válido" de forma **binária** ("passou de
+  2024?"), sem noção de idade, origem ou deriva. Ao reiniciar sem GNSS/rede,
+  o relógio voltava para 1970 e o TOTP era recusado; sem qualquer fonte, um
+  relógio parado continuava "válido" indefinidamente.
+  - `lib/src/time_source.h` (novo, puro/testável no host): `HefTimeSourceKind`,
+    `HefTimeSource` com `sync/valid/utc/ageSeconds/source/driftPpm`, modelo de
+    deriva (medição a cada sincronização, limitada a ±500 ppm, aplicada na
+    extrapolação), holdover NVS com **downtime assumido** após power cycle
+    (`maxDowntimeS`, padrão 900 s) — a idade é conservadora e `valid()` expira
+    *mais cedo* do que o necessário, nunca mais tarde (*fail closed*).
+  - `lib/src/rtc_pcf8563.h` (novo, puro/testável no host): codec dos 7
+    registros BCD do PCF8563 (`hefPcf8563ToUnix`/`hefUnixToPcf8563`,
+    `hefDaysFromCivil`/`hefCivilFromDays`, `hefPcf8563ReadMatches`,
+    `hefPcf8563Ctrl1Start`), com validação de OSF, bits reservados, modo 24 h,
+    data impossível (mês 13, dia 0/32, 29/02 em ano não bissexto), coerência
+    do dia da semana e flag de século.
+  - Node 2: `currentUtc()`/`timeLooksValid()` passam a usar a abstração de
+    tempo; probe do PCF8563 em `0x51` (barramento I2C compartilhado com o
+    Si4735 em `0x11`, SDA 21/SCL 22); leitura periódica (60 s) com sync
+    `HEF_TIME_RTC`; callback SNTP (`sntp_set_time_sync_notification_cb`,
+    `pool.ntp.org`/`time.google.com`/`time.nist.gov`, apenas em STA) com sync
+    `HEF_TIME_SNTP` e atualização do RTC; `applyTrackTime()` com sync
+    `HEF_TIME_GNSS` e atualização do RTC; `settime` com sync
+    `HEF_TIME_MANUAL` e atualização do RTC (com read-back); holdover
+    persistido na NVS (namespace `heftime`) a cada 5 min; `GET /api/status`,
+    `GET /api/health`, `status` e `time` expõem fonte, idade, deriva,
+    `age_assumed` e presença do RTC.
+  - `tests/time_source.cpp` (novo, host): 85 verificações.
+  - `tests/rtc_pcf8563.cpp` (novo, host): 304 verificações.
+  - `test_functional.sh`: novo grupo 11/12 (origem do tempo e RTC PCF8563),
+    com verificações estáticas de integração no Node 2.
+- **Offset de registro do PCF8563 corrigido no codec.** O bloco de data/hora
+  do PCF8563 começa no registro `0x02` (0x00/0x01 são controle/status). Um
+  codec que lesse a partir de `0x00` interpretaria os controles como data e
+  hora: o resultado seria sempre inválido (o RTC pareceria "ausente") ou —
+  pior — uma data plausível e **errada**, quebrando o TOTP de forma
+  silenciosa. O codec usa `HEF_PCF8563_REG_TIME = 0x02` e isso é coberto
+  pelos testes de round-trip/decodificação.
 
 ### Documentado
 
+- README §9.8 (novo): "Origem do tempo e holdover (Node 2)" — o que estava
+  errado, precedência das fontes (RTC PCF8563, SNTP, holdover NVS, GNSS,
+  manual), abstração da origem do tempo, modelo de deriva, holdover com
+  **downtime assumido** (*fail closed*), codec do PCF8563, integração com
+  SNTP, visibilidade e checklist de validação em bancada.
 - README §9.7 (novo): "Watchdog, brownout e causa de reinício (Node 2 /
   Node 3)" — o que estava errado, o watchdog de tarefa e o detector de
   brownout, o progresso das operações longas sem mascarar travamento, os
@@ -291,10 +335,10 @@
 - README §5.4 (novo): parâmetros de RF do link LoRa (constantes e origem).
 - README §2.6 (novo): "Operação em campo (v5.1.0)" — o que a v5.0.0
   deixava em aberto em operação real.
-- README §0, §2, §9.1, §9.2, §11, §12 e §14 atualizados: causa de
-  reinício e watchdog, comandos `resets`, 11 grupos de teste
-  (548 verificações no host; +515 sobre a v5.0.0) e as novas limitações
-  conhecidas.
+- README §0, §2, §9.1, §9.2, §11, §12 e §14 atualizados: origem do tempo e
+  holdover, causa de reinício e watchdog, comandos `resets`/`time`/`settime`,
+  12 grupos de teste (937 verificações no host; +904 sobre a v5.0.0) e as
+  novas limitações conhecidas.
 
 ### Correção de estimativa (documento do plano)
 

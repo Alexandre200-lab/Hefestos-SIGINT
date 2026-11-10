@@ -35,7 +35,7 @@ echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/11] Invariantes de pinagem"
+echo "[1/12] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -73,7 +73,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/11] Layout do protocolo LoRa"
+echo "[2/12] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -113,7 +113,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/11] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/12] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -144,7 +144,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/11] Ausencia de legado inseguro"
+echo "[4/12] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -159,7 +159,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/11] Anti-replay estrito e TOTP ativo"
+echo "[5/12] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -179,7 +179,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/11] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/12] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -194,7 +194,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/11] Estado anti-replay persistido (replay pos-reboot)"
+echo "[7/12] Estado anti-replay persistido (replay pos-reboot)"
 REPLAY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -233,7 +233,7 @@ fi
 [ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[8/11] Orcamento de RF (tempo no ar e duty cycle)"
+echo "[8/12] Orcamento de RF (tempo no ar e duty cycle)"
 BUDGET=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -285,7 +285,7 @@ fi
 [ $BUDGET -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[9/11] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
+echo "[9/12] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
 POLICY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -360,7 +360,7 @@ fi
 [ $POLICY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[10/11] Causa de reinicio e watchdog (item 1.4)"
+echo "[10/12] Causa de reinicio e watchdog (item 1.4)"
 WDT=0
 if command -v g++ >/dev/null 2>&1; then
     # --- 10a) Contadores de reinicio ---
@@ -484,7 +484,87 @@ done
 [ $WDT -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[11/11] Build dos tres nos"
+echo "[11/12] Origem do tempo e RTC PCF8563 (item 1.5)"
+TIME=0
+if command -v g++ >/dev/null 2>&1; then
+    # --- 11a) Abstracao da origem do tempo ---
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/time_source.cpp" -o /tmp/hef_time_test 2>/tmp/hef_time_cc.log; then
+        if /tmp/hef_time_test > /tmp/hef_time_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_time_run.log | head -4
+            echo "  ... (ver /tmp/hef_time_run.log para o restante)"
+            echo "  [PASS] origem do tempo (85 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_time_run.log || true
+            echo "  [FAIL] origem do tempo"; TIME=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de origem do tempo falhou:"
+        head -20 /tmp/hef_time_cc.log
+        TIME=1
+    fi
+
+    # --- 11b) Codec do RTC PCF8563 ---
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/rtc_pcf8563.cpp" -o /tmp/hef_rtc_test 2>/tmp/hef_rtc_cc.log; then
+        if /tmp/hef_rtc_test > /tmp/hef_rtc_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_rtc_run.log | head -4
+            echo "  ... (ver /tmp/hef_rtc_run.log para o restante)"
+            echo "  [PASS] codec RTC PCF8563 (304 verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_rtc_run.log || true
+            echo "  [FAIL] codec RTC PCF8563"; TIME=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste do RTC PCF8563 falhou:"
+        head -20 /tmp/hef_rtc_cc.log
+        TIME=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (testes de tempo/RTC nao executados)"
+fi
+
+# Node2 tem de usar a abstracao de tempo, ter o PCF8563 e o SNTP.
+N2="$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"
+if grep -q "HefTimeSource" "$N2" &&
+   grep -q "timeSource" "$N2" &&
+   grep -q "timeLooksValid" "$N2"; then
+    echo "  [PASS] Node2 usa a abstracao da origem do tempo"
+else
+    echo "  [FAIL] Node2 nao usa a abstracao da origem do tempo"; TIME=1
+fi
+if grep -q "readRtcPcf8563" "$N2" &&
+   grep -q "HEF_PCF8563_I2C_ADDR" "$N2" &&
+   grep -q "writeRtcPcf8563" "$N2"; then
+    echo "  [PASS] Node2 integra o RTC PCF8563 (leitura + escrita + read-back)"
+else
+    echo "  [FAIL] Node2 nao integra o RTC PCF8563"; TIME=1
+fi
+if grep -q "sntp_set_time_sync_notification_cb" "$N2" &&
+   grep -q "configTime" "$N2"; then
+    echo "  [PASS] Node2 integra SNTP como fonte de tempo"
+else
+    echo "  [FAIL] Node2 nao integra SNTP"; TIME=1
+fi
+if grep -q "loadTimeHoldover" "$N2" &&
+   grep -q "persistTimeHoldover" "$N2" &&
+   grep -q "HEF_NVS_NAMESPACE_TIME" "$N2"; then
+    echo "  [PASS] Node2 persiste o holdover de tempo na NVS"
+else
+    echo "  [FAIL] Node2 nao persiste o holdover de tempo"; TIME=1
+fi
+if grep -q "HEF_TIME_GNSS" "$N2" &&
+   grep -q "HEF_TIME_MANUAL" "$N2"; then
+    echo "  [PASS] Node2 aceita GNSS e ajuste manual como fontes de tempo"
+else
+    echo "  [FAIL] Node2 nao registra todas as fontes de tempo"; TIME=1
+fi
+[ $TIME -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[12/12] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then
