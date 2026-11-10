@@ -15,14 +15,19 @@
 //    2       1   type       (ver HefMsgType)
 //    3       1   flags
 //    4       1   keyId      (slot de chave do emissor)
-//    5       2   epoch      (muda a cada boot do emissor)
-//    7       4   counter    (monotonico estrito por (epoch, node))
-//   11       2   payloadLen
-//   13     N     payload
-//   13+N   16   tag GCM
+//    5       2   nodeId     (16 bits, derivados do MAC do efuse)
+//    7       2   epoch      (muda a cada boot do emissor)
+//    9       4   counter    (monotonico estrito por (epoch, node))
+//   13       2   payloadLen
+//   15     N     payload
+//   15+N   16   tag GCM
 //
-// O cabecalho (bytes 0..12) e' usado como AAD do AES-256-GCM: alterar
+// O cabecalho (bytes 0..14) e' usado como AAD do AES-256-GCM: alterar
 // node_id, epoch, counter ou tipo invalida a tag.
+//
+// O node_id viaja em claro no cabecalho porque o receptor precisa dele para
+// derivar a chave (HKDF do PSK de deploy). A autenticacao vem da tag GCM:
+// um node_id falso simply produz uma tag invalida -> frame descartado.
 //
 // NONCE: prefixo de 4 bytes (keyId ^ nodeId) || contador de 8 bytes.
 // Deterministico e unico por (chave, emissor, contador).
@@ -77,7 +82,7 @@ inline uint64_t getU64(const uint8_t* p) {
 // Preenche o cabecalho (13 bytes). Retorna false se os parametros sao invalidos.
 inline bool linkBuildHeader(uint8_t* hdr,
                             uint8_t type, uint8_t flags, uint8_t keyId,
-                            uint16_t epoch, uint32_t counter,
+                            uint16_t nodeId, uint16_t epoch, uint32_t counter,
                             uint16_t payloadLen) {
     if (!hdr) return false;
     if (payloadLen > HEF_MAX_PAYLOAD) return false;
@@ -86,9 +91,10 @@ inline bool linkBuildHeader(uint8_t* hdr,
     hdr[2] = type;
     hdr[3] = flags;
     hdr[4] = keyId;
-    putU16(hdr + 5, epoch);
-    putU32(hdr + 7, counter);
-    putU16(hdr + 11, payloadLen);
+    putU16(hdr + 5, nodeId);
+    putU16(hdr + 7, epoch);
+    putU32(hdr + 9, counter);
+    putU16(hdr + 13, payloadLen);
     return true;
 }
 
@@ -97,7 +103,7 @@ inline bool linkHeaderValid(const uint8_t* hdr, uint16_t frameLen) {
     if (!hdr) return false;
     if (hdr[0] != HEF_LINK_MAGIC) return false;
     if (hdr[1] != HEF_LINK_VERSION) return false;
-    uint16_t plen = getU16(hdr + 11);
+    uint16_t plen = getU16(hdr + 13);
     if (plen > HEF_MAX_PAYLOAD) return false;
     if ((uint32_t)HEF_HEADER_LEN + plen + HEF_TAG_LEN != frameLen) return false;
     return true;

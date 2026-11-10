@@ -1,277 +1,518 @@
-# HEFESTOS SIGINT: Estação Tática SIGINT Multi-Banda (v4.1)
+# Hefestos SIGINT — v5.0.0
 
-Sistema avançado de Inteligência de Sinais (SIGINT), guerra eletrônica e telemetria com arquitetura Master-Slave distribuída. Realiza rastreamento GPS criptografado (AES-GCM), transmissão via LoRa (915 MHz Sub-GHz), interceptação de RF (AM/FM/SW), e retenção forense em SD Card com autenticação 2FA.
+Sistema de rastreamento e monitoramento de espectro em três nós ESP32, com link
+LoRa autenticado (AES-256-GCM), base com dashboard HTTP autenticado (senha + TOTP)
+e caixa-preta forense com log encadeado por hash em cartão SD.
 
-## Versão 4.0 - Architecture Unification (Jul 2026)
-
-### Principais Mudanças v4.0
-
-| Área | Mudança |
-|------|---------|
-| **Config** | Header centralizado `hefestos_pins.h` (pins, EEPROM, limites) |
-| **Build** | Script unificado `build.sh` — compila os 3 nós do zero |
-| **Node1** | Refatorado para pins centralizados, CSMA/CA no LoRa |
-| **Node2** | Session-based HTTP auth, StaticJson, String→char arrays, V4.1 features (banda sweep, jamming detection, OTA) |
-| **Node3** | **Migrado Arduino Uno → ESP32-C3**: HardwareSerial nativo, LEDC PWM, buffer RAM 16→256, 3.3V logic (sem level shifter) |
-| **EEPROM** | Criptografada com chave derivada do efuse MAC (AES-256-GCM + PBKDF2 100k) |
-| **HTTP** | Session tokens (Bearer/Cookie), idle 30min / absolute 4h, rate limit anônimo (hash) |
-| **LoRa** | Nonce derivado SHA-256(counter || random_4B) → 12B nonce; CSMA/CA com backoff 1000ms |
-| **Segurança** | `isRNGReady()`: threshold 4/8 bytes entropia; `isValidCounter()`: janela 1000 counters drift tolerance; `secureCompare`: constant-time comparation |
-
-### Correções de Segurança v4.0
-
-| # | Vulnerabilidade | Correção |
-|---|----------------|----------|
-| 1 | EEPROM plaintext (chaves AES, senhas) | AES-256-GCM com chave única por chip (efuse MAC) |
-| 2 | HTTP sem autenticação | Session tokens obrigatórios em `/`, `/dados`, `/sintonizar` |
-| 3 | Nonce previsível (counter + random) | SHA-256(counter || random_4B) → 12B nonce |
-| 4 | RNG failure silencioso | `isRNGReady()` retorna erro -2 |
-| 5 | `secureCompare` lê além do `\0` | Compara `strlen` real + constant-time |
-| 6 | `blocked_since = 0` persistia bloqueio eterno | Expira no boot (`millis() - BLOCK_DURATION - 1`) |
-| 7 | `DynamicJsonDocument` fragmenta heap | `StaticJsonDocument<1024>` na stack |
-| 8 | `String` dinâmico em loops | `char[]` fixo elimina fragmentação |
-| 9 | LoRa sem CSMA/CA | Channel sense + random backoff antes de TX |
-
-### Bibliotecas de Segurança Revisadas
-| Biblioteca | Descrição | Mudanças |
-|------------|-----------|----------|
-| `crypto_gcm.h` | AES-GCM autêntico (mbedtls) | **Reescrito**: agora usa `mbedtls_gcm_crypt_and_tag` AEAD real (antes: AES-CTR + HMAC truncado caseiro) |
-| `secure_protocol.h` | Nonce/Counter anti-replay | Reset periódico removido (elimina janela de replay de 60s) |
-| `totp_auth.h` | 2FA TOTP (RFC 6238) | `generateRandomSecret()` via hardware RNG (`esp_fill_random`) |
-| `secure_storage.h` | Encrypt at rest | **Reescrito**: key derivation via PBKDF2-HMAC-SHA256 100k iterações; AES-256-GCM (antes: LCG caseiro + XOR+ROT13) |
-| `config.h` | Gerenciamento de chaves | `esp_fill_random()` no lugar de LCG; credenciais hardcoded removidas |
-| `rate_limiter.h` | Anti-DoS | IP tracking removido (privacidade); apenas hash anônimo |
-
-### Correções de Segurança v3.1
-| Correção | Antes | Depois |
-|----------|-------|--------|
-| **Telnet Auth** | Apenas senha verificada (username ignorado) | Username **e** senha verificados |
-| **Session Timeout** | Ilimitado | 1 min idle / 5 min absoluto |
-| **Brute Force** | 3 tentativas = reset conexão | 3 tentativas = IP bloqueado por 30 min |
-| **Senha em echo** | Caracteres visíveis na digitação | Exibe `*` durante digitação da senha |
-| **AES-GCM** | AES-CTR + HMAC-8 (não-AEAD, IV previsível) | `mbedtls_gcm` AEAD real (12B nonce + random, tag 16B) |
-| **Key Derivation** | LCG 5k rounds | PBKDF2-HMAC-SHA256 100k rounds |
-| **Geração de chaves** | LCG baseado em MAC+heap+reset | `esp_fill_random()` (hardware RNG) |
-| **Anti-Replay** | Reset a cada 60s (janela de replay) | Monotônico (uint32_t = 8000 anos sem overflow) |
-| **Encrypt-at-Rest** | AES-CTR (assinatura errada) + XOR+ROT13 | AES-256-GCM autêntico |
-| **HTTP /sintonizar** | Sem validação de input | Range validado (banda/frequência) |
-| **Credenciais hardcoded** | Presentes em `config.h` e README | Removidas — geradas aleatoriamente no 1º boot |
-| **TOTP Secret** | RFC test vector (`JBSWY3DPEHPK3PXP`) | Gerado via `esp_fill_random()` |
-| **Rate Limiter** | IP armazenado em plaintext | Apenas hash anônimo |
-| **Build artifacts** | `.bin`, `.elf`, `.map` no repo | Adicionados ao `.gitignore` |
-
-### Aviso de Segurança
-**Credenciais anteriores foram removidas permanentemente do código.**  
-Se você atualizou de uma versão anterior, execute `factoryReset()` ou limpe a EEPROM.  
-O histórico do git ainda contém credenciais expostas — use `git filter-branch` ou BFG Repo-Cleaner para purgar.
+> **Escopo e uso legal.** Este projeto é **passivo e defensivo**: recebe
+> telemetria própria e mede espectro de radiodifusão. Ele **não** implementa
+> jamming, spoofing, interceptação de terceiros, quebra de criptografia ou
+> qualquer forma de exploração. Transmitir em frequências reguladas sem
+> autorização é ilegal na maioria das jurisdições. O operador é o único
+> responsável pelo uso e pelas licenças (ex.: Anatel no Brasil, FCC nos EUA).
+> Use apenas em equipamentos e frequências que você está autorizado a operar.
 
 ---
 
-## Arquitetura do Sistema
+## 1. Arquitetura
 
-### 1. Node 1 (Transmissor/Alvo - ESP32)
-- GPS polling (1000ms)
-- Criptografia AES-GCM com nonce+counter
-- Transmissão LoRa 915 MHz
-- Transmissor FM (Si4713)
+```
+   ┌────────────────────┐        LoRa 915 MHz         ┌────────────────────┐
+   │ NODE 1             │  frames binários AEAD       │ NODE 2             │
+   │ Alvo / Emissor     │ ──────────────────────────► │ Base / Sensores    │
+   │ ESP32-WROOM-32     │ ◄────────────────────────── │ ESP32-WROOM-32     │
+   │ GPS + LoRa + Si4713│      TRACK_ACK autenticado  │ LoRa + Si4735 + AP │
+   └────────────────────┘                             └─────────┬──────────┘
+                                                               │ UART2 115200
+                                                               │ frames c/ CRC16
+                                                     ┌─────────▼──────────┐
+                                                     │ NODE 3             │
+                                                     │ Caixa Preta        │
+                                                     │ ESP32-C3 + SD      │
+                                                     │ log com hash chain │
+                                                     └────────────────────┘
+```
 
-### 2. Node 2 (Base Hefestos - ESP32)
-- Servidor HTTP/Dashboard
-- CLI Telnet com rate limiting
-- Interceptação LoRa com verificação GCM
-- Detecção de replay attacks
-- Controle rádio (AM/FM/SW)
+- **Node 1** transmite posição/qualidade do fix GNSS e nível de bateria.
+- **Node 2** autentica, mantém estado por par, sincroniza o relógio UTC pelo
+  epoch do GNSS, responde ACK, encaminha tudo ao Node 3, controla o receptor
+  Si4735 (FM/AM/SW), executa varredura de espectro e detecção de interferência.
+- **Node 3** grava um log append-only com cadeia de SHA-256 e responde a
+  consultas de capturas/exportação.
 
-### 3. Node 3 (Caixa Preta - ESP32-C3)
-- Log forense em SD Card
-- CRC16 UART
-- Buffer RAM 256 slots (expandido de 16 entries)
-- LEDs/Buzzer via LEDC PWM
-- UART nativo (sem SoftwareSerial)
-- 3.3V logic (sem level shifter - compatível com Node2)
+O dashboard do Node 2 é servido em `http://<ip-do-node2>/` (SoftAP
+`HEFESTOS-<node_id>` por padrão, ou STA se configurado).
 
 ---
 
-## Segurança v3.0
+## 2. O que mudou da v4.1 para a v5.0.0
 
-### Proteções Implementadas
-| Camada | Proteção | Mecanismo |
-|-------|----------|-----------|
-| RF | AEAD | AES-GCM (128-bit, mbedtls) |
-| RF | Anti-Replay | Nonce + Counter monotônico |
-| RF | Confidencialidade | Criptografia autenticada |
-| UART | Integridade | CRC16 |
-| API | Autenticação | 2FA TOTP + Rate Limit |
-| API | DoS | 30 cmd/min + cooldown 100ms |
-| API | Brute Force | Block IP por 30 min após 3 tentativas |
-| Storage | Cifragem | AES-256-GCM via PBKDF2 |
-| Session | Timeout | 1 min idle / 5 min absoluto |
+A v4.1 não compilava e tinha falhas que invalidavam as propriedades de segurança
+anunciadas. A v5.0.0 foi uma reescrita com verificação empírica.
 
-> **Nota**: Credenciais são geradas aleatoriamente no primeiro boot via hardware RNG (`esp_fill_random`).  
-> Não existem credenciais padrão. Consulte o serial output no primeiro boot para obter as senhas,  
-> ou configure via `config.h` antes da compilação.
+### 2.1 Build
+
+| Problema na v4.1 | Correção na v5.0.0 |
+|---|---|
+| `#include "../lib/..."` quebrava o build (o Arduino copia o sketch para outro diretório) | Biblioteca real em `lib/` com `library.properties`; build com `--libraries <raiz>` |
+| `SD.begin()` com assinatura inexistente no core ESP32 | `SPI.begin(sck, miso, mosi, cs)` + `SD.begin(cs, SPI, 10 MHz)` |
+| `SI4735::setBand()` não existe | `HefRadio` usa `setFM`/`setAM`/`setFrequency` |
+| `LoRa.onReceive` com assinatura errada e `readBytes` inexistente | RX explícito via `parsePacket()`/`readBytes()` |
+| Core não fixado; APIs mbedtls 2.x vs 3.x | Core fixado em **esp32 2.0.17** e APIs mbedtls 2.x |
+
+Resultado medido: Node 1 **24%**, Node 2 **66%**, Node 3 **25%** da flash.
+
+### 2.2 Criptografia e protocolo
+
+| Falha na v4.1 | Correção na v5.0.0 |
+|---|---|
+| `decryptConfig()` comparava 116 bytes com 508 → **sempre falhava**; segredos ficavam em texto puro e a chave AES era regenerada a cada boot | Vault em NVS com header `magic/version/flags/totalLen/iv`, payload TLV cifrado e tamanho autenticado |
+| Cada nó derivava a chave do **próprio MAC** → Node 1 e Node 2 nunca compartilhavam chave | PSK de deploy + `HKDF-SHA256(PSK, salt=node_id)` → chave por nó, compartilhável |
+| Link usava AES-128 embora a documentação dissesse AES-256 | **AES-256-GCM** de fato |
+| Nonce aleatório de 4 bytes + SHA-256 “para embaralhar” | Nonce determinístico `node_id(4) ‖ contador(8)`, único por (chave, emissor, contador) |
+| Cabeçalho não autenticado | Cabeçalho de 15 bytes é o **AAD** do GCM |
+| `RESYNC` aceitava qualquer contador fora da janela de 256 → replay de captura SDR | Anti-replay estrito: `contador <= maior` é sempre `REPLAY`; sem caminho de aceitação |
+| `isRNGReady()` contava bytes não-nulos (passava com RNG quebrado) | Auto-teste diferencial do RNG, com falha fechada |
+| Flags de versão colidiam com `FLAG_KEYS_GENERATED` | Layout de flags separado e explícito |
+| PBKDF2 100k iterações sobre MAC de efuse | HKDF (primitiva correta para material de chave) |
+
+### 2.3 Elétrica e RF
+
+| Falha na v4.1 | Correção na v5.0.0 |
+|---|---|
+| Node 3: `SCK` e `LED_VERDE` ambos em **GPIO7** | SCK=4, MISO=5, MOSI=6, CS=10, LED verde=7, LED vermelho=1, buzzer=3 |
+| Node 2: UART0 usada para o Node 3, matando o console | Node 3 em **UART2**; console em UART0 |
+| Node 3: UART0 para o link, sem console | Link em **UART1**; console em UART0 |
+| Node 1: GPS em UART0, conflitando com o console | GPS em **UART2**; console em UART0 |
+| Pinos de strapping/flash usados no C3 | Conjunto validado por teste automatizado (sem GPIO2/8/9/12–17) |
+
+### 2.4 ESM (espectro / jamming) — de decorativo para real
+
+| Falha na v4.1 | Correção na v5.0.0 |
+|---|---|
+| Varredura usava `LoRa.readRSSI()` — reportava o RSSI do **LoRa** para toda banda | `HefRadio::readQuality()` usa `getCurrentReceivedSignalQuality()` do Si4735 (RSSI/SNR reais) |
+| Varredura síncrona com `delay(50)`, receptor fora do ar, sem restaurar a sintonia do operador | Máquina de estados não-bloqueante (`SpectrumScanner::tick`), dwell configurável, restauração da frequência do operador |
+| `monitorLinkQuality()` lia `markCounter()`, que nunca era chamado → sempre “NORMAL” | `JammingDetector` com RSSI/SNR reais dos pacotes, piso de ruído do Si4735 e perda de enlace |
+| Node 2 nunca enviava nada ao Node 3 | Encaminhamento no loop principal, fila não-bloqueante, frames com CRC16 |
+| Capturas processadas só dentro de handlers HTTP bloqueantes | RX/TX serial 100% no loop; handlers nunca bloqueiam |
+
+### 2.5 Segurança operacional
+
+| Falha na v4.1 | Correção na v5.0.0 |
+|---|---|
+| Telnet em texto claro | Removido; console local + HTTP autenticado |
+| TOTP existia mas nunca era incluído/verificado | TOTP **obrigatório** no login, com proteção de replay por passo de 30 s |
+| Sessões sem expiração real | Idle 15 min / absoluta 4 h, binding por IP, token de 32 bytes |
+| Rate limit global bloqueava o próprio operador | Buckets por IP: login (5/min) e comandos (60/min, cooldown 50 ms) |
+| Dashboard montava HTML com dados de RF | Dashboard usa `textContent` (sem `innerHTML`), cabeçalhos `nosniff`/`DENY`/`no-referrer` |
+| Funções de debug podiam imprimir segredos | Nenhuma rotina imprime chave/senha/PSK |
 
 ---
 
-## Pinagem (inalterada)
+## 3. Modelo de segurança
 
-### Node 1 (ESP32)
+### 3.1 Ativos e adversários
+
+Ativos: PSK de deploy, chaves de link derivadas, credenciais HTTP, segredo TOTP,
+posições rastreadas e o log forense.
+
+Adversários considerados:
+- Observador de RF com SDR (captura e reenvio de frames).
+- Atacante na rede local/Wi-Fi (força bruta de login, CSRF, XSS).
+- Furto do cartão SD (integridade do log) e acesso físico ao console serial.
+
+Fora de escopo: ataque com acesso físico completo ao ESP32 (extração de flash sem
+secure boot), comprometimento do PSK por engenharia social, jamming ativo por
+terceiros (detectamos, não emitimos).
+
+### 3.2 Provisionamento de chaves
+
 ```
-LoRa SX1276:  CS(5), RST(14), DIO0(26), SPI(18,19,23)
-GPS NEO-6M:    RX(16), TX(17)
-TX FM:        SDA(21), SCL(22), RST(32)
+PSK (32 bytes, único do deployment)
+        │
+        ├── HKDF-SHA256(salt = node_id_1, info = "hefestos-v5/link/aes256") → key_1
+        ├── HKDF-SHA256(salt = node_id_2, info = "hefestos-v5/link/aes256") → key_2
+        └── HKDF-SHA256(salt = node_id_N, info = "hefestos-v5/link/aes256") → key_N
 ```
 
-### Node 2 (ESP32)
+- O PSK é gravado uma única vez em cada nó pelo console serial.
+- A chave de link **nunca** trafega.
+- Comprometer um nó não expõe a chave de outro nó.
+- Rotação: novo PSK em todos os nós + reinício. O Node 2 re-deriva as chaves dos
+  pares ao receber o primeiro frame autenticado de cada `node_id`.
+
+### 3.3 Vault de configuração (NVS)
+
 ```
-LoRa SX1276:  CS(5), RST(14), DIO0(26), SPI(18,19,23)
-RX Scanner:    SDA(21), SCL(22), RST(12)
-UART Node3:   TX(17), RX(16)
++---------------------------+
+| magic    u32              |  "HFFC"
+| version  u8               |  5
+| flags    u8               |
+| totalLen u16              |  ciphertext + tag
+| iv       u8[12]           |
+| reservado u8[16]          |
++---------------------------+
+| ciphertext || tag GCM     |  AES-256-GCM
++---------------------------+
 ```
 
-## Compilação
+- Chave do vault: `HKDF-SHA256(MAC do efuse, salt="Hefestos-v5-vault")`.
+  O vault é **vinculado ao chip**: copiar a NVS para outro ESP32 invalida o
+  conteúdo (anti-clonagem).
+- Payload TLV: SSID/senha Wi-Fi, usuário/senha HTTP, segredo TOTP, PSK e
+  enrollments (`node_id`, `key_id`).
+- `totalLen` é validado contra o tamanho gravado: truncamento/corrupção falha
+  fechado.
+- Segredos ficam em cache em RAM somente após o boot e são apagados em
+  `factoryReset()`.
+
+### 3.4 Frame LoRa
+
+Formato (big-endian), 15 bytes de cabeçalho + payload + tag:
+
+| offset | tam | campo |
+|---:|---:|---|
+| 0 | 1 | `magic` = `0xA5` |
+| 1 | 1 | `version` = 5 |
+| 2 | 1 | `type` (`TRACK`, `TRACK_ACK`, …) |
+| 3 | 1 | `flags` (status do track) |
+| 4 | 1 | `keyId` |
+| 5 | 2 | `nodeId` (16 bits do MAC) |
+| 7 | 2 | `epoch` (novo a cada boot) |
+| 9 | 4 | `counter` (monotônico estrito) |
+| 13 | 2 | `payloadLen` |
+| 15 | N | payload |
+| 15+N | 16 | tag GCM |
+
+- **AAD** = cabeçalho completo. Alterar `nodeId`, `epoch`, `counter` ou `type`
+  invalida a tag.
+- **Nonce** = `nodeId(4) ‖ counter(8)`.
+- `nodeId` viaja em claro porque o receptor precisa dele para derivar a chave;
+  autenticidade vem da tag. Um `nodeId` forjado produz tag inválida.
+- Payload de tracking (23 bytes): `epochUtc`, `lat`, `lon`, `altM`, `speedCms`,
+  `courseDeg`, `hdopX10`, `sats`, `fixQuality`, `batteryPct`, `statusFlags`.
+- `TRACK_ACK` ecoa `epoch`/`counter` no cabeçalho e é cifrado com a chave do par,
+  com prefixo de nonce = `nodeId` do par. Sem ACK válido, o Node 1 retransmite
+  (mesmo contador; o Node 2 reenvia o ACK de duplicata sem reprocessar o track).
+
+### 3.5 Anti-replay
+
+`RxSequence` por par `(node_id)`:
+
+- `counter <= maior_visto` → `REPLAY` (sempre rejeitado).
+- `counter > maior + 1024` → `FAR` (rejeitado).
+- `epoch` anterior → `STALE_EPOCH` (rejeitado).
+- `epoch` novo → nova sessão do emissor, janela reiniciada.
+
+A janela de 1024 bits serve apenas para **contar lacunas** (diagnóstico), nunca
+para aceitar pacotes atrasados.
+
+### 3.6 Autenticação HTTP
+
+- Login: usuário + senha + **TOTP de 6 dígitos** (RFC 6238, SHA-1, 30 s).
+- Comparações em tempo constante.
+- Código TOTP já usado não é aceito novamente.
+- Sessão: token de 32 bytes (hex), `HttpOnly`, `SameSite=Strict`, binding por IP,
+  expiração idle e absoluta.
+- Rate limit por IP e bloqueio de 30 min após 5 falhas.
+- TOTP exige relógio sincronizado. O Node 2 sincroniza pelo epoch GNSS recebido
+  ou pelo comando `settime <unix>` no console. Sem relógio válido, o login HTTP
+  responde com erro explícito (o console serial continua disponível).
+
+---
+
+## 4. Protocolo serial Node 2 ↔ Node 3
+
+```
+START(0xAA) TYPE(1) SEQ(2) LEN(2) PAYLOAD(N) CRC16(2) END(0x55)
+```
+
+CRC16-IBM sobre `TYPE..PAYLOAD`. Tipos: `DATA`, `HEARTBEAT`, `REQUEST`,
+`RESPONSE`, `TIME`, `ACK`. Requisições: `CAPTURE_LAST`, `CAPTURE_LIST`,
+`CAPTURE_CLEAR`, `LOG_EXPORT`, `LOG_INFO`.
+
+O Node 3 responde com `RESPONSE` cujo primeiro byte é o ID da requisição,
+seguido de JSON. O Node 2 mantém um cache e nunca bloqueia o handler HTTP
+esperando o Node 3.
+
+---
+
+## 5. Hardware e pinagem
+
+### 5.1 Node 1 — Alvo / Emissor (ESP32-WROOM-32)
+
+| Sinal | GPIO |
+|---|---:|
+| LoRa NSS | 5 |
+| LoRa RESET | 14 |
+| LoRa DIO0 | 26 |
+| Si4713 RESET | 32 |
+| I2C SDA | 21 |
+| I2C SCL | 22 |
+| GPS RX (do módulo) | 16 |
+| GPS TX (para o módulo) | 17 |
+| Chave RF | 25 |
+| ADC bateria | 36 |
+| Console | UART0 |
+
+### 5.2 Node 2 — Base (ESP32-WROOM-32)
+
+| Sinal | GPIO |
+|---|---:|
+| LoRa NSS | 5 |
+| LoRa RESET | 14 |
+| LoRa DIO0 | 26 |
+| Si4735 RESET | 12 |
+| I2C SDA | 21 |
+| I2C SCL | 22 |
+| UART2 TX → Node 3 RX | 17 |
+| UART2 RX ← Node 3 TX | 16 |
+| Console | UART0 |
+
+### 5.3 Node 3 — Caixa Preta (ESP32-C3)
+
+| Sinal | GPIO |
+|---|---:|
+| SD CS | 10 |
+| SD MOSI | 6 |
+| SD MISO | 5 |
+| SD SCK | 4 |
+| UART1 RX ← Node 2 TX | 20 |
+| UART1 TX → Node 2 RX | 21 |
+| LED verde | 7 |
+| LED vermelho | 1 |
+| Buzzer | 3 |
+| Console | UART0 |
+
+> O ESP32-C3 usa o barramento FSPI nativo nesses pinos. GPIO2/8/9 (strapping),
+> GPIO12–17 (flash) e GPIO18/19 (USB-JTAG) são evitados. O teste
+> `test_functional.sh` falha se essa regra for violada.
+
+---
+
+## 6. Estrutura do repositório
+
+```
+lib/                     biblioteca compartilhada (Arduino library)
+  library.properties
+  src/
+    hefestos_pins.h      pinagem, versão, constantes
+    crypto_gcm.h         AES-256-GCM + HKDF-SHA256 + comparação constante
+    config.h             vault NVS cifrado (TLV)
+    provisioning.h       derivação de chave por nó
+    secure_protocol.h    anti-replay (RxSequence/TxSequence)
+    link_protocol.h      frame LoRa + payload de tracking
+    serial_protocol.h    link Node2<->Node3 (CRC16)
+    radio_si4735.h       wrapper do receptor
+    spectrum.h           varredura não-bloqueante
+    jamming_detector.h   detecção real de interferência
+    field_log.h          log forense com hash chain
+    totp_auth.h          TOTP RFC 6238
+    rate_limiter.h       token buckets por IP
+    debug.h              logging sem vazamento de segredos
+src/
+  Node1_Transmissor_Alvo/
+  Node2_Base_Hefestos/
+  Node3_Caixa_Preta_ESP32C3/
+build.sh                 build dos 3 nós
+test_functional.sh       invariantes + build
+```
+
+---
+
+## 7. Build
+
+Requisitos:
+
+- `arduino-cli` (>= 0.35)
+- core **esp32:esp32 2.0.17** (mbedtls 2.x)
+- bibliotecas externas (versões testadas em `dependencias.txt`)
 
 ```bash
-# ESP32 boards
-arduino-cli core install esp32:esp32
-arduino-cli core install arduino:avr
-
-# Compilar Node1
-arduino-cli compile -b esp32:esp32:esp32 src/Node1_Transmissor_Alvo/
-
-# Compilar Node2
-arduino-cli compile -b esp32:esp32:esp32 src/Node2_Base_Hefestos/
-
-# Compilar Node3 (ESP32-C3)
-arduino-cli compile -b esp32:esp32:esp32c3 src/Node3_Caixa_Preta_ESP32C3/
+arduino-cli core install esp32:esp32@2.0.17
+./build.sh
 ```
 
----
-<tool_call>
-<function=edit>
-<parameter=newString>
-### Node 3 (Caixa Preta - ESP32-C3)
-```
-SD Card:      CS(4), MOSI(6), MISO(5), SCK(7)
-UART:        RX(20), TX(21)
-LEDs/Buzzer: 7, 8, 9
-```
+O `build.sh` valida a versão do core e compila os três sketches com
+`--libraries <raiz>`, que é o que faz os includes `<config.h>` etc. resolverem.
 
----
-
-## Dashboard Web (v4.1)
-
-### Endpoints Disponíveis
-
-| Endpoint | Método | Auth | Descrição |
-|----------|--------|------|-----------|
-| `/` | GET | Sim | Dashboard HTML completo |
-| `/login` | POST | Não | Autenticação HTTP |
-| `/logout` | POST | Sim | Encerrar sessão |
-| `/dados` | GET | Sim | Status operacional JSON |
-| `/sintonizar` | GET | Sim | Controle rádio (parâmetros: `b`, `f`) |
-| `/ultima` | GET | Sim | Última captura capturada |
-| `/historico` | GET | Sim | Últimas 20 capturas |
-| `/clear_historico` | POST | Sim | Limpar histórico |
-| `/jamming` | GET | Sim | Status de jamming |
-| `/ota` | POST | Sim | Atualização firmware |
-
-### Dashboard Features
-
-- **Status Operacional**: RX, GCM OK/FAIL, RSSI, contadores
-- **Última Captura**: Tipo (ALVO/SNIFF_RX), dados, timestamp
-- **Histórico**: Lista das últimas 20 capturas com timestamp
-- **Atualização Automática**: Polling a cada 2 segundos
-- **Controles**: Botão atualizar manual e limpar histórico
-- **Indicadores Visuais**: Status de sinal (FORTE/BOM/FRACO)
-
-### Comandos Seriais (Node2 → Node3)
-
-| Comando | Resposta | Descrição |
-|---------|----------|-----------|
-| `GET_CAPTURE` | JSON `{tipo, dados, timestamp}` | Retorna última captura |
-| `GET_HISTORICO` | JSON `{total_captures, capture_history[]}` | Retorna histórico completo |
-| `CLEAR_HISTORICO` | JSON `{status: "ok"}` | Limpa buffer de histórico |
-
----
-
-## Compilação
+Para gravar:
 
 ```bash
-# ESP32 boards
-arduino-cli core install esp32:esp32
-arduino-cli core install arduino:avr
-
-# Compilar Node1
-arduino-cli compile -b esp32:esp32:esp32 src/Node1_Transmissor_Alvo/
-
-# Compilar Node2
-arduino-cli compile -b esp32:esp32:esp32 src/Node2_Base_Hefestos/
-
-# Compilar Node3
-arduino-cli compile -b arduino:avr:uno src/Node3_Caixa_Preta_Arduino/
+arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 \
+  --input-dir build/node1 src/Node1_Transmissor_Alvo
+# Node 3: --fqbn esp32:esp32:esp32c3
 ```
 
----
-
-## Vulnerabilidades Corrigidas
-
-| Versão | Vulnerabilidade | Status |
-|--------|--------------|--------|
-| v2.1 | HMAC sobre ciphertext | ✅ CORRIGIDO |
-| v2.1 | Rate limiter hash fixo | ✅ CORRIGIDO |
-| v2.1 | Username "admin" hardcoded | ✅ CORRIGIDO |
-| v2.1 | Sem 2FA real | ✅ ADICIONADO |
-| v2.1 | EEPROM texto puro | ✅ CORRIGIDO |
-| v3.1 | AES-GCM caseiro (CTR+HMAC truncado) → mbedtls GCM real | ✅ CORRIGIDO |
-| v3.1 | Key derivation LCG → PBKDF2 100k iters | ✅ CORRIGIDO |
-| v3.1 | Telnet auth sem username | ✅ CORRIGIDO |
-| v3.1 | Replay window 60s | ✅ CORRIGIDO |
-| v3.1 | Credenciais hardcoded no código/README | ✅ REMOVIDO |
-| v3.1 | TOTP secret RFC test vector | ✅ CORRIGIDO |
-| v3.1 | Buffer overflow potencial em crypto | ✅ CORRIGIDO |
-| v3.1 | IP tracking em plaintext | ✅ CORRIGIDO |
-| v3.1 | XOR+ROT13 pseudo-criptografia | ✅ REMOVIDO |
-| v3.1 | Sessão telnet sem timeout | ✅ ADICIONADO |
-| v3.1 | Brute force sem bloqueio de IP | ✅ ADICIONADO |
-| v3.1 | Build artifacts no repo | ✅ .gitignore |
+> Se o core 2.0.17 não estiver disponível no índice, instale-o pelo
+> board manager com a URL do ESP32 e fixe a versão. A v5 **não** é compatível
+> com o core 3.x sem ajustar as APIs de mbedtls.
 
 ---
 
-## Documentação
+## 8. Provisionamento
 
-| Documento | Conteúdo |
-|-----------|---------|
-| `IMPLEMENTATION_GUIDE_v2.md` | Arquitetura v3.0, segurança (desatualizado) |
-| `OPERATION_MANUAL_v2.md` | CLI, dashboard v3.0 (desatualizado) |
-| `dependencias.txt` | Bibliotecas |
+Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
+
+1. **PSK de deployment** (uma vez, igual em todos os nós):
+
+   ```bash
+   # gere 32 bytes aleatórios, ex.: openssl rand -hex 32
+   psk <64 caracteres hex>
+   ```
+
+2. **Wi-Fi do Node 2** (opcional; sem isso ele sobe SoftAP):
+
+   ```bash
+   wifi <ssid> <senha>
+   ```
+
+   No primeiro boot, o Node 2 imprime no console o SSID
+   `HEFESTOS-<node_id>` e a senha WPA2 (derivada do MAC do chip).
+
+3. **Credenciais HTTP**: no primeiro boot o Node 2 gera e imprime
+   `admin` + senha aleatória. Troque:
+
+   ```bash
+   user <nome>
+   pass <senha-com-10-ou-mais>
+   ```
+
+4. **TOTP**: o primeiro boot imprime o segredo base32 e a URI `otpauth://`.
+   Cadastre no autenticador. Para reexibir: `totp`.
+
+5. **Relógio**: o Node 2 sincroniza sozinho quando recebe um track com epoch
+   GNSS válido. Antes disso (ou sem GPS), use:
+
+   ```bash
+   settime 1760000000
+   ```
+
+6. Reinicie os nós e confirme no console: `status` deve mostrar chave OK,
+   relógio válido e pares autenticados após o primeiro track.
+
+> **Nunca** versione o PSK, a senha do Wi-Fi, a senha HTTP ou o segredo TOTP.
+> O repositório não contém nenhum desses valores.
 
 ---
 
-## Versão
+## 9. Operação
 
-- **Versão atual**: 4.0.0
-- **Data**: 2026-09-15
-- **Status**: Production-ready (security hardened)
-- **Compatibilidade**: ESP32, ESP32-C3, Arduino Uno (modo legado)
+### 9.1 Console serial
+
+**Node 1:** `help`, `status`, `id`, `psk <hex>`, `psk show`,
+`fm on|off`, `fm freq <kHz>`, `fm power <0-255>`.
+
+**Node 2:** `help`, `status`, `id`, `psk`, `user`, `pass`, `totp`,
+`wifi`, `settime`, `time`, `enroll <node> <keyid>`, `peers`,
+`sweep on|off|now`, `radio <FM|AM|SW> <kHz>`, `reboot`, `factory`.
+
+**Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
+`time <unix>`, `format`, `reboot`.
+
+### 9.2 API HTTP (Node 2)
+
+Todas exigem sessão autenticada (cookie `HEF_SID`).
+
+| Método | Rota | Descrição |
+|---|---|---|
+| GET | `/` | dashboard |
+| GET/POST | `/login` | formulário e autenticação |
+| POST | `/logout` | encerra a sessão |
+| GET | `/api/status` | estado geral |
+| GET | `/api/peers` | pares autenticados e último track |
+| GET | `/api/radio` | banda, frequência e qualidade do Si4735 |
+| POST | `/api/radio?band=FM&freq=100100` | sintoniza |
+| GET | `/api/spectrum` | amostras da varredura |
+| POST | `/api/sweep[?auto=1][&dwell=90]` | inicia varredura |
+| GET | `/api/health` | heap, relógio, contadores |
+| GET | `/api/captures` | capturas do Node 3 (cache) |
+| GET | `/api/logs` | estado do log forense |
+
+### 9.3 Varredura de espectro
+
+Plano padrão: FM 87,5–108 MHz (passo 250 kHz), AM 520–1710 kHz (20 kHz),
+SW 2,3–30 MHz (25 kHz). A varredura é incremental: um ponto por `tick()`,
+com dwell configurável, e restaura a frequência do operador ao terminar.
+`auto=1` repete continuamente.
+
+### 9.4 Detecção de interferência
+
+Estados: `NORMAL`, `DEGRADED` (SNR mediana abaixo do limite),
+`NOISE_RISE` (piso de ruído do Si4735 subiu mais de 10 dB por 30 s) e
+`LINK_LOSS` (nenhum frame LoRa há 15 s). As métricas vêm do RF real —
+não de contadores que nunca eram atualizados.
 
 ---
 
-## Changelog
+## 10. Log forense (Node 3)
 
-### v3.1.0 (2026-07-15) — Security Hardening
-- **Criptografia**: AES-GCM real (mbedtls) substitui AES-CTR+HMAC caseiro
-- **Key Derivation**: PBKDF2-HMAC-SHA256 (100k iters) substitui LCG (5k iters)
-- **RNG**: Hardware RNG (`esp_fill_random`) substitui LCG
-- **Telnet**: Auth com username+senha; session timeout; brute force blocking por IP
-- **Credenciais**: Removidas do código e README — geradas aleatoriamente no 1º boot
-- **TOTP**: Secret gerado via hardware RNG
-- **Anti-Replay**: Reset periódico removido (era janela de 60s)
-- **Rate Limiter**: IP tracking removido (apenas hash anônimo)
-- **Encrypt-at-Rest**: AES-256-GCM (antes: AES-CTR quebrado + XOR+ROT13)
-- **HTTP**: Validação de parâmetros no endpoint /sintonizar
-- **Git**: Build artifacts adicionados ao .gitignore
-- **Hex fix**: `0xHEF3` inválido → `0x1EF3`
+- Registro binário append-only: `seq`, `utc`, `type`, `len`, `data`.
+- Cadeia: `hash[n] = SHA256(hash[n-1] ‖ registro[n])`.
+- Cabeçalho do arquivo semeia a cadeia com o `node_id` (dois gravadores nunca
+  produzem a mesma cadeia).
+- `export` gera `HEFLOG.JSONL` + `HEFLOG.HASH` com contagem, hash final e
+  resultado da verificação de integridade.
+- Ao reiniciar, o Node 3 varre o arquivo e retoma `seq`/`records`/cabeça da
+  cadeia sem reiniciar a numeração.
+- O cartão SD **não** é cifrado em repouso: a cadeia detecta alteração, mas não
+  impede leitura. Proteja fisicamente o cartão.
 
-### v3.0.0 (2026-04-20)
-- AES-GCM, anti-replay, TOTP 2FA, secure storage
+---
+
+## 11. Testes
+
+```bash
+./test_functional.sh            # invariantes + build dos 3 nós
+./test_functional.sh --no-build # só invariantes (rápido, sem toolchain)
+```
+
+Cobertura: pinagem duplicada, pinos proibidos no C3, layout do frame,
+anti-replay estrito, ausência de Telnet/EEPROM/include relativo, TOTP no login,
+dashboard sem injeção de HTML e ausência de chaves hardcoded.
+
+---
+
+## 12. Solução de problemas
+
+| Sintoma | Causa provável | Ação |
+|---|---|---|
+| `chave de link: AUSENTE` | PSK não gravado | `psk <64 hex>` e reiniciar |
+| Node 2 não autentica tracks | PSK diferente entre nós | regravar o mesmo PSK |
+| Login recusa TOTP | relógio não sincronizado | `settime <unix>` ou aguardar GNSS |
+| `/api/spectrum` vazio | varredura não iniciada | `POST /api/sweep` ou `sweep now` |
+| Node 3 sem log | SD ausente/incompatível | verificar 3,3 V, cartão FAT32, `status` |
+| Node 2 reinicia sozinho | heap crítico | reduzir sessões/varredura; ver `/api/health` |
+| Frame rejeitado como replay | emissor reiniciou sem novo epoch | reiniciar o Node 1 (epoch novo) |
+
+---
+
+## 13. Rotação de chaves e reset
+
+- **Rotação de PSK:** grave o novo PSK em todos os nós (`psk ...`), reinicie.
+  O Node 2 re-deriva a chave de cada par no primeiro frame válido.
+- **Reset de fábrica (Node 2):** `factory` apaga PSK, enrollments, credenciais
+  e TOTP. O chip continua o mesmo (a chave do vault é derivada do MAC).
+- **Node 3:** `format` apaga o log e recria o cabeçalho. Isso **destrói** a
+  cadeia anterior; exporte antes.
+
+---
+
+## 14. Limitações conhecidas
+
+- O link LoRa é ponto-a-ponto; não há roteamento multi-salto.
+- A hora do Node 1 vem do GNSS; sem fix válido, o campo `epochUtc` é 0 e o
+  Node 2 não sincroniza por ele.
+- A varredura usa um único Si4735: mede uma frequência por vez.
+- `NOISE_RISE` é heurístico (limiar de 10 dB / 30 s), não um classificador.
+- Secure boot e flash encryption **não** são habilitados pelo firmware; recomenda-
+  se habilitá-los no processo de produção (e isso queimará eFuses de forma
+  irreversível).
+- O SoftAP deriva a senha do MAC do chip. Quem tiver acesso físico ao console
+  serial vê a senha — trate o console como interface privilegiada.
+
+---
+
+## 15. Licença
+
+Ver `LICENSE`. Uso sujeito às leis de telecomunicações aplicáveis.

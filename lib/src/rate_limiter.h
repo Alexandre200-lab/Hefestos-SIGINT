@@ -29,6 +29,7 @@ struct RateBucket {
     uint32_t    lastRefillMs;
     bool        active;
     uint32_t    blockedUntilMs;
+    uint32_t    lastOpMs;
 };
 
 class RateLimiter {
@@ -61,6 +62,7 @@ private:
         buckets_[victim].tokens        = capacity_;
         buckets_[victim].lastRefillMs  = now();
         buckets_[victim].blockedUntilMs = 0;
+        buckets_[victim].lastOpMs       = 0;
         return victim;
     }
 
@@ -137,12 +139,12 @@ public:
 
         refill(b);
         if (b->tokens < 1.0f) return false;
-        if (useCooldown_ && b->lastRefillMs != 0 &&
-            (t - b->lastRefillMs) < cooldownMs_) {
+        if (useCooldown_ && b->lastOpMs != 0 &&
+            (t - b->lastOpMs) < cooldownMs_) {
             return false;
         }
         b->tokens -= 1.0f;
-        b->lastRefillMs = t;
+        b->lastOpMs = t;
         return true;
     }
 

@@ -94,7 +94,7 @@ public:
         running_ = true;
         planIndex_ = 0;
         nextFreqKHz_ = plan_[0].startKHz;
-        radio_.tune(plan_[0].band, nextFreqKHz_);
+        radio_.tune((HefBand)plan_[0].band, nextFreqKHz_);
         settleUntilMs_ = millis() + SI4735_SETTLE_MS;
     }
 
@@ -145,7 +145,7 @@ public:
             nextFreq = plan_[planIndex_].startKHz;
         }
         nextFreqKHz_ = nextFreq;
-        radio_.tune(plan_[planIndex_].band, nextFreq);
+        radio_.tune((HefBand)plan_[planIndex_].band, nextFreq);
         settleUntilMs_ = now + dwellMs_ + SI4735_SETTLE_MS;
         return true;
     }
@@ -168,6 +168,14 @@ public:
             if (samples_[idx].band == band) { *out = samples_[idx]; return true; }
         }
         return false;
+    }
+
+    // Acessa uma amostra por idade (0 = mais recente).
+    bool atAge(uint16_t age, SpectrumPoint* out) const {
+        if (age >= sampleCount_ || !out) return false;
+        uint16_t idx = (uint16_t)((sampleHead_ + SPECTRUM_RING - 1 - age) % SPECTRUM_RING);
+        *out = samples_[idx];
+        return true;
     }
 
     void clearSamples() { sampleHead_ = 0; sampleCount_ = 0; }

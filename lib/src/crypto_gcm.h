@@ -104,8 +104,7 @@ public:
         mbedtls_gcm_init(&ctx);
         int ret = setKey(&ctx, key_, sizeof(key_));
         if (ret == 0) {
-            ret = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_CIPHER_ID_AES,
-                                           MBEDTLS_GCM_ENCRYPT,
+            ret = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT,
                                            len, iv, sizeof(iv),
                                            aad, aadLen,
                                            input, output, sizeof(tag), tag);
@@ -136,8 +135,7 @@ public:
         mbedtls_gcm_init(&ctx);
         int ret = setKey(&ctx, key_, sizeof(key_));
         if (ret == 0) {
-            ret = mbedtls_gcm_auth_decrypt(&ctx, MBEDTLS_CIPHER_ID_AES,
-                                          ctLen, iv, sizeof(iv),
+            ret = mbedtls_gcm_auth_decrypt(&ctx, ctLen, iv, sizeof(iv),
                                           aad, aadLen,
                                           input + ctLen, HEF_AEAD_TAG_LEN,
                                           input, output);
@@ -149,19 +147,78 @@ public:
 };
 
 // ---------------------------------------------------------------
-// HKDF-SHA256 (mbedtls 2.x) - usado para derivacao de chaves.
-// Substitui o PBKDF2 com 100k iteracoes que era aplicado sobre um
-// segredo que NAO e senha (MAC do efuse / PSK de deploy) - PBKDF2
-// com senha humana nao tem sentido ali.
+// HKDF-SHA256 (RFC 5869) implementado sobre HMAC-SHA256 do mbedtls.
+//
+// A versao anterior chamava mbedtls_hkdf(), que depende de
+// CONFIG_MBEDTLS_HKDF_C - desabilitado no core Arduino ESP32 2.0.17.
+// A implementacao local evita depender da configuracao do SDK e usa
+// apenas a primitiva HMAC, que esta sempre disponivel.
 // ---------------------------------------------------------------
-inline bool hefHkdfSha256(const uint8_t* ikm, size_t ikmLen,
-                           const uint8_t* salt, size_t saltLen,
-                           const uint8_t* info, size_t infoLen,
-                           uint8_t* okm, size_t okmLen) {
+inline bool hefHmacSha256(const uint8_t* key, size_t keyLen,
+                          const uint8_t* data, size_t dataLen,
+                          uint8_t out[32]) {
     const mbedtls_md_info_t* md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (!md) return false;
-    return mbedtls_hkdf(md, salt, saltLen, ikm, ikmLen,
-                        info, infoLen, okm, okmLen) == 0;
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    bool ok = false;
+    if (mbedtls_md_setup(&ctx, md, 1) == 0 &&
+        mbedtls_md_hmac_starts(&ctx, key, keyLen) == 0 &&
+        mbedtls_md_hmac_update(&ctx, data, dataLen) == 0 &&
+        mbedtls_md_hmac_finish(&ctx, out) == 0) {
+        ok = true;
+    }
+    mbedtls_md_free(&ctx);
+    return ok;
+}
+
+inline bool hefHkdfSha256(const uint8_t* ikm, size_t ikmLen,
+                          const uint8_t* salt, size_t saltLen,
+                          const uint8_t* info, size_t infoLen,
+                          uint8_t* okm, size_t okmLen) {
+    if (!ikm || !okm || okmLen == 0 || okmLen > 255 * 32) return false;
+
+    // Extract: PRK = HMAC-SHA256(salt, IKM)
+    uint8_t zeroSalt[32];
+    memset(zeroSalt, 0, sizeof(zeroSalt));
+    const uint8_t* useSalt = (salt && saltLen > 0) ? salt : zeroSalt;
+    size_t useSaltLen = (salt && saltLen > 0) ? saltLen : sizeof(zeroSalt);
+
+    uint8_t prk[32];
+    if (!hefHmacSha256(useSalt, useSaltLen, ikm, ikmLen, prk)) return false;
+
+    // Expand
+    uint8_t t[32];
+    size_t tLen = 0;
+    size_t written = 0;
+    uint8_t counter = 1;
+    uint8_t block[32 + 64];
+    while (written < okmLen) {
+        size_t pos = 0;
+        if (tLen) { memcpy(block, t, tLen); pos += tLen; }
+        if (info && infoLen) {
+            size_t cp = infoLen;
+            if (cp > sizeof(block) - pos) cp = sizeof(block) - pos;
+            memcpy(block + pos, info, cp);
+            pos += cp;
+        }
+        block[pos++] = counter;
+        if (!hefHmacSha256(prk, sizeof(prk), block, pos, t)) {
+            memset(prk, 0, sizeof(prk));
+            memset(t, 0, sizeof(t));
+            return false;
+        }
+        tLen = sizeof(t);
+        size_t cp = okmLen - written;
+        if (cp > tLen) cp = tLen;
+        memcpy(okm + written, t, cp);
+        written += cp;
+        counter++;
+    }
+    memset(prk, 0, sizeof(prk));
+    memset(t, 0, sizeof(t));
+    memset(block, 0, sizeof(block));
+    return true;
 }
 
 // Comparacao em tempo constante.

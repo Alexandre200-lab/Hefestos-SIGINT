@@ -1,43 +1,58 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =====================================================================
+# Hefestos SIGINT v5.0.0 - build de todos os nos
+#
+# Requisitos:
+#   - arduino-cli >= 0.35
+#   - core esp32:esp32 EXATAMENTE 2.0.17 (mbedtls 2.x)
+#   - bibliotecas externas (ver dependencias.txt)
+#
+# A biblioteca compartilhada deste repositorio (lib/) e' passada via
+# --libraries, o que resolve o include quebrado da v4 ("../lib/...").
+# =====================================================================
 set -euo pipefail
 
-if ! command -v arduino-cli >/dev/null 2>&1; then
-  echo "ERROR: arduino-cli not found. Install it before building the project."
-  echo "Docs: https://arduino.github.io/arduino-cli/latest/installation/"
-  exit 127
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLI="${ARDUINO_CLI:-arduino-cli}"
+CORE_VERSION="2.0.17"
+BUILD_DIR="$ROOT/build"
+
+if ! command -v "$CLI" >/dev/null 2>&1; then
+    echo "ERRO: arduino-cli nao encontrado no PATH." >&2
+    echo "      Instale em https://arduino.github.io/arduino-cli/ e reexecute." >&2
+    exit 1
 fi
 
-BOARD_ESP32="esp32:esp32:esp32"
-BOARD_ESP32C3="esp32:esp32:esp32c3"
-BUILD_DIR="build"
+INSTALLED="$("$CLI" core list 2>/dev/null | awk '$1=="esp32:esp32"{print $2}')"
+if [ "$INSTALLED" != "$CORE_VERSION" ]; then
+    echo "ERRO: core esp32 instalado='${INSTALLED:-nenhum}', exigido='$CORE_VERSION'." >&2
+    echo "      Execute: $CLI core install esp32:esp32@$CORE_VERSION" >&2
+    exit 1
+fi
 
-echo "=== HEFESTOS SIGINT v4.0 - Build ==="
-echo ""
+mkdir -p "$BUILD_DIR"
 
-# === Node1 - Transmissor/Alvo (ESP32) ===
-echo "--- Node1 (Transmissor/Alvo - ESP32) ---"
-arduino-cli compile -b $BOARD_ESP32 \
-  --build-path $BUILD_DIR/Node1 \
-  --warnings all \
-  src/Node1_Transmissor_Alvo/
+compile_node() {
+    local name="$1"
+    local fqbn="$2"
+    local sketch="$3"
 
-echo ""
+    echo
+    echo "==> Compilando $name ($fqbn)"
+    "$CLI" compile \
+        --fqbn "$fqbn" \
+        --libraries "$ROOT" \
+        --build-path "$BUILD_DIR/$name" \
+        --warnings default \
+        "$sketch"
+}
 
-# === Node2 - Base Hefestos (ESP32) ===
-echo "--- Node2 (Base Hefestos - ESP32) ---"
-arduino-cli compile -b $BOARD_ESP32 \
-  --build-path $BUILD_DIR/Node2 \
-  --warnings all \
-  src/Node2_Base_Hefestos/
+compile_node "node1" "esp32:esp32:esp32"   "$ROOT/src/Node1_Transmissor_Alvo"
+compile_node "node2" "esp32:esp32:esp32"   "$ROOT/src/Node2_Base_Hefestos"
+compile_node "node3" "esp32:esp32:esp32c3" "$ROOT/src/Node3_Caixa_Preta_ESP32C3"
 
-echo ""
-
-# === Node3 - Caixa Preta (ESP32-C3) ===
-echo "--- Node3 (Caixa Preta - ESP32-C3) ---"
-arduino-cli compile -b $BOARD_ESP32C3 \
-  --build-path $BUILD_DIR/Node3 \
-  --warnings all \
-  src/Node3_Caixa_Preta_ESP32C3/
-
-echo ""
-echo "=== BUILD OK ==="
+echo
+echo "====================================================="
+echo " BUILD OK - Hefestos SIGINT v5.0.0 (3/3 nos)"
+echo " Artefatos em: $BUILD_DIR"
+echo "====================================================="

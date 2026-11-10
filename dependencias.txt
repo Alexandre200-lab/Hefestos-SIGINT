@@ -1,12 +1,17 @@
-Bibliotecas requeridas na IDE:
-- LoRa (Sandeep Mistry)
-- TinyGPSPlus (Mikal Hart)
-- Adafruit Si4713 Library (Adafruit)
-- PU2CLR SI4735 (Ricardo Lima Caratti)
-- ESPAsyncWebServer (Repositorio Github: me-no-dev)
-- AsyncTCP (Repositorio Github: me-no-dev)
-- ArduinoJson (Benoit Blanchon)
-- AESLib (Compativel com arquitetura ESP32)
-- SD (Nativa)
-- SoftwareSerial (Nativa)
-- SPI e Wire (Nativas)
+Bibliotecas externas testadas (Arduino ESP32 core 2.0.17)
+
+Obrigatorias:
+- LoRa ......................... 0.8.0    (Sandeep Mistry)
+- TinyGPSPlus .................. 1.0.3    (Mikal Hart)
+- Adafruit Si4713 Library ...... 1.2.4    (Adafruit)
+- PU2CLR SI4735 ................ 2.1.8    (Ricardo Lima Caratti)
+- ArduinoJson .................. 6.21.5   (Benoit Blanchon)
+- ESPAsyncWebServer ............ 3.6.0    (fork mathieucarbou)
+- AsyncTCP ..................... 3.3.2    (fork mathieucarbou)
+
+Nativas do core (nao instalar):
+- WiFi, Wire, SPI, SD, Preferences, FS, HardwareSerial, mbedtls
+
+Removidas na v5.0.0:
+- AESLib        (substituida por mbedtls AES-256-GCM)
+- SoftwareSerial (o ESP32-C3 usa UARTs de hardware)

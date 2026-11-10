@@ -73,7 +73,7 @@
 // ============================================================
 #define HEF_LINK_MAGIC        0xA5
 #define HEF_LINK_VERSION      5
-#define HEF_HEADER_LEN        13
+#define HEF_HEADER_LEN        15
 #define HEF_TAG_LEN           16
 #define HEF_IV_LEN            12
 #define HEF_KEY_LEN           32      // AES-256
@@ -136,6 +136,7 @@
 #define HEF_VAULT_MAGIC     0x48464643   // "HFFC"
 #define HEF_VAULT_VERSION   5
 #define HEF_MAX_ENROLLMENTS 8
+#define HEF_TOTP_SECRET_MAX 32
 #define HEF_KEY_ID_MAX      255
 
 // ============================================================

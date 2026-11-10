@@ -18,12 +18,15 @@
 //   | magic    u32 LE           |  HEF_VAULT_MAGIC
 //   | version  u8               |  HEF_VAULT_VERSION
 //   | flags    u8               |
-//   | totalLen u16 LE           |  tamanho do ciphertext
+//   | totalLen u16 LE           |  ciphertext + tag GCM
 //   | iv       u8[12]           |
-//   | tag      u8[16]           |
+//   | reservado u8[16]          |  (zero; semantica futura)
 //   +---------------------------+
-//   | ciphertext (TLV)          |  AES-256-GCM
+//   | ciphertext || tag (16)    |  AES-256-GCM
 //   +---------------------------+
+//
+// totalLen cobre ciphertext E tag: a integridade do blob e' verificada
+// por (36 + totalLen == tamanho gravado).
 //
 // A chave do vault e' derivada do MAC do efuse (HKDF) => o vault e'
 // vinculado ao chip. Trocar de ESP32 invalida o conteudo (propriedade
@@ -50,6 +53,9 @@
 #define HEF_TLV_ENROLL    0x06
 #define HEF_TLV_NODE_ID   0x07
 #define HEF_TLV_TZ_MIN    0x08
+#define HEF_TLV_WIFI_SSID 0x09
+
+#define HEF_VAULT_BUF 512
 
 #define HEF_FLAG_PROVISIONED 0x01
 #define HEF_FLAG_DEBUG       0x02
@@ -70,6 +76,15 @@ private:
     HefEnrollment enroll_[HEF_MAX_ENROLLMENTS];
     uint8_t enrollCount_;
     bool loaded_;
+
+    // Cache dos segredos em RAM (decifrados uma vez no boot).
+    char    wifiSsid_[33];
+    char    wifiPass_[33];
+    char    cliUser_[17];
+    char    cliPass_[33];
+    uint8_t totpSecret_[HEF_TOTP_SECRET_MAX];
+    size_t  totpLen_;
+    bool    secretsLoaded_;
 
     // --- Derivacao da chave do vault a partir do MAC do efuse ---
     void deriveVaultKey() {
@@ -114,9 +129,15 @@ private:
 
 public:
     ConfigVault()
-        : havePsk_(false), flags_(0), nodeId_(0), enrollCount_(0), loaded_(false) {
+        : havePsk_(false), flags_(0), nodeId_(0), enrollCount_(0), loaded_(false),
+          totpLen_(0), secretsLoaded_(false) {
         memset(masterPsk_, 0, sizeof(masterPsk_));
         memset(enroll_, 0, sizeof(enroll_));
+        memset(wifiSsid_, 0, sizeof(wifiSsid_));
+        memset(wifiPass_, 0, sizeof(wifiPass_));
+        memset(cliUser_, 0, sizeof(cliUser_));
+        memset(cliPass_, 0, sizeof(cliPass_));
+        memset(totpSecret_, 0, sizeof(totpSecret_));
     }
 
     // ---- Ciclo de vida ----
@@ -137,8 +158,14 @@ public:
 
     void end() {
         wipePsk();
+        volatile uint8_t* p;
+        p = (volatile uint8_t*)wifiPass_; for (size_t i = 0; i < sizeof(wifiPass_); i++) p[i] = 0;
+        p = (volatile uint8_t*)cliPass_;  for (size_t i = 0; i < sizeof(cliPass_); i++) p[i] = 0;
+        p = (volatile uint8_t*)totpSecret_; for (size_t i = 0; i < sizeof(totpSecret_); i++) p[i] = 0;
+        totpLen_ = 0;
         prefs_.end();
         loaded_ = false;
+        secretsLoaded_ = false;
     }
 
     bool isLoaded() const { return loaded_; }
@@ -151,10 +178,10 @@ public:
         flags_ = 0;
 
         size_t blobLen = prefs_.getBytesLength(HEF_NVS_KEY_VAULT);
-        if (blobLen < 44) return false;   // header(4+1+1+2+12+16)=36 + 1 tag? -> minimo 36
-        if (blobLen > 2048) return false;
+        if (blobLen < 52) return false;   // header 36 + tag GCM 16 (payload vazio)
+        if (blobLen > HEF_VAULT_BUF) return false;
 
-        uint8_t buf[2048];
+        uint8_t buf[HEF_VAULT_BUF];
         size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
         if (got < 36 || got > sizeof(buf)) return false;
 
@@ -175,13 +202,11 @@ public:
         if ((size_t)totalLen + 36 != got) return false;   // integridade do tamanho
 
         const uint8_t* iv  = buf + 8;
-        const uint8_t* tag = buf + 20;
-        const uint8_t* ct  = buf + 36;
 
         AeadGcm gcm;
         gcm.setKey(vaultKey_, sizeof(vaultKey_));
-        uint8_t plain[2048];
-        int ptLen = gcm.decrypt(ct, totalLen, plain, sizeof(plain),
+        uint8_t plain[HEF_VAULT_BUF];
+        int ptLen = gcm.decrypt(buf + 36, totalLen, plain, sizeof(plain),
                                 0, 0, iv, HEF_IV_LEN);
         if (ptLen < 0) return false;
 
@@ -202,12 +227,36 @@ public:
             memcpy(&stored, v, 2);
             if (stored != 0) nodeId_ = stored;
         }
+
+        // Cache dos segredos em RAM
+        wifiSsid_[0] = wifiPass_[0] = cliUser_[0] = cliPass_[0] = 0;
+        totpLen_ = 0;
+        secretsLoaded_ = true;
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_WIFI_SSID, &v, &l)) {
+            size_t cp = (l < sizeof(wifiSsid_) - 1) ? l : sizeof(wifiSsid_) - 1;
+            memcpy(wifiSsid_, v, cp); wifiSsid_[cp] = 0;
+        }
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_WIFI_PASS, &v, &l)) {
+            size_t cp = (l < sizeof(wifiPass_) - 1) ? l : sizeof(wifiPass_) - 1;
+            memcpy(wifiPass_, v, cp); wifiPass_[cp] = 0;
+        }
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_CLI_USER, &v, &l)) {
+            size_t cp = (l < sizeof(cliUser_) - 1) ? l : sizeof(cliUser_) - 1;
+            memcpy(cliUser_, v, cp); cliUser_[cp] = 0;
+        }
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_CLI_PASS, &v, &l)) {
+            size_t cp = (l < sizeof(cliPass_) - 1) ? l : sizeof(cliPass_) - 1;
+            memcpy(cliPass_, v, cp); cliPass_[cp] = 0;
+        }
+        if (tlvFind(plain, (size_t)ptLen, HEF_TLV_TOTP, &v, &l) && l <= HEF_TOTP_SECRET_MAX) {
+            memcpy(totpSecret_, v, l); totpLen_ = l;
+        }
         return true;
     }
 
     bool save() {
         // Monta TLV
-        uint8_t plain[2048];
+        uint8_t plain[HEF_VAULT_BUF];
         size_t pos = 0;
 
         if (havePsk_) {
@@ -222,25 +271,40 @@ public:
         nid[1] = (uint8_t)(nodeId_ >> 8);
         pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_NODE_ID, nid, 2);
 
+        // Segredos em cache: precisam ser reescritos aqui, senao um save()
+        // disparado por enrollNode()/setDeploymentPsk() APAGARIA as
+        // credenciais ja provisionadas.
+        if (wifiSsid_[0]) pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_WIFI_SSID,
+                                          (const uint8_t*)wifiSsid_, strlen(wifiSsid_) + 1);
+        if (wifiPass_[0]) pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_WIFI_PASS,
+                                          (const uint8_t*)wifiPass_, strlen(wifiPass_) + 1);
+        if (cliUser_[0])  pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_CLI_USER,
+                                          (const uint8_t*)cliUser_, strlen(cliUser_) + 1);
+        if (cliPass_[0])  pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_CLI_PASS,
+                                          (const uint8_t*)cliPass_, strlen(cliPass_) + 1);
+        if (totpLen_ > 0) pos = tlvAppend(plain, sizeof(plain), pos, HEF_TLV_TOTP,
+                                          totpSecret_, totpLen_);
+
         // Cifra
         uint8_t iv[HEF_IV_LEN];
         esp_fill_random(iv, sizeof(iv));
-        uint8_t cipher[2048];
+        uint8_t cipher[HEF_VAULT_BUF];
         AeadGcm gcm;
         gcm.setKey(vaultKey_, sizeof(vaultKey_));
         int ctLen = gcm.encrypt(plain, pos, cipher, sizeof(cipher), 0, 0, NULL, 0);
         if (ctLen < 0) return false;
 
-        uint8_t out[2048];
+        uint8_t out[HEF_VAULT_BUF];
         uint32_t magic = HEF_VAULT_MAGIC;
-        memcpy(out, magic, 4);
+        memcpy(out, &magic, 4);
         out[4] = HEF_VAULT_VERSION;
         out[5] = flags_;
         uint16_t tl = (uint16_t)ctLen;
         memcpy(out + 6, &tl, 2);
         memcpy(out + 8, iv, HEF_IV_LEN);
-        memcpy(out + 20, cipher + ctLen - HEF_AEAD_TAG_LEN, HEF_AEAD_TAG_LEN);
-        memcpy(out + 36, cipher, ctLen - HEF_AEAD_TAG_LEN);
+        memset(out + 20, 0, 16);            // reservado (semantica futura)
+        // ciphertext || tag GCM, contiguos.
+        memcpy(out + 36, cipher, (size_t)ctLen);
 
         size_t total = 36 + (size_t)ctLen;
         prefs_.putBytes(HEF_NVS_KEY_VAULT, out, total);
@@ -250,21 +314,26 @@ public:
     // ---- Segredos (com fallback seguro) ----
 
     bool getWifiPassword(char* out, size_t n) {
-        if (!load()) { if (n) out[0] = 0; return false; }
-        uint8_t buf[2048];
-        size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
-        if (got < 36) return false;
-        uint16_t totalLen; memcpy(&totalLen, buf + 6, 2);
-        const uint8_t* iv = buf + 8; const uint8_t* tag = buf + 20; const uint8_t* ct = buf + 36;
-        AeadGcm gcm; gcm.setKey(vaultKey_, sizeof(vaultKey_));
-        uint8_t plain[2048];
-        int ptLen = gcm.decrypt(ct, totalLen, plain, sizeof(plain), 0, 0, iv, HEF_IV_LEN);
-        if (ptLen < 0) return false;
-        const uint8_t* v; size_t l;
-        if (!tlvFind(plain, (size_t)ptLen, HEF_TLV_WIFI_PASS, &v, &l)) return false;
-        size_t cp = (l < n - 1) ? l : n - 1;
-        memcpy(out, v, cp); out[cp] = 0;
+        if (!out || n == 0) return false;
+        if (!secretsLoaded_) load();
+        if (!wifiPass_[0]) return false;
+        strncpy(out, wifiPass_, n - 1);
+        out[n - 1] = 0;
         return true;
+    }
+
+    bool getWifiSsid(char* out, size_t n) {
+        if (!out || n == 0) return false;
+        if (!secretsLoaded_) load();
+        if (!wifiSsid_[0]) return false;
+        strncpy(out, wifiSsid_, n - 1);
+        out[n - 1] = 0;
+        return true;
+    }
+
+    bool setWifiSsid(const char* ssid) {
+        if (!ssid || strlen(ssid) < 1 || strlen(ssid) > 32) return false;
+        return setSecret(HEF_TLV_WIFI_SSID, (const uint8_t*)ssid, strlen(ssid) + 1);
     }
 
     bool setWifiPassword(const char* pass) {
@@ -273,19 +342,11 @@ public:
     }
 
     bool getCliUsername(char* out, size_t n) {
-        if (!load()) { if (n) out[0] = 0; return false; }
-        uint8_t buf[2048];
-        size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
-        if (got < 36) return false;
-        uint16_t totalLen; memcpy(&totalLen, buf + 6, 2);
-        AeadGcm gcm; gcm.setKey(vaultKey_, sizeof(vaultKey_));
-        uint8_t plain[2048];
-        int ptLen = gcm.decrypt(buf + 36, totalLen, plain, sizeof(plain), 0, 0, buf + 8, HEF_IV_LEN);
-        if (ptLen < 0) return false;
-        const uint8_t* v; size_t l;
-        if (!tlvFind(plain, (size_t)ptLen, HEF_TLV_CLI_USER, &v, &l)) return false;
-        size_t cp = (l < n - 1) ? l : n - 1;
-        memcpy(out, v, cp); out[cp] = 0;
+        if (!out || n == 0) return false;
+        if (!secretsLoaded_) load();
+        if (!cliUser_[0]) return false;
+        strncpy(out, cliUser_, n - 1);
+        out[n - 1] = 0;
         return true;
     }
 
@@ -295,19 +356,11 @@ public:
     }
 
     bool getCliPassword(char* out, size_t n) {
-        if (!load()) { if (n) out[0] = 0; return false; }
-        uint8_t buf[2048];
-        size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
-        if (got < 36) return false;
-        uint16_t totalLen; memcpy(&totalLen, buf + 6, 2);
-        AeadGcm gcm; gcm.setKey(vaultKey_, sizeof(vaultKey_));
-        uint8_t plain[2048];
-        int ptLen = gcm.decrypt(buf + 36, totalLen, plain, sizeof(plain), 0, 0, buf + 8, HEF_IV_LEN);
-        if (ptLen < 0) return false;
-        const uint8_t* v; size_t l;
-        if (!tlvFind(plain, (size_t)ptLen, HEF_TLV_CLI_PASS, &v, &l)) return false;
-        size_t cp = (l < n - 1) ? l : n - 1;
-        memcpy(out, v, cp); out[cp] = 0;
+        if (!out || n == 0) return false;
+        if (!secretsLoaded_) load();
+        if (!cliPass_[0]) return false;
+        strncpy(out, cliPass_, n - 1);
+        out[n - 1] = 0;
         return true;
     }
 
@@ -317,19 +370,12 @@ public:
     }
 
     bool getTotpSecret(uint8_t* out, size_t* outLen) {
-        if (!load()) return false;
-        uint8_t buf[2048];
-        size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
-        if (got < 36) return false;
-        uint16_t totalLen; memcpy(&totalLen, buf + 6, 2);
-        AeadGcm gcm; gcm.setKey(vaultKey_, sizeof(vaultKey_));
-        uint8_t plain[2048];
-        int ptLen = gcm.decrypt(buf + 36, totalLen, plain, sizeof(plain), 0, 0, buf + 8, HEF_IV_LEN);
-        if (ptLen < 0) return false;
-        const uint8_t* v; size_t l;
-        if (!tlvFind(plain, (size_t)ptLen, HEF_TLV_TOTP, &v, &l)) return false;
-        if (l > *outLen) l = *outLen;
-        memcpy(out, v, l); *outLen = l;
+        if (!out || !outLen) return false;
+        if (!secretsLoaded_) load();
+        if (totpLen_ == 0) return false;
+        if (totpLen_ > *outLen) return false;
+        memcpy(out, totpSecret_, totpLen_);
+        *outLen = totpLen_;
         return true;
     }
 
@@ -339,9 +385,9 @@ public:
 
     // Reescreve uma entrada TLV preservando as demais.
     bool setSecret(uint8_t type, const uint8_t* val, size_t len) {
-        uint8_t buf[2048];
+        uint8_t buf[HEF_VAULT_BUF];
         size_t got = prefs_.getBytes(HEF_NVS_KEY_VAULT, buf, sizeof(buf));
-        uint8_t plain[2048];
+        uint8_t plain[HEF_VAULT_BUF];
         size_t plainLen = 0;
 
         if (got >= 36) {
@@ -356,7 +402,7 @@ public:
         if (plainLen == 0) plainLen = 0;
 
         // Remove entrada existente e reconstroi o TLV.
-        uint8_t rebuilt[2048];
+        uint8_t rebuilt[HEF_VAULT_BUF];
         size_t pos = 0;
         size_t p = 0;
         while (p + 3 <= plainLen) {
@@ -373,24 +419,25 @@ public:
         // Re-cifra preservando PSK/enroll/nodeId guardados em RAM.
         uint8_t iv[HEF_IV_LEN];
         esp_fill_random(iv, sizeof(iv));
-        uint8_t cipher[2048];
+        uint8_t cipher[HEF_VAULT_BUF];
         AeadGcm gcm;
         gcm.setKey(vaultKey_, sizeof(vaultKey_));
         int ctLen = gcm.encrypt(rebuilt, pos, cipher, sizeof(cipher), 0, 0, NULL, 0);
         if (ctLen < 0) return false;
 
-        uint8_t out[2048];
+        uint8_t out[HEF_VAULT_BUF];
         uint32_t magic = HEF_VAULT_MAGIC;
-        memcpy(out, magic, 4);
+        memcpy(out, &magic, 4);
         out[4] = HEF_VAULT_VERSION;
         out[5] = flags_;
         uint16_t tl = (uint16_t)ctLen;
         memcpy(out + 6, &tl, 2);
         memcpy(out + 8, iv, HEF_IV_LEN);
-        memcpy(out + 20, cipher + ctLen - HEF_AEAD_TAG_LEN, HEF_AEAD_TAG_LEN);
-        memcpy(out + 36, cipher, ctLen - HEF_AEAD_TAG_LEN);
+        memset(out + 20, 0, 16);
+        memcpy(out + 36, cipher, (size_t)ctLen);
 
         prefs_.putBytes(HEF_NVS_KEY_VAULT, out, 36 + (size_t)ctLen);
+        secretsLoaded_ = false;   // invalida cache; proximo get() recarrega
         return true;
     }
 
@@ -429,6 +476,18 @@ public:
         return false;
     }
 
+    // Lookup inverso: keyId (campo do cabecalho do frame) -> node_id.
+    // O receptor precisa do node_id ANTES de decifrar, para derivar a chave.
+    bool nodeIdForKeyId(uint8_t keyId, uint16_t* out) const {
+        for (uint8_t i = 0; i < enrollCount_; i++) {
+            if (enroll_[i].keyId == keyId) {
+                if (out) *out = enroll_[i].nodeId;
+                return true;
+            }
+        }
+        return false;
+    }
+
     uint8_t enrollmentCount() const { return enrollCount_; }
 
     // ---- Flags / estado ----
@@ -447,14 +506,22 @@ public:
 
     // ---- Manutencao ----
 
+    // Apaga TODO o conteudo do vault (PSK, enrollments, credenciais,
+    // segredo TOTP). A chave do vault e' derivada do MAC do efuse; um
+    // factory reset nao a expoe nem a altera.
     bool factoryReset() {
         prefs_.remove(HEF_NVS_KEY_VAULT);
         wipePsk();
         enrollCount_ = 0;
         flags_ = 0;
         memset(enroll_, 0, sizeof(enroll_));
-        prefs_.putBytes(HEF_NVS_KEY_VAULT, (const uint8_t*)HEF_VAULT_MAGIC, 0); // placeholder
-        prefs_.remove(HEF_NVS_KEY_VAULT);
+        memset(wifiSsid_, 0, sizeof(wifiSsid_));
+        memset(wifiPass_, 0, sizeof(wifiPass_));
+        memset(cliUser_, 0, sizeof(cliUser_));
+        memset(cliPass_, 0, sizeof(cliPass_));
+        memset(totpSecret_, 0, sizeof(totpSecret_));
+        totpLen_ = 0;
+        secretsLoaded_ = true;
         return true;
     }
 };

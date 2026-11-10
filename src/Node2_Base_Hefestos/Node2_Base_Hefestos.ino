@@ -1,11 +1,32 @@
-// Node 2: Hefestos Base Server (ESP32) - v4.0
-// Uses centralized pin definitions from hefestos_pins.h
+// =====================================================================
+// Node 2 - Base / Posto de Sensores (ESP32-WROOM-32) - v5.0.0
+//
+// Funcoes:
+//   - Recebe os frames de tracking do Node1 por LoRa (AES-256-GCM).
+//   - Mantem estado por par (node_id -> chave derivada por HKDF).
+//   - Responde TRACK_ACK autenticado (o Node1 retransmite sem ACK).
+//   - Sincroniza o relogio UTC pelo epoch GNSS recebido (TOTP depende disso).
+//   - Encaminha cada track para o Node3 (Caixa Preta) por UART2.
+//   - Controla o receptor Si4735 (FM/AM/SW) e a varredura de espectro.
+//   - Detecta interferencia/jamming por metricas reais de RF.
+//   - Serve dashboard/API autenticado (usuario + senha + TOTP).
+//
+// v5.0.0 - Correcoes em relacao a v4.x:
+//   - UART0 reservada ao console; Node3 passou para UART2 (a v4 usava
+//     UART0 para o Node3, matando o console e o log de debug).
+//   - Telnet removido (texto claro em rede de campo).
+//   - Dashboard sem injecao de HTML (a v4 montava String com dados de RF).
+//   - Sessoes com expiracao idle/absoluta e binding por IP.
+//   - Rate limit por IP e por operacao (login x comandos).
+//   - Encaminhamento ao Node3 no loop principal (a v4 nunca enviava).
+//   - Varredura de espectro nao-bloqueante com RSSI real do Si4735.
+//   - Jamming com estado real (RSSI/SNR/perda de enlace), nao constante.
+// =====================================================================
 #include <WiFi.h>
 #include <sys/time.h>
-#include <esp_task_wdt.h>
-
-void processCommand(String cmd);
-void processAuth();
+#include <time.h>
+#include <esp_random.h>
+#include <esp_efuse.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <LoRa.h>
@@ -13,949 +34,1455 @@ void processAuth();
 #include <Wire.h>
 #include <SI4735.h>
 #include <HardwareSerial.h>
+#include <Preferences.h>
 
-#include "../lib/hefestos_pins.h"
-#include "../lib/config.h"
-#include "../lib/crypto_gcm.h"
-#include "../lib/secure_protocol.h"
-#include "../lib/rate_limiter.h"
-#include "../lib/debug.h"
+#include <hefestos_pins.h>
+#include <config.h>
+#include <crypto_gcm.h>
+#include <debug.h>
+#include <link_protocol.h>
+#include <provisioning.h>
+#include <secure_protocol.h>
+#include <rate_limiter.h>
+#include <totp_auth.h>
+#include <radio_si4735.h>
+#include <spectrum.h>
+#include <jamming_detector.h>
+#include <serial_protocol.h>
 
-char targetMessage[128] = "Aguardando sincronizacao...";
-int rssiLoRa = 0;
-char currentBand[4] = "FM";
-float currentFreq = 100.1;
-uint32_t packet_rx_count = 0;
-uint32_t gcm_valid_count = 0;
-uint32_t gcm_invalid_count = 0;
-uint32_t replay_count = 0;
+// =====================================================================
+// Objetos globais
+// =====================================================================
+static ConfigVault  vault;
+static DebugLogger  dbg;
+static TotpAuth     totp;
 
-ConfigManager config;
-DebugLogger debug;
-SecureProtocol secProto;
-AESGCM aesgcm;
-PacketHistory packetHistory;
+static SI4735       si4735;
+static HefRadio     radio(si4735);
+static SpectrumScanner scanner(radio);
+static JammingDetector jam;
 
-uint8_t aes_key[16];
-SI4735 radioRX;
-AsyncWebServer server(80);
-WiFiServer shellServer(23);
-WiFiClient shellClient;
+static HardwareSerial node3Serial(2);   // UART2 -> Node3
+static HefSerialTx    serTx;
+static HefSerialRx    serRx;
+static Preferences    seqPrefs;
 
-struct TelnetState {
-  bool authenticated;
-  int auth_attempts;
-  char username[64];
-  unsigned long last_activity;
-  unsigned long session_start;
-  char auth_input[64];
-  char auth_password[64];
-  bool waiting_password;
-} telnet_state = {false, 0, "", 0, 0, "", "", false};
+static AsyncWebServer server(80);
 
-struct BlockedIP {
-  IPAddress ip;
-  unsigned long blocked_since;
-};
-BlockedIP blocked_ips[MAX_BLOCKED_IPS];
-int blocked_count = 0;
+// Prototipos usados antes da definicao (link serial com o Node3).
+void hefSendSer(uint8_t type, const uint8_t* data, uint16_t len);
+void hefSendTimeToNode3(uint32_t utc);
 
-unsigned long last_barrida_check = 0;
+static RateLimiter loginLimiter(RATE_LOGIN_BUCKET, RATE_LOGIN_WINDOW_MS);
+static RateLimiter cmdLimiter(RATE_CMD_BUCKET, RATE_CMD_WINDOW_MS, RATE_CMD_COOLDOWN_MS);
 
-// === Serial Communication with Node3 ===
-HardwareSerial SerialNode2(0);
+static uint16_t nodeId = 0;
+static bool     keyReady = false;
+static bool     clockSynced = false;
+static bool     autoSweep = false;
 
-// === HTTP Session Management ===
-#define MAX_HTTP_SESSIONS 4
-#define HTTP_SESSION_IDLE_TIMEOUT 1800000   // 30 min
-#define HTTP_SESSION_ABSOLUTE_TIMEOUT 14400000  // 4 hours
-
-struct HTTPSession {
-  char token[33];        // 16 bytes -> 32 hex chars + null
-  IPAddress ip;
-  unsigned long last_activity;
-  unsigned long created_at;
-  bool active;
-};
-
-HTTPSession http_sessions[MAX_HTTP_SESSIONS];
-
-bool verifyHTTPSession(AsyncWebServerRequest* request) {
-  if (!request->hasHeader("Cookie") && !request->hasHeader("X-Hefestos-Token")) {
-    return false;
-  }
-  
-  String token = "";
-  if (request->hasHeader("X-Hefestos-Token")) {
-    token = request->getHeader("X-Hefestos-Token")->value();
-  } else if (request->hasHeader("Cookie")) {
-    String cookie = request->getHeader("Cookie")->value();
-    int pos = cookie.indexOf("X-Hefestos-Token=");
-    if (pos >= 0) {
-      pos += 17; // length of "X-Hefestos-Token="
-      int end = cookie.indexOf(';', pos);
-      if (end < 0) end = cookie.length();
-      token = cookie.substring(pos, end);
-    }
-  }
-  
-  if (token.length() != 32) return false;
-  
-  unsigned long now = millis();
-  for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
-    if (http_sessions[i].active && 
-        secureCompare(http_sessions[i].token, token.c_str()) &&
-        http_sessions[i].ip == request->client()->remoteIP()) {
-      
-      if (now - http_sessions[i].last_activity > HTTP_SESSION_IDLE_TIMEOUT ||
-          now - http_sessions[i].created_at > HTTP_SESSION_ABSOLUTE_TIMEOUT) {
-        http_sessions[i].active = false;
-        return false;
-      }
-      
-      http_sessions[i].last_activity = now;
-      return true;
-    }
-  }
-  return false;
-}
-
-void cleanupHTTPSessions() {
-  unsigned long now = millis();
-  for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
-    if (http_sessions[i].active &&
-        (now - http_sessions[i].last_activity > HTTP_SESSION_IDLE_TIMEOUT ||
-         now - http_sessions[i].created_at > HTTP_SESSION_ABSOLUTE_TIMEOUT)) {
-      http_sessions[i].active = false;
-    }
-  }
-}
-
-String generateSessionToken() {
-  uint8_t random_bytes[16];
-  esp_fill_random(random_bytes, 16);
-  String token = "";
-  for (int i = 0; i < 16; i++) {
-    char hex[3];
-    sprintf(hex, "%02x", random_bytes[i]);
-    token += hex;
-  }
-  return token;
-}
-
-bool isIPBlocked(IPAddress ip) {
-  unsigned long now = millis();
-  for (int i = 0; i < blocked_count; i++) {
-    if (blocked_ips[i].ip == ip) {
-      if (now - blocked_ips[i].blocked_since > BLOCK_DURATION) {
-        blocked_ips[i] = blocked_ips[--blocked_count];
-        return false;
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-void blockIP(IPAddress ip) {
-  if (blocked_count < MAX_BLOCKED_IPS) {
-    blocked_ips[blocked_count].ip = ip;
-    blocked_ips[blocked_count].blocked_since = millis();
-    blocked_count++;
-  } else {
-    int oldest = 0;
-    for (int i = 1; i < MAX_BLOCKED_IPS; i++) {
-      if (blocked_ips[i].blocked_since < blocked_ips[oldest].blocked_since) {
-        oldest = i;
-      }
-    }
-    debug.logf("BLOCK LRU: substituindo slot %d", oldest);
-    blocked_ips[oldest].ip = ip;
-    blocked_ips[oldest].blocked_since = millis();
-  }
-  persistBlockedIPs();
-}
-
-void persistBlockedIPs() {
-  EEPROM.write(EEPROM_ADDR_BLOCKED, blocked_count);
-  for (int i = 0; i < blocked_count; i++) {
-    for (int j = 0; j < 4; j++) {
-      EEPROM.write(EEPROM_ADDR_BLOCKED + 1 + i * 4 + j, blocked_ips[i].ip[j]);
-    }
-  }
-  EEPROM.commit();
-}
-
-// === V4.1: Band Sweep and Jamming Detection ===
-
-void barridaBanda() {
-  const char* bandas[] = {"FM", "AM", "SW"};
-  float freqs[][3] = {
-      {8400, 10800, 100.1},     // FM
-      {520, 1710, 1000},         // AM  
-      {2300, 30000, 5000}        // SW
-  };
-
-  for (int b = 0; b < 3; b++) {
-    for (int f = 0; f < 3; f++) {
-      radioRX.setBand(bandas[b], freqs[b][f]);
-      delay(50);
-      int rssi = readRSSI();
-      logSpectra(bandas[b], freqs[b][f], rssi);
-    }
-  }
-}
-
-int readRSSI() {
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    rssiLoRa = LoRa.packetRssi();
-    return rssiLoRa;
-  }
-  return rssiLoRa;
-}
-
-void logSpectra(const char* banda, float freq, int rssi) {
-  debug.logf("SPECTRA: Banda=%s Freq=%.1f RSSI=%d dBm", banda, freq, rssi);
-}
-
-// Jamming detection structure
-struct LinkMetric {
-  uint32_t last_counter;
-  uint32_t gaps;
-  int snr_estimate;
-  bool jamming_detected;
-  unsigned long jamming_since;
+// =====================================================================
+// Estado por par (node_id remoto)
+// =====================================================================
+struct PeerState {
+    bool      used;
+    uint16_t  nodeId;
+    uint8_t   keyId;
+    uint8_t   key[HEF_KEY_LEN];
+    RxSequence rx;
+    HefTrack  last;
+    bool      haveTrack;
+    uint32_t  lastSeenMs;
+    uint32_t  framesOk;
+    uint32_t  framesBad;
+    uint32_t  replays;
+    int16_t   lastRssi;
+    float     lastSnr;
 };
 
-LinkMetric link_metrics;
+static PeerState peers[HEF_MAX_ENROLLMENTS];
+static uint32_t loraFramesOk = 0;
+static uint32_t loraFramesBad = 0;
+static uint32_t loraReplays = 0;
+static uint32_t acksSent = 0;
 
-void monitorLinkQuality() {
-  static uint32_t last_rx_counter = 0;
-  uint32_t current = secProto.getRXCounter();
+// =====================================================================
+// Cache de respostas do Node3 (nao-bloqueante)
+// =====================================================================
+struct RespCache {
+    uint8_t  req;
+    bool     valid;
+    uint32_t ms;
+    char     json[640];
+};
+static RespCache respCache[4];
 
-  if (current != last_rx_counter && current != 0) {
-    uint32_t gap = current - last_rx_counter;
-    if (gap > 0) {
-      // Map gap to SNR estimate: smaller gap = better SNR
-      link_metrics.snr_estimate = map(gap, 1, 100, 100, 0);
-      link_metrics.gaps++;
+static uint32_t serFramesOk = 0;
+static uint32_t serCrcErrors = 0;
+static uint32_t serDrops = 0;
+static uint32_t serLastMs = 0;
 
-      if (link_metrics.snr_estimate < 20) {
-        if (!link_metrics.jamming_detected) {
-          link_metrics.jamming_detected = true;
-          link_metrics.jamming_since = millis();
-          debug.logWarning("JAMMING DETECTED - SNR below threshold");
+// =====================================================================
+// Sessoes HTTP
+// =====================================================================
+struct Session {
+    bool     active;
+    uint32_t ip;
+    char     token[HTTP_TOKEN_HEX_LEN + 1];
+    uint32_t createdMs;
+    uint32_t lastMs;
+};
+static Session sessions[HTTP_SESSION_SLOTS];
+
+// Falhas de login por IP
+struct LoginFail {
+    uint32_t ip;
+    uint8_t  count;
+    bool     used;
+};
+static LoginFail loginFails[8];
+
+// =====================================================================
+// Utilitarios
+// =====================================================================
+static uint32_t nowMs() { return (uint32_t)millis(); }
+
+static uint32_t currentUtc() { return (uint32_t)time(nullptr); }
+
+static bool timeLooksValid() { return TotpAuth::clockLooksValid(currentUtc()); }
+
+static void randomHex(char* out, size_t bytes) {
+    uint8_t raw[32];
+    if (bytes > sizeof(raw)) bytes = sizeof(raw);
+    esp_fill_random(raw, bytes);
+    bytesToHex(raw, bytes, out, bytes * 2 + 1);
+    memset(raw, 0, sizeof(raw));
+}
+
+static bool constantTimeStringEq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    size_t la = strlen(a), lb = strlen(b);
+    if (la != lb) return false;
+    return hefConstantTimeEq((const uint8_t*)a, (const uint8_t*)b, la);
+}
+
+// =====================================================================
+// Pares
+// =====================================================================
+static PeerState* peerByNodeId(uint16_t id) {
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        if (peers[i].used && peers[i].nodeId == id) return &peers[i];
+    }
+    return nullptr;
+}
+
+static PeerState* peerCreate(uint16_t id, uint8_t keyId,
+                             const uint8_t* key, size_t keyLen) {
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        if (!peers[i].used) {
+            memset(&peers[i], 0, sizeof(PeerState));
+            peers[i].used = true;
+            peers[i].nodeId = id;
+            peers[i].keyId = keyId;
+            memcpy(peers[i].key, key, keyLen);
+            return &peers[i];
         }
-      } else {
-        if (link_metrics.jamming_detected) {
-          link_metrics.jamming_detected = false;
-          debug.log("Jamming condition cleared");
-        }
-      }
     }
-  }
-  last_rx_counter = current;
+    return nullptr;
 }
 
-bool isJammingDetected() {
-  return link_metrics.jamming_detected;
+static uint8_t peerCount() {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) if (peers[i].used) n++;
+    return n;
 }
 
-// === Serial Buffer Processing ===
-void processSerialBuffer() {
-  if (!SerialNode2) return;
-  
-  while (SerialNode2.available()) {
-    char c = SerialNode2.read();
-    if (c == '\n') {
-      waitingSerialResponse = false;
-    } else {
-      serialBufferResponse += c;
-    }
-  }
-}
-
-// === HTTP Endpoints ===
-
-// Login endpoint - defined as function
-void handleLogin(AsyncWebServerRequest *request) {
-    if (!request->hasParam("user", true) || !request->hasParam("pass", true)) {
-      request->send(400, "text/plain", "Missing credentials");
-      return;
-    }
-    String user = request->getParam("user", true)->value();
-    String pass = request->getParam("pass", true)->value();
-    
-    if (secureCompare(user.c_str(), config.getCLIUsername()) &&
-        secureCompare(pass.c_str(), config.getCLIPassword())) {
-      cleanupHTTPSessions();
-      
-      String token = generateSessionToken();
-      for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
-        if (!http_sessions[i].active) {
-          token.toCharArray(http_sessions[i].token, 33);
-          http_sessions[i].ip = request->client()->remoteIP();
-          http_sessions[i].last_activity = millis();
-          http_sessions[i].created_at = millis();
-          http_sessions[i].active = true;
-          break;
-        }
-      }
-      
-      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"token\":\"" + token + "\"}");
-      resp->addHeader("Set-Cookie", "X-Hefestos-Token=" + token + "; HttpOnly; Path=/");
-      resp->addHeader("Content-Security-Policy", "default-src 'self'");
-      request->send(resp);
-    } else {
-      if (!rateLimiter.allowCommand(request->client()->remoteIP().toString().c_str())) {
-        request->send(429, "text/plain", "Too many attempts");
-      } else {
-        request->send(401, "text/plain", "Invalid credentials");
-      }
+static void wipePeers() {
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        volatile uint8_t* p = peers[i].key;
+        for (size_t k = 0; k < sizeof(peers[i].key); k++) p[k] = 0;
+        memset(&peers[i], 0, sizeof(PeerState));
     }
 }
 
-// Logout endpoint - defined as function
-void handleLogout(AsyncWebServerRequest *request) {
-    String token = "";
-    if (request->hasHeader("X-Hefestos-Token")) {
-      token = request->getHeader("X-Hefestos-Token")->value();
-    } else if (request->hasHeader("Cookie")) {
-      String cookie = request->getHeader("Cookie")->value();
-      int pos = cookie.indexOf("X-Hefestos-Token=");
-      if (pos >= 0) {
-        pos += 17;
-        int end = cookie.indexOf(';', pos);
-        if (end < 0) end = cookie.length();
-        token = cookie.substring(pos, end);
-      }
-    }
-    
-    if (token.length() == 32) {
-      for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
-        if (http_sessions[i].active && secureCompare(http_sessions[i].token, token.c_str())) {
-          http_sessions[i].active = false;
-          break;
-        }
-      }
-    }
-    
-    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"ok\":true}");
-    resp->addHeader("Set-Cookie", "X-Hefestos-Token=; HttpOnly; Path=/; Max-Age=0");
-    request->send(resp);
-}
+// =====================================================================
+// Link LoRa
+// =====================================================================
+static void sendAck(const PeerState* peer, uint16_t epoch, uint32_t counter) {
+    if (!peer) return;
 
-// OTA Update endpoint - v4.1 (DISABLED - not implemented)
-void handleOTA(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    debug.logWarning("OTA endpoint disabled - not implemented");
-    AsyncWebServerResponse *resp = request->beginResponse(501, "application/json", 
-      "{\"status\":\"disabled\",\"error\":\"OTA not implemented - use serial flashing\"}");
-    resp->addHeader("Content-Security-Policy", "default-src 'self'");
-    request->send(resp);
-}
+    uint8_t hdr[HEF_HEADER_LEN];
+    uint8_t payload[4];
+    putU32(payload, counter);
 
-// Jamming status endpoint - v4.1
-void handleJamming(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    String status = isJammingDetected() ? "DETECTADO" : "NORMAL";
-    int snr = link_metrics.snr_estimate;
-    
-    char json[128];
-    snprintf(json, sizeof(json),
-      "{\"jamming\":\"%s\",\"snr\":%d,\"since\":%lu}", 
-      status.c_str(), snr, link_metrics.jamming_since);
-    
-    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", json);
-    resp->addHeader("Content-Security-Policy", "default-src 'self'");
-    request->send(resp);
-}
-
-// Dados endpoint
-void handleDados(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    StaticJsonDocument<1024> doc;
-    doc["mensagem"] = targetMessage;
-    doc["rssi"] = rssiLoRa;
-    doc["rx_count"] = packet_rx_count;
-    doc["gcm_ok"] = gcm_valid_count;
-    doc["gcm_fail"] = gcm_invalid_count;
-    doc["replay_count"] = replay_count;
-    String jsonOutput;
-    serializeJson(doc, jsonOutput);
-    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", jsonOutput);
-    resp->addHeader("Content-Security-Policy", "default-src 'self'");
-    resp->addHeader("X-Content-Type-Options", "nosniff");
-    request->send(resp);
-}
-
-// Sintonizar endpoint
-void handleSintonizar(AsyncWebServerRequest *request) {
-    if (!rateLimiter.allowCommand(request->client()->remoteIP().toString().c_str())) {
-      request->send(429, "text/plain", "Rate limit exceeded");
-      return;
-    }
-    
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    if (request->hasParam("b") && request->hasParam("f")) {
-      String b = request->getParam("b")->value();
-      if (b.length() > 10) {
-        request->send(400, "text/plain", "Parametro invalido");
+    if (!linkBuildHeader(hdr, HEF_MSG_TRACK_ACK, 0, peer->keyId,
+                         nodeId, epoch, counter, sizeof(payload))) {
         return;
-      }
-      float f = request->getParam("f")->value().toFloat();
-      if (isnan(f) || isinf(f)) {
-        request->send(400, "text/plain", "Frequencia invalida");
+    }
+
+    uint8_t out[HEF_MAX_FRAME];
+    memcpy(out, hdr, HEF_HEADER_LEN);
+
+    AeadGcm gcm;
+    gcm.setKey(peer->key, HEF_KEY_LEN);
+    int ctLen = gcm.encrypt(payload, sizeof(payload),
+                            out + HEF_HEADER_LEN, sizeof(out) - HEF_HEADER_LEN,
+                            (uint32_t)peer->nodeId, counter,
+                            hdr, HEF_HEADER_LEN);
+    if (ctLen < 0) return;
+
+    LoRa.beginPacket();
+    LoRa.write(out, (size_t)(HEF_HEADER_LEN + ctLen));
+    LoRa.endPacket();
+    LoRa.receive();
+    acksSent++;
+}
+
+static void applyTrackTime(const HefTrack& t) {
+    if (t.epochUtc < 1704067200UL) return;   // antes de 2024: invalido
+
+    time_t sysNow = time(nullptr);
+    long long delta = (long long)t.epochUtc - (long long)sysNow;
+    if (delta < 0) delta = -delta;
+    if (delta <= 2) { clockSynced = true; return; }
+
+    struct timeval tv;
+    tv.tv_sec  = (time_t)t.epochUtc;
+    tv.tv_usec = 0;
+    settimeofday(&tv, nullptr);
+    clockSynced = true;
+
+    // Propaga o tempo ao Node3 (log forense com UTC absoluto).
+    hefSendTimeToNode3(t.epochUtc);
+    dbg.logf("Relogio sincronizado pelo GNSS: utc=%u", t.epochUtc);
+}
+
+static void forwardTrackToNode3(const PeerState* peer, const HefTrack& t,
+                                int16_t rssi, float snr) {
+    char rec[192];
+    snprintf(rec, sizeof(rec),
+             "T,%u,%u,%.7f,%.7f,%d,%u,%u,%u,%u,%u,%u,%u,%d,%.1f",
+             peer->nodeId, t.epochUtc,
+             t.lat, t.lon, (int)t.altM,
+             (unsigned)t.speedCms, (unsigned)t.courseDeg,
+             (unsigned)t.hdopX10, (unsigned)t.sats,
+             (unsigned)t.fixQuality, (unsigned)t.batteryPct,
+             (unsigned)t.statusFlags, (int)rssi, (double)snr);
+    hefSendSer(HEF_SER_DATA, (const uint8_t*)rec, (uint16_t)strlen(rec));
+}
+
+static void processTrack(const uint8_t* frame, uint16_t frameLen,
+                         int16_t rssi, float snr) {
+    if (frameLen < HEF_HEADER_LEN + HEF_TAG_LEN) { loraFramesBad++; return; }
+    if (!linkHeaderValid(frame, frameLen)) { loraFramesBad++; return; }
+
+    uint8_t  type   = frame[2];
+    uint8_t  keyId  = frame[4];
+    uint16_t src    = getU16(frame + 5);
+    uint16_t epoch  = getU16(frame + 7);
+    uint32_t ctr    = getU32(frame + 9);
+    uint16_t plen   = getU16(frame + 13);
+
+    if (type != HEF_MSG_TRACK) return;
+    if (plen != HEF_TRACK_PAYLOAD_LEN) { loraFramesBad++; return; }
+    if (src == 0 || src == nodeId) return;   // nao aceita eco do proprio no
+
+    PeerState* peer = peerByNodeId(src);
+    uint8_t derived[HEF_KEY_LEN];
+    bool derivedOk = false;
+
+    if (!peer) {
+        const uint8_t* psk = vault.getPsk();
+        if (!psk) { loraFramesBad++; return; }
+        if (!deriveNodeKey(psk, HEF_KEY_LEN, src, derived, sizeof(derived))) {
+            loraFramesBad++;
+            return;
+        }
+        derivedOk = true;
+    }
+
+    AeadGcm gcm;
+    gcm.setKey(peer ? peer->key : derived, HEF_KEY_LEN);
+
+    uint8_t plain[HEF_MAX_PAYLOAD];
+    int ptLen = gcm.decrypt(frame + HEF_HEADER_LEN, frameLen - HEF_HEADER_LEN,
+                            plain, sizeof(plain), (uint32_t)src, ctr,
+                            frame, HEF_HEADER_LEN);
+
+    if (ptLen != HEF_TRACK_PAYLOAD_LEN) {
+        if (derivedOk) memset(derived, 0, sizeof(derived));
+        if (peer) peer->framesBad++;
+        loraFramesBad++;
         return;
-      }
-      if (b != "FM" && b != "AM" && b != "SW") {
-        request->send(400, "text/plain", "Banda invalida");
+    }
+
+    // Autenticado: cria o par (TOFU com prova de posse do PSK de deploy).
+    if (!peer) {
+        peer = peerCreate(src, keyId, derived, HEF_KEY_LEN);
+        memset(derived, 0, sizeof(derived));
+        if (!peer) { loraFramesBad++; return; }
+        vault.enrollNode(src, keyId);
+    }
+
+    uint32_t lost = 0;
+    LinkRxResult res = peer->rx.accept(epoch, ctr, &lost);
+    if (res != LINK_RX_ACCEPT) {
+        // Duplicata da ULTIMA transmissao: o Node1 reenvia com o MESMO
+        // contador quando o ACK se perde. Reenviamos o ACK, mas NAO
+        // reprocessamos o track (anti-replay preservado).
+        if (res == LINK_RX_REPLAY && ctr == peer->rx.highest()) {
+            sendAck(peer, epoch, ctr);
+            return;
+        }
+        peer->replays++;
+        loraReplays++;
         return;
-      }
-      if (f < 0.1 || f > 30000.0) {
-        request->send(400, "text/plain", "Frequencia invalida");
-        return;
-      }
-      currentBand = b;
-      currentFreq = f;
-      if (b == "FM") radioRX.setFM(8400, 10800, f * 100, 10);
-      else if (b == "AM") radioRX.setAM(520, 1710, f, 10);
-      else if (b == "SW") radioRX.setAM(2300, 30000, f * 1000, 5);
     }
-    AsyncWebServerResponse *resp = request->beginResponse(200, "text/plain", "OK");
-    resp->addHeader("X-Content-Type-Options", "nosniff");
-    request->send(resp);
+
+    HefTrack t;
+    linkUnpackTrack(plain, &t);
+
+    peer->last = t;
+    peer->haveTrack = true;
+    peer->lastSeenMs = nowMs();
+    peer->lastRssi = rssi;
+    peer->lastSnr = snr;
+    peer->framesOk++;
+    loraFramesOk++;
+
+    jam.onPacket(rssi, snr, nowMs());
+    applyTrackTime(t);
+    forwardTrackToNode3(peer, t, rssi, snr);
+    sendAck(peer, epoch, ctr);
+
+    dbg.logf("TRACK node=%u ctr=%u lost=%u rssi=%d snr=%.1f",
+             src, (unsigned)ctr, (unsigned)lost, (int)rssi, (double)snr);
 }
 
-// === V4.1: Dashboard Capture History Endpoints ===
+// =====================================================================
+// Fila de TX serial (Node2 -> Node3), nao-bloqueante
+// =====================================================================
+class SerQueue {
+private:
+    static const uint16_t CAP = 2048;
+    uint8_t  buf_[CAP];
+    uint16_t head_;
+    uint16_t tail_;
+    uint16_t count_;
 
-String serialBufferResponse = "";
-unsigned long serialRequestTime = 0;
-bool waitingSerialResponse = false;
+public:
+    SerQueue() : head_(0), tail_(0), count_(0) {}
 
-void solicitarUltimaCaptura() {
-  if (SerialNode2 && !waitingSerialResponse) {
-    SerialNode2.println("GET_CAPTURE");
-    serialRequestTime = millis();
-    waitingSerialResponse = true;
-  }
-}
-
-void solicitarHistoricoCapturas() {
-  if (SerialNode2 && !waitingSerialResponse) {
-    SerialNode2.println("GET_HISTORICO");
-    serialRequestTime = millis();
-    waitingSerialResponse = true;
-  }
-}
-
-// Endpoint: Última captura
-void handleUltima(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    solicitarUltimaCaptura();
-    
-    unsigned long startWait = millis();
-    while (waitingSerialResponse && (millis() - startWait < 200)) {
-      delay(10);
-      processSerialBuffer();
-    }
-    
-    if (serialBufferResponse.length() > 0) {
-      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", serialBufferResponse);
-      resp->addHeader("Content-Security-Policy", "default-src 'self'");
-      serialBufferResponse = "";
-      waitingSerialResponse = false;
-      request->send(resp);
-    } else {
-      String fallback = "{\"tipo\":\"NONE\",\"dados\":\"No data from Node3\",\"timestamp\":" + String(millis()) + "}";
-      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", fallback);
-      resp->addHeader("Content-Security-Policy", "default-src 'self'");
-      waitingSerialResponse = false;
-      request->send(resp);
-    }
-}
-
-// Endpoint: Histórico de capturas
-void handleHistorico(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    solicitarHistoricoCapturas();
-    
-    unsigned long startWait = millis();
-    while (waitingSerialResponse && (millis() - startWait < 500)) {
-      delay(10);
-      processSerialBuffer();
-    }
-    
-    if (serialBufferResponse.length() > 0) {
-      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", serialBufferResponse);
-      resp->addHeader("Content-Security-Policy", "default-src 'self'");
-      serialBufferResponse = "";
-      waitingSerialResponse = false;
-      request->send(resp);
-    } else {
-      String fallback = "{\"total_captures\":0,\"capture_history\":[]}";
-      AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", fallback);
-      resp->addHeader("Content-Security-Policy", "default-src 'self'");
-      waitingSerialResponse = false;
-      request->send(resp);
-    }
-}
-
-// Endpoint: Limpar histórico
-void handleClearHistorico(AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      request->send(401, "text/plain", "Unauthorized");
-      return;
-    }
-    
-    if (SerialNode2) {
-      SerialNode2.println("CLEAR_HISTORICO");
-    }
-    
-    AsyncWebServerResponse *resp = request->beginResponse(200, "application/json", "{\"status\":\"ok\"}");
-    resp->addHeader("Content-Security-Policy", "default-src 'self'");
-    request->send(resp);
-}
-
-void loop() {
-  if (!shellClient || !shellClient.connected()) {
-    if (shellClient) shellClient.stop();
-    WiFiClient newClient = shellServer.available();
-
-    if (isIPBlocked(newClient.remoteIP())) {
-      newClient.println("\r\n=== HEFESTOS SIGINT v4.0 ===");
-      newClient.println("IP temporariamente bloqueado.");
-      delay(100);
-      newClient.stop();
-      return;
-    }
-
-    shellClient = newClient;
-    telnet_state.authenticated = false;
-    telnet_state.auth_attempts = 0;
-    telnet_state.last_activity = millis();
-    telnet_state.session_start = 0;
-    telnet_state.waiting_password = false;
-    telnet_state.auth_input = "";
-    telnet_state.auth_password = "";
-
-    shellClient.println("\r\n=== HEFESTOS SIGINT v4.0 ===");
-    shellClient.println("Seguranca: AES-GCM + Anti-Replay");
-    shellClient.println("Usuario:");
-    shellClient.print("> ");
-  }
-
-  if (shellClient && shellClient.connected()) {
-    unsigned long now = millis();
-
-    if (telnet_state.authenticated) {
-      if (now - telnet_state.last_activity > SESSION_IDLE_TIMEOUT ||
-          now - telnet_state.session_start > SESSION_ABSOLUTE_TIMEOUT) {
-        shellClient.println("\r\n[SESSION EXPIRED]");
-        shellClient.stop();
-        telnet_state.authenticated = false;
-        return;
-      }
-    }
-
-    if (shellClient.available()) {
-      if (!telnet_state.authenticated) {
-        processAuth();
-      } else {
-        char cmdBuffer[128];
-        int cmdLen = shellClient.readBytesUntil('\n', cmdBuffer, sizeof(cmdBuffer) - 1);
-        if (cmdLen > 0) {
-          cmdBuffer[cmdLen] = '\0';
-          String cmdLine = String(cmdBuffer);
-          cmdLine.trim();
-          telnet_state.last_activity = millis();
-          processCommand(cmdLine);
+    bool push(const uint8_t* d, uint16_t n) {
+        if (!d || n == 0) return true;
+        if (n > (uint16_t)(CAP - count_)) return false;
+        for (uint16_t i = 0; i < n; i++) {
+            buf_[tail_] = d[i];
+            tail_ = (uint16_t)((tail_ + 1) % CAP);
         }
-        if (shellClient.connected()) {
-          shellClient.print("hefestos@base:~# ");
-        }
-      }
+        count_ = (uint16_t)(count_ + n);
+        return true;
     }
-  }
 
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    uint8_t buffer[256];
-    int len = LoRa.readBytes(buffer, 256);
-    rssiLoRa = LoRa.packetRssi();
-
-    uint8_t decrypted[256];
-    int decLen = aesgcm.decrypt(buffer, len, decrypted);
-
-    if (decLen > 0) {
-      uint32_t counter;
-      memcpy(&counter, buffer, 4);
-
-      if (!secProto.isValidCounter(counter)) {
-        if (packetHistory.isDuplicate(counter)) {
-          replay_count++;
-          debug.logf("REPLAY DETECTADO #%u", counter);
-        } else {
-          debug.logf("RESYNC #%u (reboot detectado)", counter);
-          secProto.updateValidCounter(counter);
-          packetHistory.add(counter);
-          gcm_valid_count++;
-          targetMessage = String((char*)decrypted);
-          if (targetMessage.startsWith("ALVO_")) {
-            packet_rx_count++;
-          }
+    void pump(Stream& s) {
+        while (count_ > 0) {
+            int space = s.availableForWrite();
+            if (space <= 0) break;
+            s.write(buf_[head_]);
+            head_ = (uint16_t)((head_ + 1) % CAP);
+            count_--;
         }
-      } else {
-        secProto.updateValidCounter(counter);
-        packetHistory.add(counter);
-        gcm_valid_count++;
-        
-        targetMessage = String((char*)decrypted);
-        
-        if (targetMessage.startsWith("ALVO_")) {
-          packet_rx_count++;
-          debug.logf("RX #%u: %s (GCM OK)", counter, targetMessage.c_str());
-        }
-      }
-    } else {
-      gcm_invalid_count++;
     }
-  }
-  
-  // Barrida periódica de banda a cada 30 segundos - v4.1
-  unsigned long now = millis();
-  if (now - last_barrida_check > 30000) {
-    last_barrida_check = now;
-    barridaBanda();
-  }
-  
-  monitorLinkQuality();
+
+    uint16_t pending() const { return count_; }
+};
+
+static SerQueue serQueue;
+
+void hefSendSer(uint8_t type, const uint8_t* data, uint16_t len) {
+    uint8_t frame[HEF_SER_MAX_PAYLOAD + 16];
+    int n = serTx.encode(type, serTx.nextSeq(), data, len, frame);
+    if (n <= 0 || !serQueue.push(frame, (uint16_t)n)) serDrops++;
 }
 
-static bool secureCompare(const char* a, const char* b) {
-  if (!a || !b) return false;
-  size_t len_a = strlen(a);
-  size_t len_b = strlen(b);
-  volatile uint8_t result = (len_a != len_b);
-  size_t min_len = (len_a < len_b) ? len_a : len_b;
-  for (size_t i = 0; i < min_len; i++) {
-    result |= (uint8_t)a[i] ^ (uint8_t)b[i];
-  }
-  return result == 0;
+void hefSendTimeToNode3(uint32_t utc) {
+    uint8_t tb[4];
+    putU32(tb, utc);
+    hefSendSer(HEF_SER_TIME, tb, sizeof(tb));
 }
 
-void processAuth() {
-  while (shellClient.available()) {
-    char c = shellClient.read();
-    if (c == '\n' || c == '\r') {
-      if (!telnet_state.waiting_password) {
-        telnet_state.username = telnet_state.auth_input;
-        telnet_state.waiting_password = true;
-        shellClient.print("Senha: ");
-      } else {
-        telnet_state.auth_password = telnet_state.auth_input;
-        const char* stored_user = config.getCLIUsername();
-        const char* stored_pass = config.getCLIPassword();
+// Resposta do Node3 -> cache
+static void onNode3Frame(const HefSerFrame& f, void*) {
+    serLastMs = nowMs();
+    serFramesOk++;
 
-        if (secureCompare(telnet_state.username.c_str(), config.getCLIUsername()) &&
-            secureCompare(telnet_state.auth_password.c_str(), config.getCLIPassword())) {
-          telnet_state.authenticated = true;
-          telnet_state.session_start = millis();
-          telnet_state.last_activity = millis();
-          shellClient.println("\n[+] OK");
-        } else {
-          telnet_state.auth_attempts++;
-          if (telnet_state.auth_attempts >= MAX_AUTH_ATTEMPTS) {
-            shellClient.println("BLOQUEADO");
-            blockIP(shellClient.remoteIP());
-            shellClient.stop();
-          } else {
-            shellClient.println("NOVO");
-            shellClient.print("Usuario: ");
-          }
-        }
-        telnet_state.waiting_password = false;
-      }
-      telnet_state.auth_input = "";
-    } else if (c >= 32 && c <= 126) {
-      if (telnet_state.auth_input.length() >= 64) {
-        continue;
-      }
-      telnet_state.auth_input += c;
-      if (telnet_state.waiting_password) {
-        shellClient.print("*");
-      } else {
-        shellClient.print(c);
-      }
+    if (f.type != HEF_SER_RESPONSE || f.len < 1) return;
+
+    uint8_t req = f.payload[0];
+    RespCache* slot = nullptr;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (respCache[i].valid && respCache[i].req == req) { slot = &respCache[i]; break; }
     }
-  }
+    if (!slot) {
+        for (uint8_t i = 0; i < 4; i++) {
+            if (!respCache[i].valid) { slot = &respCache[i]; break; }
+        }
+    }
+    if (!slot) slot = &respCache[0];
+
+    slot->req = req;
+    slot->valid = true;
+    slot->ms = nowMs();
+    uint16_t n = (uint16_t)(f.len - 1);
+    if (n > sizeof(slot->json) - 1) n = sizeof(slot->json) - 1;
+    memcpy(slot->json, f.payload + 1, n);
+    slot->json[n] = 0;
 }
 
-void processCommand(String cmd) {
-  if (cmd == "help") {
-    shellClient.println("Comandos: help, status, freq, band, sair");
-  } else if (cmd == "status") {
-    shellClient.printf("RX: %u | GCM OK: %u | FAIL: %u | REPLAY: %u\r\n",
-      packet_rx_count, gcm_valid_count, gcm_invalid_count, replay_count);
-    shellClient.printf("RSSI: %d dBm | Banda: %s | Freq: %.1f\r\n",
-      rssiLoRa, currentBand.c_str(), currentFreq);
-  } else if (cmd == "sair") {
-    shellClient.println("Encerrando sessao...");
-    shellClient.stop();
-    telnet_state.authenticated = false;
-  } else if (cmd.startsWith("freq ")) {
-    float f = cmd.substring(5).toFloat();
-    if (f > 0) { currentFreq = f; shellClient.printf("Freq: %.1f\r\n", f); }
-    else shellClient.println("Frequencia invalida");
-  } else if (cmd.startsWith("band ")) {
-    String b = cmd.substring(5);
-    if (b == "FM" || b == "AM" || b == "SW") { currentBand = b; shellClient.println("Banda: " + b); }
-    else shellClient.println("Banda invalida (FM/AM/SW)");
-  } else if (cmd.length() > 0) {
-    shellClient.println("Comando desconhecido. Digite 'help'.");
-  }
+static void requestNode3(uint8_t req) {
+    uint8_t b = req;
+    hefSendSer(HEF_SER_REQUEST, &b, 1);
 }
 
-// === Dashboard HTML - Index Page ===
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html lang="pt-br"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HEFESTOS SIGINT v4.0 Dashboard</title>
+static const RespCache* cachedResponse(uint8_t req) {
+    for (uint8_t i = 0; i < 4; i++) {
+        if (respCache[i].valid && respCache[i].req == req) return &respCache[i];
+    }
+    return nullptr;
+}
+
+// =====================================================================
+// Sessoes / autenticacao
+// =====================================================================
+static Session* sessionByToken(const char* token) {
+    if (!token || !token[0]) return nullptr;
+    uint32_t now = nowMs();
+    for (uint8_t i = 0; i < HTTP_SESSION_SLOTS; i++) {
+        Session& s = sessions[i];
+        if (!s.active) continue;
+        if ((now - s.lastMs) > HTTP_SESSION_IDLE_MS ||
+            (now - s.createdMs) > HTTP_SESSION_ABSOLUTE_MS) {
+            memset(&s, 0, sizeof(s));
+            continue;
+        }
+        if (constantTimeStringEq(s.token, token)) return &s;
+    }
+    return nullptr;
+}
+
+static Session* createSession(uint32_t ip) {
+    uint32_t now = nowMs();
+    Session* slot = nullptr;
+    for (uint8_t i = 0; i < HTTP_SESSION_SLOTS; i++) {
+        if (!sessions[i].active) { slot = &sessions[i]; break; }
+    }
+    if (!slot) {
+        // Substitui a sessao mais antiga (menor lastMs).
+        slot = &sessions[0];
+        for (uint8_t i = 1; i < HTTP_SESSION_SLOTS; i++) {
+            if (sessions[i].lastMs < slot->lastMs) slot = &sessions[i];
+        }
+    }
+    memset(slot, 0, sizeof(Session));
+    slot->active = true;
+    slot->ip = ip;
+    slot->createdMs = now;
+    slot->lastMs = now;
+    randomHex(slot->token, HTTP_TOKEN_HEX_LEN / 2);
+    return slot;
+}
+
+static void destroySession(const char* token) {
+    for (uint8_t i = 0; i < HTTP_SESSION_SLOTS; i++) {
+        if (sessions[i].active && constantTimeStringEq(sessions[i].token, token)) {
+            memset(&sessions[i], 0, sizeof(sessions[i]));
+        }
+    }
+}
+
+static bool getCookie(AsyncWebServerRequest* r, const char* name,
+                      char* out, size_t cap) {
+    if (!r || !r->hasHeader("Cookie")) return false;
+    const AsyncWebHeader* h = r->getHeader("Cookie");
+    if (!h) return false;
+    String v = h->value();
+    String key = String(name) + "=";
+    int idx = v.indexOf(key);
+    if (idx < 0) return false;
+    int start = idx + key.length();
+    int end = v.indexOf(';', start);
+    if (end < 0) end = v.length();
+    String tok = v.substring(start, end);
+    tok.trim();
+    if (tok.length() == 0 || tok.length() >= cap) return false;
+    strncpy(out, tok.c_str(), cap - 1);
+    out[cap - 1] = 0;
+    return true;
+}
+
+static Session* authedSession(AsyncWebServerRequest* r) {
+    char token[HTTP_TOKEN_HEX_LEN + 1];
+    if (!getCookie(r, "HEF_SID", token, sizeof(token))) return nullptr;
+    Session* s = sessionByToken(token);
+    if (!s) return nullptr;
+    if (s->ip != ipToKey(r->client()->remoteIP())) return nullptr;
+    s->lastMs = nowMs();
+    return s;
+}
+
+static void sendUnauthorized(AsyncWebServerRequest* r) {
+    r->send(401, "application/json", "{\"error\":\"nao autenticado\"}");
+}
+
+static void sendJson(AsyncWebServerRequest* r, int code, const String& body) {
+    r->send(code, "application/json", body);
+}
+
+// =====================================================================
+// Rate limit de login
+// =====================================================================
+static uint8_t registerLoginFailure(uint32_t ip) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (loginFails[i].used && loginFails[i].ip == ip) {
+            if (loginFails[i].count < 255) loginFails[i].count++;
+            return loginFails[i].count;
+        }
+    }
+    for (uint8_t i = 0; i < 8; i++) {
+        if (!loginFails[i].used) {
+            loginFails[i].used = true;
+            loginFails[i].ip = ip;
+            loginFails[i].count = 1;
+            return 1;
+        }
+    }
+    return MAX_AUTH_ATTEMPTS;
+}
+
+static void clearLoginFailures(uint32_t ip) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (loginFails[i].used && loginFails[i].ip == ip) {
+            loginFails[i].used = false;
+            loginFails[i].count = 0;
+        }
+    }
+}
+
+// =====================================================================
+// Provisionamento inicial de credenciais (console)
+// =====================================================================
+static void ensureCredentials() {
+    char buf[64];
+
+    if (!vault.getCliUsername(buf, sizeof(buf))) {
+        vault.setCliUsername("admin");
+        dbg.log("Usuario CLI/HTTP criado: admin");
+    }
+
+    if (!vault.getCliPassword(buf, sizeof(buf))) {
+        char pass[33];
+        randomHex(pass, 12);
+        vault.setCliPassword(pass);
+        Serial.println();
+        Serial.println("=================================================");
+        Serial.println(" CREDENCIAL INICIAL GERADA (anote e troque)");
+        Serial.print("   usuario: admin");
+        Serial.print("   senha:   "); Serial.println(pass);
+        Serial.println("=================================================");
+        memset(pass, 0, sizeof(pass));
+    }
+
+    size_t tlen = HEF_TOTP_SECRET_MAX;
+    uint8_t tsec[HEF_TOTP_SECRET_MAX];
+    if (vault.getTotpSecret(tsec, &tlen)) {
+        // Segredo persistido como base32 textual.
+        char b32[HEF_TOTP_SECRET_MAX + 1];
+        size_t cp = tlen < sizeof(b32) - 1 ? tlen : sizeof(b32) - 1;
+        memcpy(b32, tsec, cp);
+        b32[cp] = 0;
+        totp.setSecretBase32(b32);
+        memset(tsec, 0, sizeof(tsec));
+        memset(b32, 0, sizeof(b32));
+    }
+
+    if (!totp.hasSecret()) {
+        // Fallback: gera e persiste em base32.
+        totp.generateRandomSecret(20);
+        char b32[64];
+        totp.exportBase32(b32, sizeof(b32));
+        vault.setTotpSecret((const uint8_t*)b32, strlen(b32));
+        Serial.print("TOTP (novo): "); Serial.println(b32);
+    }
+}
+
+// =====================================================================
+// WiFi
+// =====================================================================
+static void deriveApPassword(char* out, size_t cap) {
+    uint8_t mac[6];
+    esp_efuse_mac_get_default(mac);
+    const uint8_t info[] = "hefestos-v5/ap/wpa2";
+    uint8_t okm[16];
+    hefHkdfSha256(mac, sizeof(mac), nullptr, 0, info, sizeof(info) - 1,
+                  okm, sizeof(okm));
+    bytesToHex(okm, 8, out, cap);   // 16 hex chars
+    memset(okm, 0, sizeof(okm));
+}
+
+static bool startNetwork() {
+    char ssid[33], pass[33];
+    bool haveSta = vault.getWifiSsid(ssid, sizeof(ssid)) &&
+                   vault.getWifiPassword(pass, sizeof(pass));
+
+    if (haveSta) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        WiFi.begin(ssid, pass);
+        uint32_t start = nowMs();
+        while (WiFi.status() != WL_CONNECTED && (nowMs() - start) < 15000UL) {
+            delay(200);
+        }
+        memset(pass, 0, sizeof(pass));
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.print("WiFi STA conectado. IP: ");
+            Serial.println(WiFi.localIP());
+            return true;
+        }
+        Serial.println("WiFi STA falhou; caindo para SoftAP.");
+    }
+
+    char apPass[33];
+    deriveApPassword(apPass, sizeof(apPass));
+    char apSsid[33];
+    snprintf(apSsid, sizeof(apSsid), "HEFESTOS-%u", (unsigned)nodeId);
+
+    WiFi.mode(WIFI_AP);
+    WiFi.setSleep(false);
+    bool ok = WiFi.softAP(apSsid, apPass);
+    memset(apPass, 0, sizeof(apPass));
+
+    Serial.println();
+    Serial.println("=================================================");
+    Serial.println(" REDE DE CAMPO (SoftAP WPA2)");
+    Serial.print("   SSID: "); Serial.println(apSsid);
+    deriveApPassword(apPass, sizeof(apPass));
+    Serial.print("   senha: "); Serial.println(apPass);
+    memset(apPass, 0, sizeof(apPass));
+    Serial.print("   IP:    "); Serial.println(WiFi.softAPIP());
+    Serial.println("=================================================");
+    return ok;
+}
+
+// =====================================================================
+// JSON
+// =====================================================================
+static const char* wifiModeName() {
+    wifi_mode_t m = WiFi.getMode();
+    if (m == WIFI_AP) return "AP";
+    if (m == WIFI_STA) return "STA";
+    return "MISTO";
+}
+
+static String jsonStatus() {
+    DynamicJsonDocument doc(2048);
+    doc["node_id"] = nodeId;
+    doc["fw"] = HEF_FW_VERSION_STR;
+    doc["uptime_s"] = (uint32_t)(nowMs() / 1000UL);
+
+    JsonObject w = doc.createNestedObject("wifi");
+    w["mode"] = wifiModeName();
+    w["ip"] = (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP().toString()
+                                          : WiFi.localIP().toString();
+    w["rssi"] = WiFi.RSSI();
+
+    JsonObject t = doc.createNestedObject("time");
+    t["utc"] = currentUtc();
+    t["synced"] = clockSynced && timeLooksValid();
+
+    JsonObject l = doc.createNestedObject("lora");
+    l["frames_ok"] = loraFramesOk;
+    l["frames_bad"] = loraFramesBad;
+    l["replays"] = loraReplays;
+    l["acks_sent"] = acksSent;
+    l["peers"] = peerCount();
+    l["key"] = keyReady ? "ok" : "ausente";
+
+    JsonObject r = doc.createNestedObject("radio");
+    r["band"] = HefRadio::bandName(radio.band());
+    r["freq_khz"] = radio.freqKHz();
+    r["initialized"] = radio.isInitialized();
+
+    JsonObject j = doc.createNestedObject("jamming");
+    uint32_t now = nowMs();
+    j["state"] = JammingDetector::stateName(jam.state(now));
+    j["median_snr"] = jam.medianSnr();
+    j["median_rssi_dbm"] = jam.medianRssiDbm();
+    j["noise_floor_dbuV"] = jam.noiseFloorDbuV();
+    j["last_packet_age_ms"] = jam.lastPacketAgeMs(now);
+
+    JsonObject s = doc.createNestedObject("spectrum");
+    s["running"] = scanner.isRunning();
+    s["samples"] = scanner.sampleCount();
+    s["last_sweep_ms"] = scanner.lastSweepMs();
+    s["auto"] = autoSweep;
+
+    JsonObject n3 = doc.createNestedObject("node3");
+    n3["frames_ok"] = serFramesOk;
+    n3["crc_errors"] = serRx.crcErrors();
+    n3["drops"] = serDrops;
+    n3["queue"] = serQueue.pending();
+    n3["last_age_ms"] = serLastMs ? (now - serLastMs) : 0;
+
+    uint8_t activeSessions = 0;
+    for (uint8_t i = 0; i < HTTP_SESSION_SLOTS; i++) if (sessions[i].active) activeSessions++;
+    doc["sessions"] = activeSessions;
+
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+static String jsonPeers() {
+    DynamicJsonDocument doc(4096);
+    JsonArray arr = doc.createNestedArray("peers");
+    uint32_t now = nowMs();
+    for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+        if (!peers[i].used) continue;
+        PeerState& p = peers[i];
+        JsonObject o = arr.createNestedObject();
+        o["node_id"] = p.nodeId;
+        o["key_id"] = p.keyId;
+        o["rssi"] = p.lastRssi;
+        o["snr"] = p.lastSnr;
+        o["age_ms"] = p.lastSeenMs ? (now - p.lastSeenMs) : 0;
+        o["frames_ok"] = p.framesOk;
+        o["frames_bad"] = p.framesBad;
+        o["replays"] = p.replays;
+        o["gaps"] = p.rx.gaps();
+        o["have_track"] = p.haveTrack;
+        if (p.haveTrack) {
+            o["utc"] = p.last.epochUtc;
+            o["lat"] = p.last.lat;
+            o["lon"] = p.last.lon;
+            o["alt_m"] = p.last.altM;
+            o["speed_cms"] = p.last.speedCms;
+            o["course_deg"] = p.last.courseDeg;
+            o["hdop_x10"] = p.last.hdopX10;
+            o["sats"] = p.last.sats;
+            o["fix"] = p.last.fixQuality;
+            o["battery"] = p.last.batteryPct;
+            o["flags"] = p.last.statusFlags;
+        }
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+static String jsonSpectrum() {
+    DynamicJsonDocument doc(8192);
+    doc["running"] = scanner.isRunning();
+    doc["samples"] = scanner.sampleCount();
+    doc["last_sweep_ms"] = scanner.lastSweepMs();
+    doc["dwell_ms"] = SWEEP_DWELL_MS;
+
+    JsonArray arr = doc.createNestedArray("points");
+    uint16_t count = scanner.sampleCount();
+    if (count > 96) count = 96;   // janela das 96 amostras mais recentes
+    for (uint16_t i = count; i > 0; i--) {
+        SpectrumPoint pt;
+        if (!scanner.atAge((uint16_t)(i - 1), &pt)) continue;
+        JsonObject o = arr.createNestedObject();
+        o["band"] = HefRadio::bandName((HefBand)pt.band);
+        o["freq_khz"] = pt.freqKHz;
+        o["rssi_dbuV"] = pt.rssiDBuV;
+        o["snr_db"] = pt.snrDb;
+        o["valid"] = pt.valid;
+        o["age_ms"] = nowMs() - pt.timestampMs;
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+static String jsonHealth() {
+    DynamicJsonDocument doc(1536);
+    doc["heap_free"] = ESP.getFreeHeap();
+    doc["heap_min"] = ESP.getMinFreeHeap();
+    doc["uptime_s"] = (uint32_t)(nowMs() / 1000UL);
+    doc["node_id"] = nodeId;
+    doc["clock_utc"] = currentUtc();
+    doc["clock_valid"] = timeLooksValid();
+    doc["enrollments"] = vault.enrollmentCount();
+    doc["ser_crc_errors"] = serRx.crcErrors();
+    doc["ser_overflows"] = serRx.overflows();
+    doc["ser_drops"] = serDrops;
+    uint8_t fails = 0;
+    for (uint8_t i = 0; i < 8; i++) if (loginFails[i].used) fails++;
+    doc["login_fails"] = fails;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+// =====================================================================
+// Handlers HTTP
+// =====================================================================
+static void handleLoginPage(AsyncWebServerRequest* r) {
+    static const char LOGIN_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hefestos SIGINT - Login</title>
 <style>
-body{font-family:'Courier New',monospace;background:#050505;color:#0f0;margin:0;padding:20px}
-.container{max-width:1200px;margin:0 auto}
-.card{background:#111;border:1px solid #0f0;margin:15px 0;padding:20px;border-radius:8px}
-.card h3{color:#0f0;margin-top:0}
-.stats{color:#ffff00;font-size:0.9em;margin:10px 0}
-.capture-item{padding:10px;border-top:1px solid #080;margin:5px 0}
-.capture-item .time{color:#666;font-size:0.8em}
-.capture-item .tipo{color:#ff0;font-weight:bold}
-.capture-item .dados{color:#0ff}
-.btn{padding:10px 16px;background:#0f0;color:#000;border:none;cursor:pointer;font-weight:bold;border-radius:4px;margin:5px}
-.btn:hover{background:#0ff}
-.btn-danger{background:#f00;color:#fff}
-.btn-danger:hover{background:#f55}
-.status-badge{padding:4px 8px;border-radius:4px;font-weight:bold}
-.status-ok{background:#0f0;color:#000}
-.status-error{background:#f00;color:#fff}
-#ultima-captura{background:#1a1a1a;border:2px solid #0f0;padding:15px;margin:10px 0;border-radius:8px}
-#ultima-captura .label{color:#666;font-size:0.8em}
-#ultima-captura .value{color:#0ff;font-size:1.1em}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b0f14;color:#d7e2ee;font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+form{background:#141b24;border:1px solid #22303f;border-radius:8px;padding:22px;width:320px}
+h1{font-size:15px;margin:0 0 14px;color:#3fa9f5}
+label{display:block;margin:10px 0 4px;color:#7f93a8;font-size:12px}
+input{width:100%;box-sizing:border-box;background:#0d141c;color:#d7e2ee;border:1px solid #2b3a4a;border-radius:4px;padding:8px;font:inherit}
+button{width:100%;margin-top:16px;padding:9px;background:#1b4f7a;color:#eaf4ff;border:1px solid #3fa9f5;border-radius:4px;font:inherit;cursor:pointer}
+.msg{margin-top:10px;font-size:12px;color:#e05252;min-height:16px}
 </style></head><body>
-<div class="container">
-<h1>[ HEFESTOS SIGINT v4.0 - DASHBOARD ]</h1>
-
-<div class="card">
-<h3>[+] Status Operacional</h3>
-<p class="stats">RX: <span id="rx-count">0</span> | GCM OK: <span id="gcm-ok">0</span> | GCM FAIL: <span id="gcm-fail">0</span> | REPLAY: <span id="replay">0</span></p>
-<p>Alvo: <span id="msg">--</span></p>
-<p>RSSI: <span id="rssi">0</span> dBm <span id="rssi-status" class="status-badge status-ok">OK</span></p>
-</div>
-
-<div class="card">
-<h3>[!] Última Captura</h3>
-<div id="ultima-captura">
-<div class="label">Tipo</div><div class="value" id="cap-tipo">--</div>
-<div class="label">Dados</div><div class="value" id="cap-dados">Aguardando dados...</div>
-<div class="label">Timestamp</div><div class="value" id="cap-time">-- ms</div>
-</div>
-</div>
-
-<div class="card">
-<h3>[~] Histórico de Capturas</h3>
-<p class="stats">Total: <span id="total-captures">0</span> capturas</p>
-<div id="historico-list">
-<p>Aguardando dados...</p>
-</div>
-</div>
-
-<div class="card">
-<h3>[*] Controles</h3>
-<button class="btn" onclick="atualizarTudo()">Atualizar Agora</button>
-<button class="btn btn-danger" onclick="limparHistorico()">Limpar Histórico</button>
-<p class="stats">Atualização automática: a cada 2 segundos</p>
-</div>
-</div>
-
+<form method="POST" action="/login">
+<h1>HEFESTOS SIGINT v5</h1>
+<label for="u">Usuario</label><input id="u" name="user" autocomplete="username" required>
+<label for="p">Senha</label><input id="p" name="pass" type="password" autocomplete="current-password" required>
+<label for="t">Codigo TOTP (6 digitos)</label><input id="t" name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required>
+<button type="submit">Entrar</button>
+<div class="msg" id="m"></div>
+</form>
 <script>
-let intervalId = null;
-
-function atualizarTudo() {
-  atualizarStatus();
-  atualizarUltimaCaptura();
-  atualizarHistorico();
+const q=new URLSearchParams(location.search);
+if(q.get('e')==='1')document.getElementById('m').textContent='Credenciais ou TOTP invalidos.';
+if(q.get('e')==='2')document.getElementById('m').textContent='Relogio nao sincronizado. Use o console serial: settime <unix>.';
+if(q.get('e')==='3')document.getElementById('m').textContent='Muitas tentativas. Aguarde.';
+</script></body></html>)HTML";
+    r->send(200, "text/html", LOGIN_HTML);
 }
 
-function atualizarStatus() {
-  fetch('/dados')
-    .then(r => r.json())
-    .then(d => {
-      document.getElementById('rx-count').innerText = d.rx_count;
-      document.getElementById('gcm-ok').innerText = d.gcm_ok;
-      document.getElementById('gcm-fail').innerText = d.gcm_fail;
-      document.getElementById('replay').innerText = d.replay_count;
-      document.getElementById('msg').innerText = d.mensagem?.substring(0, 40) || '--';
-      document.getElementById('rssi').innerText = d.rssi;
-      
-      const rssiStatus = document.getElementById('rssi-status');
-      if (d.rssi > -80) {
-        rssiStatus.className = 'status-badge status-ok';
-        rssiStatus.innerText = 'FORTE';
-      } else if (d.rssi > -100) {
-        rssiStatus.className = 'status-badge status-ok';
-        rssiStatus.innerText = 'BOM';
-      } else {
-        rssiStatus.className = 'status-badge status-error';
-        rssiStatus.innerText = 'FRACO';
-      }
-    })
-    .catch(e => console.error('Erro status:', e));
-}
+static void handleLogin(AsyncWebServerRequest* r) {
+    uint32_t ip = ipToKey(r->client()->remoteIP());
 
-function atualizarUltimaCaptura() {
-  fetch('/ultima')
-    .then(r => r.json())
-    .then(d => {
-      document.getElementById('cap-tipo').innerText = d.tipo || 'NONE';
-      document.getElementById('cap-dados').innerText = d.dados?.substring(0, 60) || 'Sem dados';
-      document.getElementById('cap-time').innerText = d.timestamp ? d.timestamp + ' ms' : '--';
-    })
-    .catch(e => {
-      document.getElementById('cap-tipo').innerText = 'ERRO';
-      document.getElementById('cap-dados').innerText = 'Falha ao conectar';
-    });
-}
-
-function atualizarHistorico() {
-  fetch('/historico')
-    .then(r => r.json())
-    .then(d => {
-      document.getElementById('total-captures').innerText = d.total_captures || 0;
-      
-      const list = document.getElementById('historico-list');
-      if (!d.capture_history || d.capture_history.length === 0) {
-        list.innerHTML = '<p style="color:#666">Nenhuma captura registrada</p>';
+    if (!loginLimiter.allow(ip)) {
+        r->redirect("/login?e=3");
         return;
-      }
-      
-      let html = '';
-      d.capture_history.forEach((item, idx) => {
-        html += '<div class="capture-item">';
-        html += '<span class="tipo">[' + item.tipo + ']</span> ';
-        html += '<span class="dados">' + (item.dados?.substring(0, 45) || '') + '</span>';
-        html += '<span class="time"> - ' + (item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '--') + '</span>';
-        html += '</div>';
-      });
-      list.innerHTML = html;
-    })
-    .catch(e => {
-      document.getElementById('historico-list').innerHTML = '<p style="color:#f00">Erro ao carregar histórico</p>';
-    });
+    }
+
+    String user = r->arg("user");
+    String pass = r->arg("pass");
+    String code = r->arg("totp");
+
+    char vUser[17], vPass[33];
+    bool haveUser = vault.getCliUsername(vUser, sizeof(vUser));
+    bool havePass = vault.getCliPassword(vPass, sizeof(vPass));
+
+    bool ok = haveUser && havePass &&
+              constantTimeStringEq(user.c_str(), vUser) &&
+              constantTimeStringEq(pass.c_str(), vPass);
+
+    memset(vPass, 0, sizeof(vPass));
+
+    if (!ok) {
+        if (registerLoginFailure(ip) >= MAX_AUTH_ATTEMPTS) {
+            loginLimiter.block(ip, BLOCK_DURATION_MS);
+        }
+        r->redirect("/login?e=1");
+        return;
+    }
+
+    if (!timeLooksValid()) {
+        r->redirect("/login?e=2");
+        return;
+    }
+
+    if (!totp.verify(code.c_str(), currentUtc())) {
+        if (registerLoginFailure(ip) >= MAX_AUTH_ATTEMPTS) {
+            loginLimiter.block(ip, BLOCK_DURATION_MS);
+        }
+        r->redirect("/login?e=1");
+        return;
+    }
+
+    clearLoginFailures(ip);
+    Session* s = createSession(ip);
+    if (!s) {
+        r->send(503, "text/plain", "sem slots de sessao");
+        return;
+    }
+
+    AsyncWebServerResponse* resp = r->beginResponse(302, "text/plain", "");
+    resp->addHeader("Location", "/");
+    String cookie = String("HEF_SID=") + s->token + "; Path=/; HttpOnly; SameSite=Strict";
+    resp->addHeader("Set-Cookie", cookie);
+    r->send(resp);
 }
 
-function limparHistorico() {
-  if (confirm('Tem certeza que deseja limpar o histórico de capturas?')) {
-    fetch('/clear_historico', {method: 'POST'})
-      .then(() => {
-        atualizarHistorico();
-        alert('Histórico limpo com sucesso');
-      })
-      .catch(e => alert('Erro ao limpar'));
+static void handleLogout(AsyncWebServerRequest* r) {
+    char token[HTTP_TOKEN_HEX_LEN + 1];
+    if (getCookie(r, "HEF_SID", token, sizeof(token))) destroySession(token);
+    AsyncWebServerResponse* resp = r->beginResponse(302, "text/plain", "");
+    resp->addHeader("Location", "/login");
+    resp->addHeader("Set-Cookie", "HEF_SID=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
+    r->send(resp);
+}
+
+static void handleRoot(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { r->redirect("/login"); return; }
+
+    static const char DASH[] PROGMEM = R"HTML(<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hefestos SIGINT - Node2</title>
+<style>
+:root{--bg:#0b0f14;--fg:#d7e2ee;--acc:#3fa9f5;--card:#141b24}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg)}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 16px;background:#101720;border-bottom:1px solid #22303f;position:sticky;top:0;z-index:2}
+h1{font-size:15px;margin:0;color:var(--acc)}
+main{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px;padding:12px}
+section{background:var(--card);border:1px solid #22303f;border-radius:6px;padding:10px;min-width:0}
+h2{font-size:12px;margin:0 0 8px;color:var(--acc);text-transform:uppercase;letter-spacing:.06em}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{padding:2px 4px;text-align:left;border-bottom:1px solid #1d2833;vertical-align:top}
+th{color:#7f93a8;font-weight:400}
+td:first-child{color:#7f93a8;white-space:nowrap}
+input,select,button{font:inherit;background:#0d141c;color:var(--fg);border:1px solid #2b3a4a;border-radius:4px;padding:4px 6px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+pre{white-space:pre-wrap;word-break:break-word;font-size:11px;max-height:240px;overflow:auto;margin:0}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.muted{color:#7f93a8}.ok{color:#7fe08a}.bad{color:#f08a8a}.warn{color:#f0cf8a}
+.scroll{overflow:auto;max-height:300px}
+</style></head><body>
+<header><h1>HEFESTOS SIGINT v5 &middot; Node2</h1>
+<div class="row" style="margin:0"><span id="jid" class="muted"></span><button id="logout">Sair</button></div></header>
+<main>
+<section><h2>Estado</h2><table id="status"></table></section>
+<section><h2>Pares (rastreadores)</h2><div class="scroll"><table id="peers"><thead><tr><th>no</th><th>rssi</th><th>snr</th><th>idade</th><th>lat</th><th>lon</th><th>sat</th><th>bat</th><th>ok/erro</th></tr></thead><tbody></tbody></table></div></section>
+<section><h2>Receptor / Espectro</h2>
+<div class="row"><select id="band"><option>FM</option><option>AM</option><option>SW</option></select>
+<input id="freq" type="number" min="0" step="1" value="100100" style="width:110px">
+<button id="tune">Sintonizar</button><button id="sweep">Varredura</button></div>
+<table id="radio"></table><pre id="spec">-</pre></section>
+<section><h2>Interferencia / Link</h2><table id="jam"></table></section>
+<section><h2>Saude</h2><table id="health"></table></section>
+<section><h2>Node3 &middot; Capturas</h2><pre id="caps">-</pre></section>
+<section><h2>Node3 &middot; Log forense</h2><pre id="logs">-</pre></section>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+async function api(p,o){
+  const r=await fetch(p,o);
+  if(r.status===401){location.href='/login';return null;}
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  return r.json();
+}
+function kv(id,rows){
+  const t=$(id);t.replaceChildren();
+  for(const it of rows){
+    const tr=document.createElement('tr');
+    const a=document.createElement('td');a.textContent=it[0];
+    const b=document.createElement('td');
+    b.textContent=(it[1]===null||it[1]===undefined)?'-':String(it[1]);
+    if(it[2])b.className=it[2];
+    tr.append(a,b);t.append(tr);
   }
 }
-
-// Iniciar atualizações automáticas
-intervalId = setInterval(atualizarTudo, 2000);
-atualizarTudo();
-window.addEventListener('beforeunload', () => { if (intervalId) clearInterval(intervalId); });
-</script>
-</body></html>)rawliteral";
-
-// === Setup Function ===
-void setup() {
-  esp_task_wdt_init(10, true);
-  esp_task_wdt_add(NULL);
-
-  Serial.begin(115200);
-  debug.begin(115200);
-  debug.log("Node2 v4.0: Inicializando...");
-  
-  // Initialize serial for Node3 communication
-  SerialNode2.begin(9600, SERIAL_8N1, N2_UART_RX, N2_UART_TX);
-
-  config.begin();
-  memcpy(aes_key, config.getAESKey(), 16);
-  aesgcm.setKey(aes_key, 16);
-
-  loadBlockedIPs();
-
-  const char* wifi_pass = config.getWiFiPassword();
-  WiFi.softAP("Hefestos-SIGINT", wifi_pass, 1, false, 4);
-  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-  debug.log("WiFi: Hefestos-SIGINT (v4.0)");
-
-  shellServer.begin();
-
-  LoRa.setPins(N2_LORA_SS, N2_LORA_RST, N2_LORA_DIO0);
-  LoRa.begin(LORA_FREQ);
-  LoRa.setSpreadingFactor(LORA_SF);
-  LoRa.setSignalBandwidth(LORA_BW);
-
-  secProto.begin(0xDEADBEEF);
-
-  Wire.begin(N2_I2C_SDA, N2_I2C_SCL);
-  radioRX.setup(N2_RX_RST, 1);
-  radioRX.setFM(8400, 10800, currentFreq * 100, 10);
-  radioRX.setVolume(50);
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (!verifyHTTPSession(request)) {
-      AsyncWebServerResponse *resp = request->beginResponse(401, "text/html", "<html><body><h1>401 Unauthorized</h1><p><a href='/login'>Login</a></p></body></html>");
-      resp->addHeader("WWW-Authenticate", "Bearer");
-      request->send(resp);
-      return;
+function cls(v){return v==='NORMAL'?'ok':(v==='LINK_LOSS'?'bad':'warn');}
+async function refresh(){
+  try{
+    const [s,p,r,h]=await Promise.all([api('/api/status'),api('/api/peers'),api('/api/radio'),api('/api/health')]);
+    if(!s)return;
+    $('#jid').textContent='node '+s.node_id+' | '+s.wifi.mode+' '+s.wifi.ip;
+    kv('#status',[
+      ['firmware',s.fw],['uptime',s.uptime_s+' s'],
+      ['UTC',s.time.utc?(new Date(s.time.utc*1000).toISOString()):'-'],
+      ['relogio',s.time.synced?'sincronizado':'NAO sincronizado',s.time.synced?'ok':'bad'],
+      ['chave link',s.lora.key,s.lora.key==='ok'?'ok':'bad'],
+      ['pares',s.lora.peers],['frames ok',s.lora.frames_ok],
+      ['frames ruins',s.lora.frames_bad],['replays',s.lora.replays],['ACKs',s.lora.acks_sent],
+      ['sessoes',s.sessions]
+    ]);
+    kv('#radio',[['banda',s.radio.band],['frequencia',s.radio.freq_khz+' kHz'],
+      ['inicializado',s.radio.initialized?'sim':'nao'],
+      ['varredura',s.spectrum.running?'em curso':'parada'],
+      ['amostras',s.spectrum.samples],['auto',s.spectrum.auto?'ligado':'desligado']]);
+    kv('#jam',[['estado',s.jamming.state,cls(s.jamming.state)],
+      ['SNR mediana',s.jamming.median_snr+' dB'],
+      ['RSSI mediana',s.jamming.median_rssi_dbm+' dBm'],
+      ['piso de ruido',s.jamming.noise_floor_dbuV+' dBuV'],
+      ['ultimo pacote',s.jamming.last_packet_age_ms+' ms']]);
+    kv('#health',[['heap livre',h.heap_free+' B'],['heap minimo',h.heap_min+' B'],
+      ['enrollments',h.enrollments],['CRC erros Node3',h.ser_crc_errors],
+      ['overflows Node3',h.ser_overflows],['drops TX Node3',h.ser_drops],
+      ['fila Node3',h.ser_queue+' B']]);
+    const tb=$('#peers tbody');tb.replaceChildren();
+    for(const q of p.peers){
+      const tr=document.createElement('tr');
+      const vals=[q.node_id,q.rssi,q.snr,q.age_ms+' ms',
+        q.have_track?q.lat.toFixed(6):'-',q.have_track?q.lon.toFixed(6):'-',
+        q.have_track?q.sats:'-',q.have_track?q.battery:'-',
+        q.frames_ok+'/'+q.frames_bad];
+      for(const v of vals){const td=document.createElement('td');td.textContent=String(v);tr.append(td);}
+      tb.append(tr);
     }
-    AsyncWebServerResponse *resp = request->beginResponse_P(200, "text/html", index_html);
-    resp->addHeader("Content-Security-Policy", "default-src 'self'");
-    resp->addHeader("X-Content-Type-Options", "nosniff");
-    resp->addHeader("X-Frame-Options", "DENY");
-    request->send(resp);
-  });
+    if(p.peers.length===0){
+      const tr=document.createElement('tr');
+      const td=document.createElement('td');td.colSpan=9;td.className='muted';
+      td.textContent='nenhum par autenticado ainda';
+      tr.append(td);tb.append(tr);
+    }
+    const sp=await api('/api/spectrum');
+    if(sp){
+      const pts=sp.points||[];
+      $('#spec').textContent=pts.length?pts.map(x=>x.band+' '+x.freq_khz+' kHz  '+x.rssi_dbuV+' dBuV  SNR '+x.snr_db+' dB').join('\n'):'sem amostras';
+    }
+  }catch(e){$('#jid').textContent='erro: '+e.message;}
+}
+async function refreshNode3(){
+  try{
+    const c=await api('/api/captures');if(c)$('#caps').textContent=JSON.stringify(c.data,null,1);
+    const l=await api('/api/logs');if(l)$('#logs').textContent=JSON.stringify(l.data,null,1);
+  }catch(e){}
+}
+$('#logout').onclick=async()=>{await fetch('/logout',{method:'POST'});location.href='/login';};
+$('#tune').onclick=async()=>{
+  const b=$('#band').value,f=$('#freq').value;
+  await api('/api/radio?band='+encodeURIComponent(b)+'&freq='+encodeURIComponent(f),{method:'POST'});
+  refresh();
+};
+$('#sweep').onclick=async()=>{await api('/api/sweep',{method:'POST'});refresh();};
+refresh();refreshNode3();
+setInterval(refresh,2000);
+setInterval(refreshNode3,5000);
+</script></body></html>)HTML";
 
-  server.on("/login", HTTP_POST, handleLogin);
-  server.on("/logout", HTTP_POST, handleLogout);
-  server.on("/ota", HTTP_POST, handleOTA);
-  server.on("/jamming", HTTP_GET, handleJamming);
-  server.on("/dados", HTTP_GET, handleDados);
-  server.on("/sintonizar", HTTP_GET, handleSintonizar);
-  server.on("/ultima", HTTP_GET, handleUltima);
-  server.on("/historico", HTTP_GET, handleHistorico);
-  server.on("/clear_historico", HTTP_POST, handleClearHistorico);
+    r->send(200, "text/html", DASH);
+}
 
-  server.begin();
-  debug.log("Node2 v4.0: Ready");
+static void handleStatus(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    sendJson(r, 200, jsonStatus());
+}
+
+static void handlePeers(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    sendJson(r, 200, jsonPeers());
+}
+
+static void handleRadioGet(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    DynamicJsonDocument doc(512);
+    doc["band"] = HefRadio::bandName(radio.band());
+    doc["freq_khz"] = radio.freqKHz();
+    doc["initialized"] = radio.isInitialized();
+    HefSignalQuality q = radio.readQuality();
+    doc["rssi_dbuV"] = q.rssiDBuV;
+    doc["snr_db"] = q.snrDb;
+    doc["valid"] = q.valid;
+    String out; serializeJson(doc, out);
+    sendJson(r, 200, out);
+}
+
+static void handleRadioPost(AsyncWebServerRequest* r) {
+    Session* s = authedSession(r);
+    if (!s) { sendUnauthorized(r); return; }
+    if (!cmdLimiter.allowWithCooldown(ipToKey(r->client()->remoteIP()))) {
+        sendJson(r, 429, "{\"error\":\"rate limit\"}");
+        return;
+    }
+    if (!r->hasParam("band") || !r->hasParam("freq")) {
+        sendJson(r, 400, "{\"error\":\"band e freq obrigatorios\"}");
+        return;
+    }
+    String band = r->arg("band");
+    long freq = r->arg("freq").toInt();
+    if (freq <= 0) { sendJson(r, 400, "{\"error\":\"freq invalida\"}"); return; }
+
+    // Sintonia manual cancela a varredura (evita disputa pelo receptor).
+    if (scanner.isRunning()) scanner.stop();
+    bool ok = radio.tuneByName(band.c_str(), (uint32_t)freq);
+    DynamicJsonDocument doc(256);
+    doc["ok"] = ok;
+    doc["band"] = HefRadio::bandName(radio.band());
+    doc["freq_khz"] = radio.freqKHz();
+    String out; serializeJson(doc, out);
+    sendJson(r, ok ? 200 : 400, out);
+}
+
+static void handleSpectrum(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    sendJson(r, 200, jsonSpectrum());
+}
+
+static void handleSweep(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    if (!cmdLimiter.allowWithCooldown(ipToKey(r->client()->remoteIP()))) {
+        sendJson(r, 429, "{\"error\":\"rate limit\"}");
+        return;
+    }
+    if (r->hasParam("auto")) {
+        String a = r->arg("auto");
+        autoSweep = (a == "1" || a == "on" || a == "true");
+    }
+    if (r->hasParam("dwell")) {
+        long d = r->arg("dwell").toInt();
+        if (d >= 20 && d <= 5000) scanner.setDwell((uint32_t)d);
+    }
+    if (!scanner.isRunning()) scanner.start();
+    DynamicJsonDocument doc(256);
+    doc["running"] = scanner.isRunning();
+    doc["auto"] = autoSweep;
+    doc["samples"] = scanner.sampleCount();
+    String out; serializeJson(doc, out);
+    sendJson(r, 200, out);
+}
+
+static void handleHealth(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    sendJson(r, 200, jsonHealth());
+}
+
+static String wrapNode3(uint8_t req) {
+    const RespCache* c = cachedResponse(req);
+    String out = "{\"stale\":";
+    out += (c && (nowMs() - c->ms) < 5000UL) ? "false" : "true";
+    out += ",\"data\":";
+    out += (c && c->valid) ? c->json : "null";
+    out += "}";
+    return out;
+}
+
+static void handleCaptures(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    const RespCache* c = cachedResponse(HEF_REQ_CAPTURE_LIST);
+    if (!c || (nowMs() - c->ms) > 5000UL) requestNode3(HEF_REQ_CAPTURE_LIST);
+    sendJson(r, 200, wrapNode3(HEF_REQ_CAPTURE_LIST));
+}
+
+static void handleLogs(AsyncWebServerRequest* r) {
+    if (!authedSession(r)) { sendUnauthorized(r); return; }
+    const RespCache* c = cachedResponse(HEF_REQ_LOG_INFO);
+    if (!c || (nowMs() - c->ms) > 10000UL) requestNode3(HEF_REQ_LOG_INFO);
+    sendJson(r, 200, wrapNode3(HEF_REQ_LOG_INFO));
+}
+
+static void handleNotFound(AsyncWebServerRequest* r) {
+    r->send(404, "application/json", "{\"error\":\"nao encontrado\"}");
+}
+
+// =====================================================================
+// Console serial (UART0)
+// =====================================================================
+static void printHelp() {
+    Serial.println();
+    Serial.println("=== HEFESTOS SIGINT v5 - Node2 (Base) ===");
+    Serial.println("help                     esta ajuda");
+    Serial.println("status                   estado resumido");
+    Serial.println("id                       node_id deste no");
+    Serial.println("psk <64 hex>             define o PSK de deploy");
+    Serial.println("psk show                 informa se ha PSK");
+    Serial.println("user <nome>              troca o usuario HTTP");
+    Serial.println("pass <senha>             troca a senha HTTP (>=10)");
+    Serial.println("totp                     mostra o segredo TOTP atual");
+    Serial.println("wifi <ssid> <senha>      configura STA (senha >=8)");
+    Serial.println("settime <unix>           acerta o relogio UTC");
+    Serial.println("time                     mostra o relogio UTC");
+    Serial.println("enroll <node> <keyid>    registra um par manualmente");
+    Serial.println("peers                    lista pares");
+    Serial.println("sweep on|off|now         varredura automatica/agora");
+    Serial.println("radio <FM|AM|SW> <kHz>   sintoniza o receptor");
+    Serial.println("reboot                   reinicia");
+    Serial.println("factory                  apaga o vault e reinicia");
+}
+
+static void handleConsole(char* line) {
+    if (strncmp(line, "help", 4) == 0) {
+        printHelp();
+    } else if (strncmp(line, "status", 6) == 0) {
+        Serial.printf("node_id=%u chave=%s clock=%s\n", nodeId,
+                      keyReady ? "ok" : "ausente",
+                      timeLooksValid() ? "ok" : "invalido");
+        Serial.printf("pares=%u frames_ok=%u ruins=%u replays=%u\n",
+                      peerCount(), loraFramesOk, loraFramesBad, loraReplays);
+        Serial.printf("Node3: ok=%u crc=%u drops=%u fila=%u\n",
+                      serFramesOk, serRx.crcErrors(), serDrops, serQueue.pending());
+    } else if (strncmp(line, "id", 2) == 0) {
+        Serial.printf("node_id=%u\n", nodeId);
+    } else if (strncmp(line, "psk show", 8) == 0) {
+        Serial.println(vault.hasPsk() ? "PSK: configurado" : "PSK: ausente");
+    } else if (strncmp(line, "psk ", 4) == 0) {
+        uint8_t psk[HEF_KEY_LEN];
+        int n = hexToBytes(line + 4, psk, sizeof(psk));
+        if (n != (int)HEF_KEY_LEN) {
+            Serial.println("ERRO: esperado PSK de 64 caracteres hex");
+        } else if (!vault.setDeploymentPsk(psk, HEF_KEY_LEN)) {
+            Serial.println("ERRO: falha ao gravar o vault");
+        } else {
+            Serial.println("OK: PSK gravado. Re-provisione os nos e reinicie.");
+        }
+        memset(psk, 0, sizeof(psk));
+    } else if (strncmp(line, "user ", 5) == 0) {
+        if (vault.setCliUsername(line + 5)) Serial.println("OK: usuario atualizado");
+        else Serial.println("ERRO: usuario invalido (3..16)");
+    } else if (strncmp(line, "pass ", 5) == 0) {
+        if (vault.setCliPassword(line + 5)) Serial.println("OK: senha atualizada");
+        else Serial.println("ERRO: senha invalida (>=10)");
+    } else if (strncmp(line, "totp", 4) == 0) {
+        char b32[64];
+        totp.exportBase32(b32, sizeof(b32));
+        char uri[192];
+        totp.buildOtpAuthUri(uri, sizeof(uri), "Hefestos", "admin");
+        Serial.print("TOTP base32: "); Serial.println(b32);
+        Serial.print("URI:         "); Serial.println(uri);
+    } else if (strncmp(line, "wifi ", 5) == 0) {
+        char* sp = strchr(line + 5, ' ');
+        if (!sp) {
+            Serial.println("ERRO: use 'wifi <ssid> <senha>'");
+        } else {
+            *sp = 0;
+            const char* ssid = line + 5;
+            const char* pass = sp + 1;
+            if (!vault.setWifiSsid(ssid) || !vault.setWifiPassword(pass)) {
+                Serial.println("ERRO: ssid 1..32 / senha >=8");
+            } else {
+                Serial.println("OK: WiFi gravado. Reinicie para conectar.");
+            }
+        }
+    } else if (strncmp(line, "settime ", 8) == 0) {
+        uint32_t u = (uint32_t)strtoul(line + 8, nullptr, 10);
+        if (u < 1704067200UL) {
+            Serial.println("ERRO: epoch invalido");
+        } else {
+            struct timeval tv;
+            tv.tv_sec = (time_t)u;
+            tv.tv_usec = 0;
+            settimeofday(&tv, nullptr);
+            clockSynced = true;
+            hefSendTimeToNode3(u);
+            Serial.println("OK: relogio ajustado");
+        }
+    } else if (strncmp(line, "time", 4) == 0) {
+        Serial.printf("UTC: %u (%s)\n", currentUtc(),
+                      timeLooksValid() ? "valido" : "invalido");
+    } else if (strncmp(line, "enroll ", 7) == 0) {
+        char* sp = strchr(line + 7, ' ');
+        if (!sp) {
+            Serial.println("ERRO: use 'enroll <node_id> <key_id>'");
+        } else {
+            uint16_t nid = (uint16_t)atoi(line + 7);
+            uint8_t kid = (uint8_t)atoi(sp + 1);
+            if (nid == 0) Serial.println("ERRO: node_id invalido");
+            else if (vault.enrollNode(nid, kid)) Serial.println("OK: par registrado");
+            else Serial.println("ERRO: limite de enrollments");
+        }
+    } else if (strncmp(line, "peers", 5) == 0) {
+        for (uint8_t i = 0; i < HEF_MAX_ENROLLMENTS; i++) {
+            if (!peers[i].used) continue;
+            Serial.printf("node=%u keyId=%u rssi=%d snr=%.1f ok=%u err=%u replay=%u\n",
+                          peers[i].nodeId, peers[i].keyId, peers[i].lastRssi,
+                          (double)peers[i].lastSnr, peers[i].framesOk,
+                          peers[i].framesBad, peers[i].replays);
+        }
+    } else if (strncmp(line, "sweep on", 8) == 0) {
+        autoSweep = true;
+        if (!scanner.isRunning()) scanner.start();
+        Serial.println("OK: varredura automatica ligada");
+    } else if (strncmp(line, "sweep off", 9) == 0) {
+        autoSweep = false;
+        Serial.println("OK: varredura automatica desligada");
+    } else if (strncmp(line, "sweep now", 9) == 0) {
+        scanner.start();
+        Serial.println("OK: varredura iniciada");
+    } else if (strncmp(line, "radio ", 6) == 0) {
+        char band[8];
+        unsigned freq = 0;
+        if (sscanf(line + 6, "%7s %u", band, &freq) == 2) {
+            bool ok = radio.tuneByName(band, freq);
+            Serial.printf("%s: %s %.3f MHz\n", ok ? "OK" : "ERRO",
+                          HefRadio::bandName(radio.band()),
+                          radio.freqKHz() / 1000.0f);
+        } else {
+            Serial.println("ERRO: use 'radio <FM|AM|SW> <kHz>'");
+        }
+    } else if (strncmp(line, "reboot", 6) == 0) {
+        Serial.println("Reiniciando...");
+        delay(100);
+        ESP.restart();
+    } else if (strncmp(line, "factory", 7) == 0) {
+        vault.factoryReset();
+        Serial.println("Vault apagado. Reiniciando...");
+        delay(200);
+        ESP.restart();
+    } else {
+        Serial.println("Comando desconhecido. Use 'help'.");
+    }
+}
+
+// =====================================================================
+// Setup
+// =====================================================================
+static void setupRadio() {
+    Wire.begin(N2_I2C_SDA, N2_I2C_SCL);
+    if (radio.begin(N2_RX_RST)) {
+        radio.tune(HEF_BAND_FM, 100100);
+        scanner.setDefaultPlan();
+        dbg.log("Si4735 pronto");
+    } else {
+        dbg.logWarning("Si4735 nao detectado");
+    }
+}
+
+static void setupLoRa() {
+    LoRa.setPins(N2_LORA_SS, N2_LORA_RST, N2_LORA_DIO0);
+    if (!LoRa.begin(LORA_FREQ)) {
+        dbg.logError("Falha ao iniciar o LoRa");
+        return;
+    }
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.setSyncWord(0x12);
+    LoRa.receive();
+    dbg.log("LoRa em RX");
+}
+
+void setup() {
+    Serial.begin(115200);
+    dbg.begin(115200);
+
+    dbg.log("Node2 v5.0.0: inicializando");
+
+    // Node3 em UART2 (UART0 fica para o console).
+    node3Serial.begin(115200, SERIAL_8N1, N2_UART_RX, N2_UART_TX);
+
+    // Vault + identidade + chave de link
+    vault.begin();
+    nodeId = vault.nodeId();
+    keyReady = (vault.getPsk() != nullptr);
+
+    ensureCredentials();
+    setupRadio();
+    setupLoRa();
+    startNetwork();
+
+    // Servidor HTTP
+    DefaultHeaders::Instance().addHeader("X-Content-Type-Options", "nosniff");
+    DefaultHeaders::Instance().addHeader("X-Frame-Options", "DENY");
+    DefaultHeaders::Instance().addHeader("Referrer-Policy", "no-referrer");
+
+    server.on("/login", HTTP_GET, handleLoginPage);
+    server.on("/login", HTTP_POST, handleLogin);
+    server.on("/logout", HTTP_POST, handleLogout);
+    server.on("/", HTTP_GET, handleRoot);
+
+    server.on("/api/status", HTTP_GET, handleStatus);
+    server.on("/api/peers", HTTP_GET, handlePeers);
+    server.on("/api/radio", HTTP_GET, handleRadioGet);
+    server.on("/api/radio", HTTP_POST, handleRadioPost);
+    server.on("/api/spectrum", HTTP_GET, handleSpectrum);
+    server.on("/api/sweep", HTTP_POST, handleSweep);
+    server.on("/api/health", HTTP_GET, handleHealth);
+    server.on("/api/captures", HTTP_GET, handleCaptures);
+    server.on("/api/logs", HTTP_GET, handleLogs);
+
+    server.onNotFound(handleNotFound);
+    server.begin();
+
+    Serial.println();
+    Serial.println("=================================================");
+    Serial.println(" HEFESTOS SIGINT v5.0.0 - NODE 2 (BASE)");
+    Serial.println("=================================================");
+    Serial.printf("node_id: %u\n", nodeId);
+    Serial.printf("chave de link: %s\n", keyReady ? "OK" : "AUSENTE - 'psk <64 hex>'");
+    Serial.printf("HTTP: http://%s/\n",
+                  (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP().toString().c_str()
+                                              : WiFi.localIP().toString().c_str());
+    Serial.println("=================================================");
+    printHelp();
+}
+
+// =====================================================================
+// Loop
+// =====================================================================
+void loop() {
+    uint32_t now = nowMs();
+
+    // --- Console ---
+    static char cmd[96];
+    static uint8_t cmdLen = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            cmd[cmdLen] = 0;
+            if (cmdLen > 0) handleConsole(cmd);
+            cmdLen = 0;
+        } else if (cmdLen < sizeof(cmd) - 1) {
+            cmd[cmdLen++] = c;
+        }
+    }
+
+    // --- LoRa RX ---
+    int packetSize = LoRa.parsePacket();
+    if (packetSize > 0) {
+        uint8_t frame[HEF_MAX_FRAME + 8];
+        int n = LoRa.readBytes(frame, sizeof(frame));
+        int16_t rssi = (int16_t)LoRa.packetRssi();
+        float snr = LoRa.packetSnr();
+        if (n > 0) processTrack(frame, (uint16_t)n, rssi, snr);
+    }
+
+    // --- Link serial com o Node3 ---
+    serQueue.pump(node3Serial);
+    serRx.feed(node3Serial, onNode3Frame, nullptr);
+
+    // Heartbeat para o Node3 (5 s) + tempo UTC (30 s). O reenvio periodico
+    // garante que um Node3 reiniciado recupere o relogio sem esperar por
+    // uma mudanca de hora.
+    static uint32_t lastHeartbeat = 0;
+    if (now - lastHeartbeat >= 5000UL) {
+        lastHeartbeat = now;
+        uint8_t hb[4];
+        putU32(hb, (uint32_t)(now / 1000UL));
+        hefSendSer(HEF_SER_HEARTBEAT, hb, sizeof(hb));
+        if (timeLooksValid()) hefSendTimeToNode3(currentUtc());
+    }
+
+    // --- Espectro ---
+    if (scanner.isRunning()) {
+        if (scanner.tick(now)) {
+            SpectrumPoint pt;
+            if (scanner.latest(&pt)) {
+                jam.onNoiseFloor((float)pt.rssiDBuV, now);
+            }
+            if (!scanner.isRunning() && autoSweep) {
+                scanner.start();
+            }
+        }
+    }
+
+    // --- Expiracao de sessoes ---
+    static uint32_t lastSessionSweep = 0;
+    if (now - lastSessionSweep >= 10000UL) {
+        lastSessionSweep = now;
+        for (uint8_t i = 0; i < HTTP_SESSION_SLOTS; i++) {
+            Session& s = sessions[i];
+            if (!s.active) continue;
+            if ((now - s.lastMs) > HTTP_SESSION_IDLE_MS ||
+                (now - s.createdMs) > HTTP_SESSION_ABSOLUTE_MS) {
+                memset(&s, 0, sizeof(s));
+            }
+        }
+    }
+
+    // --- Watchdog de memoria (reinicio controlado se o heap colapsar) ---
+    static uint32_t lastHeapCheck = 0;
+    if (now - lastHeapCheck >= 30000UL) {
+        lastHeapCheck = now;
+        if (ESP.getFreeHeap() < 12000) {
+            dbg.logError("Heap critico: reiniciando");
+            delay(100);
+            ESP.restart();
+        }
+    }
+
+    delay(1);
 }

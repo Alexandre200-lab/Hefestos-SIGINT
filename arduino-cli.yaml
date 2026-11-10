@@ -1,0 +1,16 @@
+# Configuracao opcional do arduino-cli para builds reproduziveis.
+#
+# Uso:
+#   arduino-cli --config-file arduino-cli.yaml core update-index
+#   arduino-cli --config-file arduino-cli.yaml core install esp32:esp32@2.0.17
+#
+# O build.sh usa a configuracao global do arduino-cli, mas valida que a
+# versao instalada do core e' exatamente 2.0.17 (mbedtls 2.x).
+directories:
+  data: ~/.arduino15
+  user: ~/Arduino
+  downloads: ~/.arduino15/staging
+
+board_manager:
+  additional_urls:
+    - https://espressif.github.io/arduino-esp32/package_esp32_index.json

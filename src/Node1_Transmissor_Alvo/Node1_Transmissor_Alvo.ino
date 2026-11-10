@@ -23,7 +23,6 @@
 #include <Wire.h>
 #include <Adafruit_Si4713.h>
 #include <Preferences.h>
-#include <esp_battery.h>
 
 #include <config.h>
 #include <crypto_gcm.h>
@@ -56,31 +55,46 @@ static uint32_t txCount        = 0;
 static uint32_t ackCount       = 0;
 static uint32_t retryCount     = 0;
 static uint32_t gpsFixCount    = 0;
-static uint8_t  lastSeqByte    = 0;
+static bool     gpsValid       = false;
 
 // Beacon FM
 static bool     fmBeaconEnabled = false;
-static uint16_t fmFreqKHz       = 100100;
-static uint8_t  fmPower         = 60;   // 0..255 (Adafruit Si4713)
+static uint32_t fmFreqKHz       = 100100;
+static uint8_t  fmPower         = 100;  // dBuV (88..115 no Si4713)
 static uint32_t fmBeaconUntilMs = 0;
 
 // ---------------------------------------------------------------
-// Callback de recepcao (ACK do Node2)
+// Recepcao do ACK do Node2
+//
+// NOTA: a lib LoRa (Sandeep Mistry) expoe onReceive(void(*)(int)) e
+// invoca o callback dentro de parsePacket() (contexto de task, nao ISR).
+// A leitura do payload e' feita explicitamente com readBytes().
 // ---------------------------------------------------------------
 static volatile uint32_t gAckCounter = 0xFFFFFFFFUL;
 static volatile bool      gGotAck    = false;
 
-static void onLoRaReceive(uint8_t* payload, uint16_t length) {
+static void processAck(const uint8_t* payload, size_t length) {
     if (length < HEF_HEADER_LEN + HEF_TAG_LEN) return;
     if (payload[0] != HEF_LINK_MAGIC) return;
     if (payload[1] != HEF_LINK_VERSION) return;
     if (payload[2] != HEF_MSG_TRACK_ACK) return;
 
-    uint16_t ackEpoch = (uint16_t)((payload[5] << 8) | payload[6]);
-    uint32_t ackCtr   = ((uint32_t)payload[7] << 24) | ((uint32_t)payload[8] << 16) |
-                        ((uint32_t)payload[9] << 8)  | payload[10];
+    uint16_t ackEpoch = (uint16_t)((payload[7] << 8) | payload[8]);
+    uint32_t ackCtr   = ((uint32_t)payload[9] << 24) | ((uint32_t)payload[10] << 16) |
+                        ((uint32_t)payload[11] << 8)  | payload[12];
     if (ackEpoch != txSeq.epoch()) return;
     if (ackCtr != txSeq.counter()) return;
+
+    // O ACK e' autenticado: so conta se a tag GCM (com a chave do no)
+    // for valida. Sem isso, um atacante poderia suprimir retransmissoes.
+    if (!keyReady) return;
+    uint8_t plain[8];
+    AeadGcm ackGcm;
+    ackGcm.setKey(linkKey, sizeof(linkKey));
+    int pt = ackGcm.decrypt(payload + HEF_HEADER_LEN,
+                            length - HEF_HEADER_LEN, plain, sizeof(plain),
+                            (uint32_t)nodeId, ackCtr, payload, HEF_HEADER_LEN);
+    if (pt < 0) return;
 
     gAckCounter = ackCtr;
     gGotAck = true;
@@ -96,14 +110,9 @@ static void loadSequence() {
     seqPrefs.getBytes("epoch", &epoch, sizeof(epoch));
     seqPrefs.getBytes("ctr", &counter, sizeof(counter));
 
-    if (epoch == 0) {
-        // Primeiro boot: epoch novo derivado da entropia do hardware.
-        epoch = deriveEpoch(nodeId, (uint32_t)millis());
-    } else {
-        // Boot subsequente: epoch NOVO (o receptor precisa distinguir a
-        // nova sessao do emissor de um replay da sessao antiga).
-        epoch = deriveEpoch(nodeId, (uint32_t)millis());
-    }
+    // O epoch e' SEMPRE novo a cada boot (mesmo no primeiro): e' assim que
+    // o receptor distingue uma nova sessao do emissor de um replay.
+    epoch = deriveEpoch(nodeId, (uint32_t)millis());
     txSeq.begin(epoch, counter);
     seqPrefs.putBytes("epoch", &epoch, sizeof(epoch));
     seqPrefs.putBytes("ctr", &counter, sizeof(counter));
@@ -111,12 +120,9 @@ static void loadSequence() {
     dbg.logf("TX sequence: epoch=%u counter=%u", epoch, counter);
 }
 
-static void persistCounter() {
-    uint32_t c = txSeq.counter();
-    seqPrefs.begin("hefseq", false);
-    seqPrefs.putBytes("ctr", &c, sizeof(c));
-    seqPrefs.end();
-}
+// O contador NAO precisa ser persistido a cada frame: o epoch muda a cada
+// boot e o receptor reinicia a janela ao ver um epoch novo. Gravar NVS a
+// 1 Hz desgastaria a flash sem ganho de seguranca.
 
 // ---------------------------------------------------------------
 // Provisionamento de chave
@@ -148,12 +154,34 @@ static uint8_t readBatteryPct() {
 }
 
 // ---------------------------------------------------------------
+// Conversao civil -> epoch UTC (sem depender de timegm, que nao existe
+// no newlib do ESP32-Arduino 2.0.x).
+// Algoritmo de Howard Hinnant (days_from_civil).
+// ---------------------------------------------------------------
+static uint32_t utcFromCivil(int year, int month, int day,
+                             int hour, int minute, int second) {
+    if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+
+    int y = year - (month <= 2 ? 1 : 0);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (unsigned)((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1);
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = (long)era * 146097L + (long)doe - 719468L;
+
+    long secs = days * 86400L + hour * 3600L + minute * 60L + second;
+    if (secs < 1704067200L) return 0;
+    return (uint32_t)secs;
+}
+
+// ---------------------------------------------------------------
 // Construcao e envio do frame de tracking
 // ---------------------------------------------------------------
 static bool buildAndSendTrack(uint8_t retry) {
     if (!keyReady) return false;
 
-    gpsValid = gps.location.isValid() && gps.satelliteCount() >= GPS_MIN_SATS &&
+    uint32_t sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    gpsValid = gps.location.isValid() && sats >= GPS_MIN_SATS &&
                gps.location.age() < GPS_FIX_MAX_AGE_MS &&
                gps.location.age() > 0;
 
@@ -166,16 +194,9 @@ static bool buildAndSendTrack(uint8_t retry) {
     uint32_t epochUtc = 0;
     if (gpsValid && gps.time.isValid() && gps.date.isValid()) {
         // Sem NTP no emissor: usa a hora do GNSS quando disponivel.
-        struct tm t;
-        memset(&t, 0, sizeof(t));
-        t.tm_year = gps.date.year() - 1900;
-        t.tm_mon  = gps.date.month() - 1;
-        t.tm_mday = gps.date.day();
-        t.tm_hour = gps.time.hour();
-        t.tm_min  = gps.time.minute();
-        t.tm_sec  = gps.time.second();
-        time_t tt = timegm(&t);
-        if (tt > 1704067200) epochUtc = (uint32_t)tt;
+        epochUtc = utcFromCivil((int)gps.date.year(), (int)gps.date.month(),
+                                (int)gps.date.day(), (int)gps.time.hour(),
+                                (int)gps.time.minute(), (int)gps.time.second());
     }
 
     linkPackTrack(payload, epochUtc,
@@ -183,17 +204,17 @@ static bool buildAndSendTrack(uint8_t retry) {
                   gpsValid ? gps.location.lng() : 0.0,
                   (int16_t)(gpsValid ? (int16_t)gps.altitude.meters() : 0),
                   (uint16_t)(gpsValid ? (uint16_t)(gps.speed.mps() * 100.0f) : 0),
-                  (uint16_t)(gpsValid ? (uint16_t)gps.course.degrees() : 0),
+                  (uint16_t)(gpsValid ? (uint16_t)gps.course.deg() : 0),
                   (uint8_t)(gpsValid ? (uint8_t)(gps.hdop.hdop() * 10.0f) : 0),
-                  (uint8_t)gps.satelliteCount(),
-                  (uint8_t)gps.fixQuality(),
+                  (uint8_t)sats,
+                  (uint8_t)(gpsValid ? 1 : 0),
                   batt,
                   statusFlags);
 
     uint32_t counter = txSeq.next();
     uint8_t hdr[HEF_HEADER_LEN];
-    if (!linkBuildHeader(hdr, HEF_MSG_TRACK, statusFlags, keyId,
-                         txSeq.epoch(), counter, HEF_TRACK_PAYLOAD_LEN)) {
+    if (!linkBuildHeader(hdr, HEF_MSG_TRACK, statusFlags, (uint8_t)(nodeId & 0xFF),
+                         nodeId, txSeq.epoch(), counter, HEF_TRACK_PAYLOAD_LEN)) {
         return false;
     }
 
@@ -201,7 +222,7 @@ static bool buildAndSendTrack(uint8_t retry) {
     memcpy(out, hdr, HEF_HEADER_LEN);
     int ctLen = gcm.encrypt(payload, HEF_TRACK_PAYLOAD_LEN,
                             out + HEF_HEADER_LEN, sizeof(out) - HEF_HEADER_LEN,
-                            (uint32_t)(keyId ^ nodeId), counter,
+                            (uint32_t)nodeId, counter,
                             hdr, HEF_HEADER_LEN);
     if (ctLen < 0) {
         dbg.logError("AEAD encrypt falhou");
@@ -210,23 +231,43 @@ static bool buildAndSendTrack(uint8_t retry) {
     }
     uint16_t frameLen = (uint16_t)(HEF_HEADER_LEN + ctLen);
 
-    // Coloca o radio em RX antes de transmitir: garante que o NOVEIRO
-    // interrompa o reception se o frame estiver em curso.
+    // Entra em RX antes de transmitir: habilita o energy sense (RSSI) e
+    // permite detectar o ACK imediatamente apos a transmissao.
     LoRa.receive();
     delay(2);
+
+    // Energy sense (aproximado): o registrador RSSI do SX1276 e' valido em
+    // modo RX e reflete o ultimo sinal recebido ou o piso de ruido.
+    int busy = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int r = LoRa.rssi();
+        if (r <= LORA_CCA_RSSI_DBM) break;
+        busy++;
+        delay(20 + (esp_random() % 120));
+    }
 
     LoRa.beginPacket();
     LoRa.write(out, frameLen);
     LoRa.endPacket();
 
+    // Retoma a recepcao para pegar o ACK.
+    LoRa.receive();
+
     txCount++;
     lastTxMs = millis();
     gGotAck = false;
 
-    // Espera ACK (se o Node2 estiver no alcance).
+    // Espera ACK (se o Node2 estiver no alcance). Janela curta e limitada:
+    // o Node1 e' um beacon, nao um servidor.
     uint32_t waitStart = millis();
-    while (!gGotAck && (millis() - waitStart) < 120) {
-        delay(5);
+    while (!gGotAck && (millis() - waitStart) < 150) {
+        int ps = LoRa.parsePacket();
+        if (ps > 0) {
+            uint8_t ackBuf[64];
+            int ackLen = LoRa.readBytes(ackBuf, sizeof(ackBuf));
+            if (ackLen > 0) processAck(ackBuf, (size_t)ackLen);
+        }
+        delay(2);
     }
     if (gGotAck) {
         ackCount++;
@@ -239,7 +280,6 @@ static bool buildAndSendTrack(uint8_t retry) {
         txSeq.setCounter(counter - 1);
         return buildAndSendTrack(retry + 1);
     }
-    persistCounter();
     return true;
 }
 
@@ -249,7 +289,7 @@ static bool buildAndSendTrack(uint8_t retry) {
 static void fmTune() {
     if (!fmBeaconEnabled) return;
     fmTx.setTXpower(fmPower);
-    fmTx.tuneFM((uint16_t)(fmFreqKHz / 10));
+    fmTx.tuneFM((uint16_t)(fmFreqKHz / 10));   // API em unidades de 10 kHz
 }
 
 // ---------------------------------------------------------------
@@ -265,7 +305,7 @@ static void printHelp() {
     Serial.println("psk show          mostra se o PSK esta configurado");
     Serial.println("fm on|off        liga/desliga o beacon FM");
     Serial.println("fm freq <kHz>    sintonia do beacon FM");
-    Serial.println("fm power <0-255>  potencia do beacon FM");
+    Serial.println("fm power <88-115> potencia do beacon FM (dBuV)");
 }
 
 static void handleConsole(char* line) {
@@ -276,7 +316,8 @@ static void handleConsole(char* line) {
         Serial.printf("epoch: %u | counter: %u\n", txSeq.epoch(), txSeq.counter());
         Serial.printf("TX: %u | ACK: %u | retry: %u\n", txCount, ackCount, retryCount);
         Serial.printf("GPS fix: %u | sats: %u | hdop: %.1f\n",
-                      gpsFixCount, (int)gps.satelliteCount(), gps.hdop.hdop());
+                      gpsFixCount, (int)(gps.satellites.isValid() ? gps.satellites.value() : 0),
+                      gps.hdop.hdop());
     } else if (strncmp(line, "id", 2) == 0) {
         Serial.printf("node_id: %u\n", nodeId);
     } else if (strncmp(line, "psk show", 7) == 0) {
@@ -304,7 +345,7 @@ static void handleConsole(char* line) {
     } else if (strncmp(line, "fm freq", 7) == 0) {
         long f = atol(line + 8);
         if (f >= 87500 && f <= 108000) {
-            fmFreqKHz = (uint16_t)f;
+            fmFreqKHz = (uint32_t)f;
             fmTune();
             Serial.printf("OK: FM %.1f MHz\n", fmFreqKHz / 1000.0f);
         } else {
@@ -312,12 +353,12 @@ static void handleConsole(char* line) {
         }
     } else if (strncmp(line, "fm power", 8) == 0) {
         long p = atol(line + 9);
-        if (p >= 0 && p <= 255) {
+        if (p >= 88 && p <= 115) {
             fmPower = (uint8_t)p;
             fmTune();
-            Serial.printf("OK: potencia FM %u\n", fmPower);
+            Serial.printf("OK: potencia FM %u dBuV\n", fmPower);
         } else {
-            Serial.println("ERRO: potencia fora de 0..255");
+            Serial.println("ERRO: potencia fora de 88..115 dBuV");
         }
     } else {
         Serial.println("Comando desconhecido. Use 'help'.");
@@ -345,7 +386,6 @@ void setup() {
         LoRa.setSignalBandwidth(LORA_BW);
         LoRa.setTxPower(LORA_TX_POWER);
         LoRa.setSyncWord(0x12);   // canal privado
-        LoRa.onReceive(onLoRaReceive);
     }
 
     // Beacon FM (Si4713)
@@ -393,6 +433,14 @@ void loop() {
         } else if (cmdLen < sizeof(cmd) - 1) {
             cmd[cmdLen++] = c;
         }
+    }
+
+    // ACK que tenha chegado fora da janela de espera
+    int ps = LoRa.parsePacket();
+    if (ps > 0) {
+        uint8_t ackBuf[64];
+        int ackLen = LoRa.readBytes(ackBuf, sizeof(ackBuf));
+        if (ackLen > 0) processAck(ackBuf, (size_t)ackLen);
     }
 
     // GPS

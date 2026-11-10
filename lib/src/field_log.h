@@ -68,10 +68,11 @@ private:
 
         File f = SD.open(path_, FILE_WRITE);
         if (!f) { open_ = false; return; }
-        f.write(hdr, 4);
-        f.write(hdr + 4, 2);
-        f.write(chain_, HEF_HASH_LEN);
+        size_t w = f.write(hdr, 4);
+        w += f.write(hdr + 4, 2);
+        w += f.write(chain_, HEF_HASH_LEN);
         f.close();
+        open_ = (w == 4 + 2 + HEF_HASH_LEN);
     }
 
 public:
@@ -86,18 +87,45 @@ public:
         path_[sizeof(path_) - 1] = 0;
 
         if (!SD.exists(path_)) {
+            open_ = false;
             writeHeader();
+            if (!open_) return false;
+            records_ = 0;
+            seq_ = 0;
+            return true;
         } else {
-            // Recupera a cadeia existente para continuar sem quebrar.
+            // Recupera a cadeia existente E o estado (seq/records) para
+            // continuar o log sem reiniciar a numeracao nem quebrar a
+            // cadeia apos um reboot.
             File f = SD.open(path_, FILE_READ);
             if (!f) { open_ = false; return false; }
             uint8_t magic[4]; uint16_t nid;
-            f.read(magic, 4);
-            f.read((uint8_t*)&nid, 2);
-            f.read(chain_, HEF_HASH_LEN);
-            bool ok = (memcmp(magic, "HLG5", 4) == 0);
+            if (f.read(magic, 4) != 4 || f.read((uint8_t*)&nid, 2) != 2 ||
+                f.read(chain_, HEF_HASH_LEN) != HEF_HASH_LEN) {
+                f.close();
+                open_ = false;
+                return false;
+            }
+            if (memcmp(magic, "HLG5", 4) != 0) { f.close(); open_ = false; return false; }
+
+            seq_ = 0;
+            records_ = 0;
+            while (true) {
+                uint8_t fixed[11];
+                if (f.read(fixed, 11) != 11) break;
+                uint16_t len = (uint16_t)((fixed[9] << 8) | fixed[10]);
+                if (len > 192) break;
+                uint8_t body[192];
+                if (len && f.read(body, len) != len) break;
+                uint8_t h[HEF_HASH_LEN];
+                if (f.read(h, HEF_HASH_LEN) != HEF_HASH_LEN) break;
+                uint32_t recSeq = ((uint32_t)fixed[0] << 24) | ((uint32_t)fixed[1] << 16) |
+                                  ((uint32_t)fixed[2] << 8) | fixed[3];
+                seq_ = recSeq;
+                records_++;
+                memcpy(chain_, h, HEF_HASH_LEN);
+            }
             f.close();
-            if (!ok) { open_ = false; return false; }
         }
         open_ = true;
         return true;
@@ -130,18 +158,19 @@ public:
 
         // hash = SHA256(chain anterior || registro)
         uint8_t digest[HEF_HASH_LEN];
-        uint8_t* tmp = (uint8_t*)malloc(pos + HEF_HASH_LEN);
-        if (!tmp) return false;
+        uint8_t tmp[HEF_HASH_LEN + 256];
+        if (pos + HEF_HASH_LEN > sizeof(tmp)) return false;
         memcpy(tmp, chain_, HEF_HASH_LEN);
         memcpy(tmp + HEF_HASH_LEN, rec, pos);
         sha256(tmp, pos + HEF_HASH_LEN, digest);
-        free(tmp);
 
-        File f = SD.open(path_, FILE_WRITE);
+        // FILE_APPEND e' obrigatorio: FILE_WRITE trunca o arquivo no ESP32.
+        File f = SD.open(path_, FILE_APPEND);
         if (!f) return false;
-        f.write(rec, pos);
-        f.write(digest, HEF_HASH_LEN);
+        size_t w = f.write(rec, pos);
+        w += f.write(digest, HEF_HASH_LEN);
         f.close();
+        if (w != pos + HEF_HASH_LEN) return false;
 
         memcpy(chain_, digest, HEF_HASH_LEN);
         records_++;
@@ -180,13 +209,11 @@ public:
             if (in.read(body + len, HEF_HASH_LEN) != HEF_HASH_LEN) { ok = false; break; }
 
             uint8_t digest[HEF_HASH_LEN];
-            uint8_t* tmp = (uint8_t*)malloc(HEF_HASH_LEN + 11 + len);
-            if (!tmp) { ok = false; break; }
+            uint8_t tmp[HEF_HASH_LEN + 11 + 192];
             memcpy(tmp, prev, HEF_HASH_LEN);
             memcpy(tmp + HEF_HASH_LEN, fixed, 11);
             memcpy(tmp + HEF_HASH_LEN + 11, body, len);
             sha256(tmp, HEF_HASH_LEN + 11 + len, digest);
-            free(tmp);
 
             if (memcmp(digest, body + len, HEF_HASH_LEN) != 0) ok = false;
 

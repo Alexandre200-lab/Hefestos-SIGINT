@@ -138,14 +138,17 @@ public:
             if (pos_ >= sizeof(buf_)) { pos_ = 0; overflows_++; continue; }
             buf_[pos_++] = b;
 
-            if (b != HEF_SER_END) continue;
+            // Precisa de START + TYPE + SEQ(2) + LEN(2) para saber o total.
+            if (pos_ < 7) continue;
 
-            // Frame completo em buf_[0..pos_-1]
-            if (pos_ < 9) { pos_ = 0; continue; }
             uint16_t len = (uint16_t)(((uint16_t)buf_[5] << 8) | buf_[6]);
             if (len > HEF_SER_MAX_PAYLOAD) { pos_ = 0; crcErrors_++; continue; }
+
             size_t expected = 8 + (size_t)len + 1;
-            if (pos_ != expected) { pos_ = 0; crcErrors_++; continue; }
+            if (pos_ < expected) continue;   // payload pode conter 0x55
+
+            // Frame completo: START(1) TYPE(1) SEQ(2) LEN(2) PAYLOAD(N) CRC(2) END(1)
+            if (buf_[pos_ - 1] != HEF_SER_END) { pos_ = 0; crcErrors_++; continue; }
 
             uint16_t gotCrc = (uint16_t)(((uint16_t)buf_[7 + len] << 8) | buf_[8 + len]);
             uint16_t calc = Crc16::calculate(buf_ + 1, 5 + len);

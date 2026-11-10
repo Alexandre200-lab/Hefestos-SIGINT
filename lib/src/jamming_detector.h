@@ -39,6 +39,9 @@ private:
 
     float   baselineSnr_;      // EMA lenta da margem saudavel
     float   noiseFloorDbuV_;   // EMA lenta do piso de ruido do receptor
+    float   lastNoiseDbuV_;    // ultima leitura instantanea
+    uint32_t noiseSpikeMs_;    // quando o piso subiu acima do baseline
+    bool    noisePrimed_;
     bool    primed_;
 
     uint32_t lastPacketMs_;
@@ -65,6 +68,7 @@ private:
 public:
     JammingDetector()
         : head_(0), count_(0), baselineSnr_(0.0f), noiseFloorDbuV_(0.0f),
+          lastNoiseDbuV_(0.0f), noiseSpikeMs_(0), noisePrimed_(false),
           primed_(false), lastPacketMs_(0), packetsSeen_(0), alerts_(0),
           linkLossTimeoutMs_(15000UL), degradedSnrDb_(3.0f), noiseRiseDb_(10.0f) {
         memset(rssiWindow_, 0, sizeof(rssiWindow_));
@@ -97,14 +101,24 @@ public:
         }
     }
 
-    // Registra o piso de ruido medido pelo receiver Si4735 (dBuV).
-    void onNoiseFloor(float rssiDbuV) {
+    // Registra o piso de ruido medido pelo receptor Si4735 (dBuV).
+    //
+    // O baseline (EMA lenta) so acompanha leituras NORMAIS. Um salto
+    // acima de noiseRiseDb_ e' tratado como interferencia e NAO contamina
+    // o baseline (senao o detector "se acostumaria" com o jammer).
+    void onNoiseFloor(float rssiDbuV, uint32_t now) {
         if (rssiDbuV <= 0.0f) return;
-        if (!primed_) {
+        lastNoiseDbuV_ = rssiDbuV;
+        if (!noisePrimed_) {
             noiseFloorDbuV_ = rssiDbuV;
-        } else {
-            noiseFloorDbuV_ = noiseFloorDbuV_ * 0.97f + rssiDbuV * 0.03f;
+            noisePrimed_ = true;
+            return;
         }
+        if (rssiDbuV - noiseFloorDbuV_ > noiseRiseDb_) {
+            noiseSpikeMs_ = now;
+            return;
+        }
+        noiseFloorDbuV_ = noiseFloorDbuV_ * 0.98f + rssiDbuV * 0.02f;
     }
 
     void tick(uint32_t now) {
@@ -119,10 +133,10 @@ public:
         if (lastPacketMs_ != 0 && (now - lastPacketMs_) > linkLossTimeoutMs_) {
             return JF_LINK_LOSS;
         }
-        // Subida do piso de ruido do receptor RF (dBuV)
-        if (noiseFloorDbuV_ > 0.0f) {
-            float floorNow = noiseFloorDbuV_;
-            if (floorNow > 100.0f) return JF_NOISE_RISE;
+        // Subida do piso de ruido do receptor RF (dBuV), com janela de
+        // 30 s para nao reportar um pico isolado como jamming.
+        if (noiseSpikeMs_ != 0 && (now - noiseSpikeMs_) < 30000UL) {
+            return JF_NOISE_RISE;
         }
         // Margem de enlace degradada
         if (count_ > 0) {
@@ -151,6 +165,7 @@ public:
     }
     float baselineSnr() const { return baselineSnr_; }
     float noiseFloorDbuV() const { return noiseFloorDbuV_; }
+    float lastNoiseDbuV() const { return lastNoiseDbuV_; }
     uint32_t packetsSeen() const { return packetsSeen_; }
     uint32_t lastPacketAgeMs(uint32_t now) const {
         return lastPacketMs_ == 0 ? 0 : (now - lastPacketMs_);

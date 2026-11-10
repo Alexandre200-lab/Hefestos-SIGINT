@@ -20,7 +20,9 @@
 #include <esp_random.h>
 #include <mbedtls/md.h>
 
+#ifndef HEF_TOTP_SECRET_MAX
 #define HEF_TOTP_SECRET_MAX 32
+#endif
 #define HEF_TOTP_DIGITS     6
 #define HEF_TOTP_PERIOD     30
 #define HEF_TOTP_WINDOW     1     // passos aceitos para tras
