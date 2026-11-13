@@ -16,7 +16,7 @@ e caixa-preta forense com log encadeado por hash em cartão SD.
 
 ## 0. v5.1.0 — anti-replay sobrevivente a reinício + RF viável
 
-Os primeiros cinco itens do plano de escala militar:
+Os seis primeiros itens do plano de escala militar:
 
 1. **O anti-replay agora sobrevive a um reinício do receptor** (item 1.1) —
    um frame capturado por SDR não é mais aceito como frame novo depois que
@@ -31,6 +31,10 @@ Os primeiros cinco itens do plano de escala militar:
 5. **O tempo sobrevive a falhas de GNSS e rede** (item 1.5) — RTC externo
    PCF8563, SNTP, holdover NVS com idade assumida e modelo de deriva, para
    que o TOTP continue funcionando sem GNSS.
+6. **O log forense deixa de destruir o cartão** (item 1.6) — escrita em
+   lotes de 4 KB (28× menos escritas), rotação de arquivos com cadeia
+   contínua, checkpoints de ancoragem, saúde do cartão com *fail closed* e
+   verificador offline (`tools/verify_log.py`).
 
 > Os percentuais de duty cycle desta tabela mantêm o ACK atual (33 B) nos
 > dois lados, para isolar o efeito da mudança de SF e de intervalo. O
@@ -54,7 +58,11 @@ Os primeiros cinco itens do plano de escala militar:
 | Tempo sem GNSS/rede após reinício | **relógio volta a 1970, TOTP recusado** | **RTC PCF8563 / SNTP / holdover NVS com idade assumida** |
 | Validação do tempo | binária ("passou de 2024?") | **origem, idade e modelo de deriva** |
 | Gravação do estado | — | imediata no epoch novo; 60 s para o contador |
-| Testes | 7 grupos | 12 grupos (937 verificações no host; +904 sobre a v5.0.0) |
+| Log forense | `open`/`write`/`close` por registro (**~86,4 mil** escritas/dia) | **lotes de 4 KB** (~3,0 mil/dia), rotação e checkpoints |
+| Gravação parcial no SD | cadeia truncada **sem aviso** | `truncate()` + retentativa do mesmo lote |
+| Cartão cheio | falha silenciosa | **fail closed**: para de aceitar e reporta (nunca apaga) |
+| Verificação do log | só no próprio firmware | **verificador offline** `tools/verify_log.py` |
+| Testes | 7 grupos | 13 grupos (1.027 verificações C++ no host + 14 do verificador) |
 
 Detalhes em [§3.5.1](#351-estado-persistido-replay-pós-reboot--v510),
 [§9.5](#95-orçamento-de-rf-e-conformidade-regulatória),
@@ -174,8 +182,11 @@ de qualquer transmissão que viole o limite. Ver [§9.5](#95-orçamento-de-rf-e-
 | `ESP.restart()` cru: reinício cego, sem motivo | `hefRestart()` grava a intenção antes de sair; nenhum reinício cru restou |
 | Contadores gravados a cada boot: 438 mil escritas/ano num laço de brownout | Guarda de desgaste: grava na mudança de causa ou a cada 10 boots; flush periódico de 5 min |
 | Estado do watchdog nunca exposto | `watchdog_active` + `watchdog_timeout_s` na API e no console — **honestos**: timeout desconhecido é `0`, nunca estimado |
+| Log forense com `open`/`write`/`close` por registro (~86,4 mil escritas/dia) | Lotes de 4 KB (~3,0 mil/dia), rotação com cadeia contínua, checkpoints e verificador offline |
+| Gravação parcial no SD truncava a cadeia em silêncio; cartão cheio falhava sem aviso | `truncate()` + retentativa do mesmo lote; **fail closed** visível em `status`/`info` (nunca apaga evidência) |
 
-Ver [§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510).
+Ver [§9.7](#97-watchdog-brownout-e-causa-de-reinício-node-2--node-3--v510) e
+[§10](#10-log-forense-node-3).
 
 ---
 
@@ -458,7 +469,8 @@ lib/                     biblioteca compartilhada (Arduino library)
     radio_si4735.h       wrapper do receptor
     spectrum.h           varredura não-bloqueante
     jamming_detector.h   detecção real de interferência
-    field_log.h          log forense com hash chain
+    field_log.h          log forense: I/O em lotes, rotação, checkpoints
+    field_log_buffer.h   decisão do log (buffer/cadeia/gatilhos) — puro
     peer_state.h         estado anti-replay persistido por par
     link_budget.h        tempo no ar, duty cycle e guard de orçamento de RF
     band_plan.h          perfis de banda regionais de referência
@@ -485,11 +497,14 @@ tests/
   watchdog_policy.cpp   política do watchdog (host)
   time_source.cpp       abstração da origem do tempo (host)
   rtc_pcf8563.cpp       codec do RTC PCF8563 (host)
+  field_log_buffer.cpp  log em lotes, rotação e checkpoints (host)
+  sha256_ref.h          SHA-256 de referência (vetores NIST) para os testes
   stub/HardwareSerial.h stub Arduino mínimo para compilar no host
 tools/
   airtime.py            CLI de cálculo de RF (airtime/duty/energia) + --selftest
+  verify_log.py         verificador offline da cadeia forense + --selftest
 build.sh                 build dos 3 nós
-test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + WDT + tempo/RTC + build
+test_functional.sh       invariantes + round-trip + anti-replay + RF + TX + WDT + tempo/RTC + log + build
 ```
 
 ---
@@ -596,7 +611,14 @@ Faça em cada nó, pelo console serial (115200 8N1), na ordem abaixo.
 > presente — ver [§9.8](#98-origem-do-tempo-e-holdover-node-2--v510).
 
 **Node 3:** `help`, `status`, `info`, `caps`, `clear`, `export`,
-`time <unix>`, `format`, `resets`, `reboot`.
+`time <unix>`, `archive`, `purge confirm`, `resets`, `reboot`.
+
+> `archive` (Node 3) força a rotação do log atual (grava o pendente e arquiva
+> como `HEFLOGnnn.BIN`). `purge confirm` apaga **toda** a evidência (logs,
+> manifesto e checkpoints) de forma irreversível — o firmware nunca apaga
+> evidência automaticamente: com o cartão cheio ele **para de aceitar** e
+> reporta (*fail closed*). O antigo `format` foi removido — ver
+> [§10](#10-log-forense-node-3).
 
 ### 9.2 API HTTP (Node 2)
 
@@ -1189,27 +1211,136 @@ presente. Em SoftAP o SNTP não é iniciado.
 
 ## 10. Log forense (Node 3)
 
-- Registro binário append-only: `seq`, `utc`, `type`, `len`, `data`.
-- Cadeia: `hash[n] = SHA256(hash[n-1] ‖ registro[n])`.
-- Cabeçalho do arquivo semeia a cadeia com o `node_id` (dois gravadores nunca
-  produzem a mesma cadeia).
-- `export` gera `HEFLOG.JSONL` + `HEFLOG.HASH` com contagem, hash final e
-  resultado da verificação de integridade.
-- Ao reiniciar, o Node 3 varre o arquivo e retoma `seq`/`records`/cabeça da
-  cadeia sem reiniciar a numeração.
-- O cartão SD **não** é cifrado em repouso: a cadeia detecta alteração, mas não
-  impede leitura. Proteja fisicamente o cartão.
+### 10.1 Formato
+
+- Registro binário append-only: `seq(4) | utc(4) | type(1) | len(2) | data |
+  hash(32)`, tudo em big-endian. **O formato não mudou desde a v5.0.0** — os
+  cartões já gravados continuam legíveis.
+- Cadeia: `hash[n] = SHA256(hash[n-1] ‖ registro[n])`, calculada **na ordem de
+  chegada**, não na ordem de gravação.
+- Cabeçalho `HLG5` (legado, 38 B) e `HLG6` (70 B):
+  `"HLG6" | nodeId(2) | seed(32) | prevHead(32)`. O `prevHead` é a cabeça
+  confirmada do arquivo anterior: **a cadeia continua entre rotações**.
+- Ao reiniciar, o Node 3 varre o arquivo e retoma `seq`/`records`/cabeça sem
+  reiniciar a numeração.
+
+### 10.2 Escrita em lotes (item 1.6)
+
+A v5.0.0 abria, gravava **um** registro e fechava o arquivo — ~86,4 mil
+escritas/dia a 1 registro/s. Num cartão FAT cada `open/write/close` atualiza
+dados, tabela FAT e diretório; esse desgaste é a principal causa de perda de
+evidência em campo.
+
+| | v5.0.0 | v5.1.0 (item 1.6) |
+|---|---|---|
+| Escritas por registro | `open` + `write` + `close` | buffer RAM, encadeado na chegada |
+| Gatilho | cada registro | **4 KB** ou **30 s** |
+| Escritas/dia (1 reg/s, 143 B) | ~86.400 | **~3.016** (28× menos) |
+| Gravação parcial | cadeia truncada sem aviso | `truncate()` + retentativa do **mesmo** lote |
+| Cartão cheio | escrita falhava em silêncio | **fail closed**: para de aceitar e reporta |
+| Rotação | não existia (arquivo único) | `HEFLOGnnn.BIN` + manifesto `HEFLOG.MAN` |
+| Ancoragem | não existia | checkpoints em `HEFCHK.BIN` |
+| Verificação | só `export` no próprio firmware | **verificador offline** `tools/verify_log.py` |
+
+- A decisão (buffer, cadeia, gatilhos, rotação, checkpoint) vive em
+  `lib/src/field_log_buffer.h`, **puro e testável no host**; a I/O fica em
+  `lib/src/field_log.h`.
+- Os gatilhos `HEF_LOG_FLUSH_BYTES=4096` e `HEF_LOG_FLUSH_MS=30000` estão em
+  `lib/src/field_log_buffer.h`. O par 1 KB/5 s sugerido no plano produziria
+  **17,3 mil** escritas/dia (o gatilho de tempo dominaria) e violaria o KPI
+  de < 8 mil/dia; por isso o par adotado é 4 KB/30 s. O número estimado
+  aparece em `info` como `writes_per_day`.
+- O buffer tem `HEF_LOG_BUF_CAP = HEF_LOG_FLUSH_BYTES + HEF_LOG_REC_MAX`, para
+  que o gatilho de tamanho possa disparar mesmo com um registro máximo.
+- **Gravação parcial:** se o `write()` devolver menos bytes que o lote, o
+  arquivo volta ao tamanho anterior com `truncate()` e o **mesmo** lote
+  (mesmos hashes) é retentado. Se o `truncate()` falhar, o log é marcado como
+  corrompido e **recusa** novas escritas: uma cadeia truncada é
+  indistinguível de uma manipulada.
+- **Rotação:** ao atingir `HEF_LOG_MAX_BYTES` (64 MB), `HEFLOG.BIN` vira
+  `HEFLOGnnn.BIN`, uma linha JSON é acrescentada a `HEFLOG.MAN` (tamanho,
+  contagem, primeiro/último `seq`, `prev_head`, `head`) e um arquivo novo é
+  aberto com `HLG6` semeado pela cabeça confirmada. `archive` força a rotação
+  pelo console.
+- **Saúde do cartão:** teste de escrita/leitura + `totalBytes()/usedBytes()`
+  no boot, na recuperação do SD e a cada `HEF_SD_HEALTH_MS` (10 min). Com
+  menos de `HEF_LOG_MIN_FREE_BYTES` (2 MB) livres, o log entra em *fail
+  closed*. **Nada é apagado automaticamente** — a evidência só sai com
+  `purge confirm`.
+- **Checkpoints:** a cada `HEF_LOG_CHECKPOINT_RECORDS` (256) registros, o
+  firmware grava em `HEFCHK.BIN` o ponto `"HCP1" | fileIndex(2) | seq(4) |
+  head(32) | signerId(8) | sigLen(2) | sig | crc16(2)`. O CRC16 (0xA001,
+  o mesmo do protocolo serial) cobre tudo o que o precede, inclusive a
+  assinatura. Na v5.1.0 o checkpoint é gravado **sem assinatura**
+  (`sigLen=0`): Ed25519 não existe no core Arduino 2.0.17 e a assinatura por
+  dispositivo é das fases 2/3.3 do plano. Um checkpoint não assinado prova
+  **consistência interna, não autoria** — e o verificador nunca o apresenta
+  como assinado.
+- Antes de rotacionar, um checkpoint pendente cuja âncora já está confirmada
+  é gravado no arquivo que realmente contém a âncora.
+
+### 10.3 Verificação offline
+
+```bash
+tools/verify_log.py --dir /media/cartao        # cartão inteiro (modo estrito)
+tools/verify_log.py HEFLOG.BIN HEFLOG000.BIN   # arquivos avulsos
+tools/verify_log.py --json                     # saída para automação
+tools/verify_log.py --selftest                 # teste do próprio verificador
+tools/verify_log.py --dir /media/cartao \
+    --expect-last-seq 12345 --expect-head <sha256>   # âncora externa
+```
+
+O verificador (Python 3, sem dependências) confere:
+
+- a cadeia SHA-256 de cada arquivo (`HLG5`/`HLG6`), registro a registro;
+- a continuidade entre arquivos (`prevHead` e `seq` do primeiro registro);
+- a **âncora do início**: o primeiro arquivo começa no `seq` 1 e o `prevHead`
+  do `HLG6` é a semente derivada do `node_id` (detecta remoção de prefixo e
+  renomeação de arquivos);
+- os checkpoints (`CRC16` e coerência `seq`/cabeça com o binário); uma
+  assinatura **presente** é reportada como tal, mas só é chamada de
+  *verificada* quando houver chave pública — a v5.1.0 grava sem assinatura;
+- o manifesto de rotação (tamanho, contagem, primeiro/último `seq`,
+  `prev_head`, cabeça e coerência nome/índice/node de cada arquivo); com
+  `--dir`, uma entrada que declara arquivo **ausente** é violação;
+- o `HEFLOG.JSONL` + `HEFLOG.HASH` (estrutura, contagem, hash final e
+  cruzamento com o binário); com `--dir`, o JSONL tem de cobrir **todos** os
+  registros do binário (exportação parcial é violação);
+- com `--expect-last-seq`/`--expect-head`, compara o fim da cadeia com uma
+  âncora guardada **fora** do cartão — é o único jeito de detectar a remoção
+  do fim da cadeia.
+
+Códigos de saída: `0` íntegro, `1` integridade violada, `2` erro de uso/IO.
+Integridade **não** é autoria: sem assinatura por dispositivo (fases 2/3.3),
+quem tem escrita no cartão pode reconstruir a cadeia desde a semente pública.
+
+### 10.4 Export e limitações
+
+- `export` grava o pendente antes de ler e exporta a **série inteira** —
+  os arquivados (`HEFLOGnnn.BIN`, em ordem) e depois o arquivo atual — em
+  `HEFLOG.JSONL`, com a cadeia continuando entre os arquivos. A v5.0.0
+  exportava só o arquivo corrente: num cartão com rotação, o JSONL omitia
+  tudo o que já tinha sido arquivado enquanto o `HEFLOG.HASH` declarava a
+  integridade do conjunto. Essa exportação parcial deixou de existir.
+- `HEFLOG.HASH` traz contagem, hash final e o resultado da verificação
+  (`integrity`): `false` se algum arquivo declarado estiver ausente, se a
+  cadeia estiver incoerente ou se houver descontinuidade entre arquivos.
+- O cartão SD **não** é cifrado em repouso: a cadeia detecta alteração, mas
+  não impede leitura. Proteja fisicamente o cartão.
+- O buffer de 4 KB vive em RAM: um brownout perde até ~30 s de evidência (o
+  gatilho de tempo). É o compromisso explícito entre desgaste e janela de
+  perda; a alternativa (gravar a cada registro) é o que destruía o cartão.
 
 ---
 
 ## 11. Testes
 
 ```bash
-./test_functional.sh            # invariantes + round-trip + RF + politica + WDT + tempo/RTC + build
+./test_functional.sh            # invariantes + round-trip + RF + politica + WDT + tempo/RTC + log + build
 ./test_functional.sh --no-build # sem build (não precisa do toolchain ESP32)
 ```
 
-Cobertura (12 grupos):
+Cobertura (13 grupos):
 
 1. pinagem duplicada e pinos proibidos no ESP32-C3;
 2. layout do frame LoRa (offsets do cabeçalho, `HEF_MAX_FRAME`);
@@ -1282,7 +1413,20 @@ Cobertura (12 grupos):
     por análise estática, que o Node 2 usa a abstração de tempo, integra o
     RTC (leitura, escrita e read-back), integra SNTP, persiste o holdover
     na NVS e aceita GNSS e ajuste manual;
-12. build dos três nós.
+12. **log forense em lotes** (`tests/field_log_buffer.cpp`, 90 verificações
+    no host): serialização byte-a-byte compatível com a v5.0.0, cadeia
+    calculada na chegada, gatilhos por tamanho e por tempo, prova de que o
+    comportamento antigo (86,4 mil escritas/dia) viola o KPI e o novo
+    (~3.016/dia) o cumpre, commit/retentativa sem quebrar a cadeia, rotação
+    (estado confirmado define o fim do arquivo, pendentes passam ao novo),
+    checkpoints com janela correta e estimativa de escritas/dia. O grupo
+    também executa `tools/verify_log.py --selftest` (14 verificações: cadeia,
+    corrupção de 1 byte, truncamento, CRC de checkpoint, continuidade entre
+    arquivos, remoção de prefixo, evidência declarada e ausente e JSONL). O
+    grupo verifica também, por análise estática, que `append()` não abre o SD
+    por registro, que o Node 3 faz flush/saúde/`archive` e que o `format`
+    destrutivo foi removido;
+13. build dos três nós.
 
 O round-trip do protocolo serial existe porque um erro de offset de 1 byte
 no parser de frames já passou pelo build e pelos testes estáticos: o código
@@ -1334,6 +1478,10 @@ closed*.
 | `RTC PCF8563: presente, hora inconfiavel` | OSF ligado (alimentação perdida) ou data inválida | sincronizar por GNSS/SNTP/`settime`; o RTC será atualizado |
 | `time` mostra `age_assumed: sim` | hora veio do holdover NVS após power cycle | normal; a idade é conservadora (downtime assumido). Confirme com GNSS/SNTP/RTC quando possível |
 | Frame rejeitado como replay | emissor reiniciou sem novo epoch | reiniciar o Node 1 (epoch novo) |
+| `status`: `log recusando registros` | cartão cheio ou teste de escrita falhou | liberar espaço/trocar o cartão; **nada é apagado automaticamente** — §10.2 |
+| `status`: `cadeia CORROMPIDA` | gravação parcial sem `truncate` possível | preservar o cartão e verificar offline com `tools/verify_log.py`; não regravar por cima — §10.3 |
+| `append_fails` crescendo | log *fail closed* (cartão cheio/insalubre) | ver `cartao:` em `status`; `archive` não resolve cartão cheio |
+| Verificação offline acusa cadeia violada | corrupção ou manipulação do cartão | preservar a evidência original e tratar o cartão como não confiável — §10.3 |
 
 ---
 
@@ -1429,6 +1577,18 @@ Consequências práticas:
   10 min sem GNSS e sem rede, hora válida ±30 s e login TOTP funcionando"*)
   não foi exercitado em campo neste ambiente (sem PCF8563, GNSS ou rede).
   Validar em bancada (§9.8.8).
+- **Log forense: janela de perda de até 30 s e aceite de bancada pendente.**
+  O buffer de 4 KB vive em RAM; um brownout perde o que ainda não foi
+  gravado (no máximo `HEF_LOG_FLUSH_MS`, 30 s). O critério do item 1.6
+  (*"24 h contínuas sem erro nem corrupção"*) não foi exercitado num cartão
+  real neste ambiente: a suíte cobre a lógica no host e o verificador
+  offline sobre arquivos sintéticos. Confirmar em bancada com rotação e
+  corte de energia no meio de um lote (§10.2).
+- **Checkpoints do log não são assinados na v5.1.0.** O core Arduino
+  2.0.17 não expõe Ed25519; o checkpoint prova consistência interna, não
+  autoria. A assinatura por dispositivo é das fases 2/3.3 do plano, e o
+  verificador nunca apresenta um checkpoint não assinado como assinado
+  (§10.2).
 - **Consumo real ainda não medido.** O item 1.3 do plano tem aceite
   "≤ 0,5 Ah/dia medido em bancada". As estimativas de firmware cobrem
   **apenas o TX LoRa** (0,053 Ah/dia no pior caso). Os consumos

@@ -299,8 +299,72 @@
     `age_assumed` e presença do RTC.
   - `tests/time_source.cpp` (novo, host): 85 verificações.
   - `tests/rtc_pcf8563.cpp` (novo, host): 304 verificações.
-  - `test_functional.sh`: novo grupo 11/12 (origem do tempo e RTC PCF8563),
+  - `test_functional.sh`: novo grupo 11/13 (origem do tempo e RTC PCF8563),
     com verificações estáticas de integração no Node 2.
+- **Log forense em lotes, rotação e checkpoints (item 1.6 do plano).** A
+  v5.0.0 abria o SD, gravava **um** registro e fechava o arquivo — a 1
+  registro/s eram ~**86,4 mil escritas/dia**. Num cartão FAT cada
+  `open/write/close` atualiza dados, tabela FAT e diretório: o desgaste é a
+  principal causa de perda de evidência em campo.
+  - `lib/src/field_log_buffer.h` (novo, puro/testável no host): `HefLogBatch`
+    — serializa e **encadeia na chegada**, gatilhos por tamanho
+    (`HEF_LOG_FLUSH_BYTES=4096`) e por tempo (`HEF_LOG_FLUSH_MS=30000`),
+    estado confirmado separado do pendente (`committedHead/Seq/Records`),
+    `commit()` que nunca descarta o lote em gravação parcial, rotação
+    (`beginNewFile`), checkpoints com janela correta e
+    `estimatedFlushesPerDay`.
+  - `lib/src/field_log.h` reescrito: I/O em lotes com `File::flush()`
+    (`fflush` + `fsync` no core 2.0.17), header `HLG6` (70 B) com
+    `prevHead` para **cadeia contínua entre rotações**, rotação para
+    `HEFLOGnnn.BIN` + manifesto append-only `HEFLOG.MAN`, checkpoints em
+    `HEFCHK.BIN` (`"HCP1" | fileIndex | seq | head | signerId | sigLen |
+    sig | crc16`), teste de saúde do cartão (`HEFLOG_HEALTH_FILE`),
+    `archive()` e `purgeAll()` explícitos, e **fail closed** quando o cartão
+    enche ou o `truncate()` da gravação parcial falha. O registro binário
+    **não mudou** (compatibilidade obrigatória).
+  - `lib/src/hefestos_pins.h`: `HEF_LOG_MAX_BYTES` (64 MB),
+    `HEF_LOG_MIN_FREE_BYTES` (2 MB), `HEF_SD_HEALTH_MS` (10 min) e
+    `HEF_LOG_MAX_FILES` (999).
+  - `tools/verify_log.py` (novo, sem dependências): verificador **offline**
+    da cadeia (`HLG5`/`HLG6`), da continuidade entre arquivos, dos
+    checkpoints (CRC16, e distinção explícita entre **assinado** e **não
+    assinado**), do manifesto e do JSONL/HASH, e das âncoras de início e de
+    fim (a de fim é externa: `--expect-last-seq`/`--expect-head`).
+    `--selftest` com 14 verificações (inclui corrupção de 1 byte,
+    truncamento, `prevHead` incoerente, remoção de prefixo e evidência
+    declarada mas ausente).
+  - `tests/field_log_buffer.cpp` (novo, host): 90 verificações, incluindo a
+    prova de que o comportamento antigo (86,4 mil/dia) viola o KPI de
+    < 8 mil/dia e o novo (~3.016/dia) o cumpre.
+  - Node 3: flush no `loop`, flush forçado em `hefRestart`, saúde do cartão
+    no boot e a cada 10 min, `archive` e `purge confirm` no console
+    (`format` descontinuado), contador `logAppendFails`, e `info`/`status`
+    com buffer, cartão, rotação, checkpoints e `writes_per_day`.
+  - `test_functional.sh`: novo grupo 12/13 (log forense), com o teste de
+    host, o `--selftest` do verificador e verificações estáticas de que
+    `append()` não faz I/O por registro.
+  - **Decisão de gatilho:** o par 1 KB/5 s sugerido no plano produziria
+    **17,3 mil** escritas/dia (o tempo dominaria) e violaria o KPI; o par
+    adotado (4 KB/30 s) produz ~3,0 mil/dia. A conta está no teste de host e
+    no README §10.2.
+  - **Checkpoint sem assinatura:** o core Arduino 2.0.17 não expõe Ed25519
+    (mbedtls sem `MBEDTLS_ED25519_C`; libsodium só expõe `version.h`). O
+    formato reserva os campos e a assinatura por dispositivo fica para as
+    fases 2/3.3; o verificador nunca apresenta um checkpoint não assinado
+    como assinado.
+- **Correções da revisão de segurança/forense (antes do aceite):**
+    o checkpoint gravava o CRC16 por cima do campo `sigLen` (os dois
+    ocupavam os bytes 50–51) e sem os 2 B de CRC que o verificador espera —
+    todo checkpoint era ilegível; o `prev_head` do manifesto recebia a
+    cabeça do próprio arquivo (e não a base da cadeia); o contador de
+    registros por arquivo não era reiniciado na rotação (o 2º manifesto
+    declarava `records`/`first_seq` errados e o verificador recusava o
+    cartão); e uma escrita interrompida por brownout deixava um registro
+    incompleto no fim do arquivo, sem reparo no boot (o próximo append
+    entrava depois do lixo e invalidava a cadeia). O boot agora trunca até
+    o último registro completo; a detecção de gravação parcial usa o
+    tamanho do arquivo após o `fsync` (o `getWriteError()` do `Print` não é
+    atualizado pelo `File`).
 - **Offset de registro do PCF8563 corrigido no codec.** O bloco de data/hora
   do PCF8563 começa no registro `0x02` (0x00/0x01 são controle/status). Um
   codec que lesse a partir de `0x00` interpretaria os controles como data e
@@ -337,8 +401,13 @@
   deixava em aberto em operação real.
 - README §0, §2, §9.1, §9.2, §11, §12 e §14 atualizados: origem do tempo e
   holdover, causa de reinício e watchdog, comandos `resets`/`time`/`settime`,
-  12 grupos de teste (937 verificações no host; +904 sobre a v5.0.0) e as
+  13 grupos de teste (1.020 verificações C++ no host + 14 do verificador) e as
   novas limitações conhecidas.
+- README §10 reescrito: formato (`HLG5`/`HLG6`), escrita em lotes com a
+  comparação de escritas/dia, gravação parcial com `truncate`, rotação e
+  manifesto, saúde do cartão com *fail closed*, checkpoints (e a limitação de
+  não serem assinados na v5.1.0), verificador offline e comandos
+  `archive`/`purge confirm`.
 
 ### Correção de estimativa (documento do plano)
 
@@ -368,6 +437,10 @@
 - O corte de radiação do beacon FM (`PROP_TX_ENABLE`, 0x3E06 do Si4713)
   também precisa de confirmação em bancada: nenhum Si4713 está conectado
   neste ambiente.
+- O aceite do item 1.6 ("24 h contínuas sem erro nem corrupção") também é de
+  bancada: a suíte cobre a lógica no host e o verificador offline sobre
+  arquivos sintéticos, mas não substitui um cartão real gravando por 24 h,
+  com rotação e queda de energia no meio de um lote.
 
 ---
 

@@ -19,6 +19,7 @@
 #   - orcamento de RF viavel (duty cycle dentro do perfil regional)
 #   - politica de TX adaptativa (evento + heartbeat, sem perder movimento)
 #   - causa de reinicio e watchdog (contadores, progresso, visibilidade)
+#   - log forense em lotes (gatilhos, rotacao, checkpoints, fail closed)
 # =====================================================================
 set -uo pipefail
 
@@ -35,7 +36,7 @@ echo " Hefestos SIGINT v5.1.0 - testes funcionais"
 echo "====================================================="
 
 echo
-echo "[1/12] Invariantes de pinagem"
+echo "[1/13] Invariantes de pinagem"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -73,7 +74,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[2/12] Layout do protocolo LoRa"
+echo "[2/13] Layout do protocolo LoRa"
 python3 - "$ROOT" <<'PY'
 import re, sys, pathlib
 root = pathlib.Path(sys.argv[1])
@@ -113,7 +114,7 @@ PY
 [ $? -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[3/12] Protocolo serial Node2<->Node3 (round-trip no host)"
+echo "[3/13] Protocolo serial Node2<->Node3 (round-trip no host)"
 SER=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -144,7 +145,7 @@ fi
 [ $SER -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[4/12] Ausencia de legado inseguro"
+echo "[4/13] Ausencia de legado inseguro"
 LEGACY=0
 if grep -rInE "EEPROM\.|TelnetServer|telnetServer|WiFiServer\(23\)" "$ROOT/src" "$ROOT/lib" >/dev/null 2>&1; then
     echo "  [FAIL] uso de EEPROM/Telnet encontrado"; LEGACY=1
@@ -159,7 +160,7 @@ fi
 [ $LEGACY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[5/12] Anti-replay estrito e TOTP ativo"
+echo "[5/13] Anti-replay estrito e TOTP ativo"
 SEC=0
 if grep -q "return LINK_RX_REPLAY" "$ROOT/lib/src/secure_protocol.h"; then
     echo "  [PASS] contador repetido retorna LINK_RX_REPLAY"
@@ -179,7 +180,7 @@ fi
 [ $SEC -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[6/12] Dashboard sem injecao de HTML e sem segredo hardcoded"
+echo "[6/13] Dashboard sem injecao de HTML e sem segredo hardcoded"
 DASH=0
 if grep -q "textContent" "$ROOT/src/Node2_Base_Hefestos/Node2_Base_Hefestos.ino"; then
     echo "  [PASS] dashboard usa textContent (sem innerHTML)"
@@ -194,7 +195,7 @@ fi
 [ $DASH -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[7/12] Estado anti-replay persistido (replay pos-reboot)"
+echo "[7/13] Estado anti-replay persistido (replay pos-reboot)"
 REPLAY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -233,7 +234,7 @@ fi
 [ $REPLAY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[8/12] Orcamento de RF (tempo no ar e duty cycle)"
+echo "[8/13] Orcamento de RF (tempo no ar e duty cycle)"
 BUDGET=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -285,7 +286,7 @@ fi
 [ $BUDGET -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[9/12] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
+echo "[9/13] Politica de TX adaptativa (evento + heartbeat) e beacon FM"
 POLICY=0
 if command -v g++ >/dev/null 2>&1; then
     if g++ -std=c++11 -Wall -Wextra \
@@ -360,7 +361,7 @@ fi
 [ $POLICY -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[10/12] Causa de reinicio e watchdog (item 1.4)"
+echo "[10/13] Causa de reinicio e watchdog (item 1.4)"
 WDT=0
 if command -v g++ >/dev/null 2>&1; then
     # --- 10a) Contadores de reinicio ---
@@ -484,7 +485,7 @@ done
 [ $WDT -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[11/12] Origem do tempo e RTC PCF8563 (item 1.5)"
+echo "[11/13] Origem do tempo e RTC PCF8563 (item 1.5)"
 TIME=0
 if command -v g++ >/dev/null 2>&1; then
     # --- 11a) Abstracao da origem do tempo ---
@@ -564,7 +565,102 @@ fi
 [ $TIME -ne 0 ] && FAILED=$((FAILED + 1))
 
 echo
-echo "[12/12] Build dos tres nos"
+echo "[12/13] Log forense em lotes, rotacao e checkpoints (item 1.6)"
+LOG=0
+
+# --- 12a) Decisao pura (buffer, cadeia, gatilhos) no host ---
+if command -v g++ >/dev/null 2>&1; then
+    if g++ -std=c++11 -Wall -Wextra \
+            -I "$ROOT/tests/stub" -I "$ROOT/tests" -I "$ROOT/lib/src" \
+            "$ROOT/tests/field_log_buffer.cpp" -o /tmp/hef_flog_test 2>/tmp/hef_flog_cc.log; then
+        if /tmp/hef_flog_test > /tmp/hef_flog_run.log 2>&1; then
+            grep -E "^\s+\[(PASS|FAIL)\]" /tmp/hef_flog_run.log | head -4
+            echo "  ... (ver /tmp/hef_flog_run.log para o restante)"
+            echo "  [PASS] log em lotes no host ($(sed -n 's/^  log forense em lotes: \([0-9][0-9]*\) verificacoes.*/\1/p' /tmp/hef_flog_run.log | tail -1) verificacoes)"
+        else
+            grep -E "\[FAIL\]" /tmp/hef_flog_run.log || true
+            echo "  [FAIL] log em lotes no host"; LOG=1
+        fi
+    else
+        echo "  [FAIL] compilacao do teste de log em lotes falhou:"
+        head -20 /tmp/hef_flog_cc.log
+        LOG=1
+    fi
+else
+    echo "  [SKIP] g++ nao instalado (teste de log em lotes nao executado)"
+fi
+
+# --- 12b) Verificador offline da cadeia ---
+if command -v python3 >/dev/null 2>&1; then
+    if python3 "$ROOT/tools/verify_log.py" --selftest >/tmp/hef_verify_run.log 2>&1; then
+        N=$(sed -n 's/^selftest: \([0-9][0-9]*\) verificacoes.*/\1/p' /tmp/hef_verify_run.log | tail -1)
+        echo "  [PASS] verificador offline (${N:-?} verificacoes)"
+    else
+        tail -5 /tmp/hef_verify_run.log
+        echo "  [FAIL] verificador offline"; LOG=1
+    fi
+else
+    echo "  [SKIP] python3 nao instalado (verificador offline nao executado)"
+fi
+
+# --- 12c) O firmware NAO pode voltar a abrir/fechar o SD por registro ---
+# A regressao que este item corrige e' exatamente essa: `append()` com
+# SD.open/write/close. A checagem e' estatica porque o custo (desgaste)
+# so aparece em campo, nao num teste de host.
+FL="$ROOT/lib/src/field_log.h"
+if python3 - "$FL" <<'PY'
+import re, sys, pathlib
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r"bool append\(uint8_t type, const uint8_t\* data, uint16_t len,\s*\n\s*uint32_t nowMs\)\s*\{(.*?)\n    \}", src, re.S)
+if not m:
+    print("  [FAIL] append() com nowMs nao encontrado"); sys.exit(1)
+body = m.group(1)
+if "SD.open" in body or "FILE_APPEND" in body:
+    print("  [FAIL] append() ainda abre o SD por registro"); sys.exit(1)
+for need in ("batch_.append", "flush(nowMs, true)"):
+    if need not in body:
+        print("  [FAIL] append() nao usa o buffer em lote (%s)" % need); sys.exit(1)
+print("  [PASS] append() apenas enfileira no buffer (sem I/O por registro)")
+PY
+then :; else LOG=1; fi
+
+# --- 12d) Gatilhos, fsync, truncate e fail closed presentes ---
+for NEEDLE in "HEF_LOG_FLUSH_BYTES" "HEF_LOG_FLUSH_MS" "HefLogBatch" \
+              "cur_.flush()" "truncate(path_" "refusing_ = true" \
+              "HEF_LOG_MANIFEST" "HEF_LOG_CHECKPOINTS" "writeHeader6" \
+              "archiveName" "purgeAll"; do
+    if grep -q -- "$NEEDLE" "$FL"; then
+        :
+    else
+        echo "  [FAIL] field_log.h sem '$NEEDLE'"; LOG=1
+    fi
+done
+if [ $LOG -eq 0 ]; then
+    echo "  [PASS] lote (fsync), truncate, rotacao, manifesto e fail closed"
+fi
+
+# --- 12e) Integracao no Node3 (flush, saude, archive/purge) ---
+N3="$ROOT/src/Node3_Caixa_Preta_ESP32C3/Node3_Caixa_Preta_ESP32C3.ino"
+for NEEDLE in "fieldLog.flush(now)" "fieldLog.healthCheck()" \
+              "fieldLog.archive(" "purge confirm" "HEF_SD_HEALTH_MS" \
+              "logAppendFails"; do
+    if grep -q -- "$NEEDLE" "$N3"; then
+        :
+    else
+        echo "  [FAIL] Node3 sem '$NEEDLE'"; LOG=1
+    fi
+done
+# O comando `format` da v5.0.0 apagava a evidencia sem confirmacao.
+if grep -q "SD.remove(\"HEFLOG.BIN\")" "$N3"; then
+    echo "  [FAIL] Node3 ainda tem o comando 'format' destrutivo"; LOG=1
+fi
+if [ $LOG -eq 0 ]; then
+    echo "  [PASS] Node3 integra flush, saude, archive e purge confirmado"
+fi
+[ $LOG -ne 0 ] && FAILED=$((FAILED + 1))
+
+echo
+echo "[13/13] Build dos tres nos"
 if [ $NO_BUILD -eq 1 ]; then
     echo "  [SKIP] --no-build"
 elif command -v "${ARDUINO_CLI:-arduino-cli}" >/dev/null 2>&1; then

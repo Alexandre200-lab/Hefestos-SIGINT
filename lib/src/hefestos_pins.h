@@ -298,6 +298,33 @@
 #define HEF_UART_BUF        1024
 #define HEF_SD_SPI_HZ       10000000
 
+// --- Item 1.6: lote, rotacao e saude do cartao ---
+// Limite de tamanho do arquivo de log antes da rotacao (64 MB). Ao
+// atingir, HEFLOG.BIN e' renomeado para HEFLOGnnn.BIN e um arquivo
+// novo e' aberto com header HLG6 (que semeia a cadeia a partir da
+// cabeca do arquivo anterior).
+#ifndef HEF_LOG_MAX_BYTES
+#define HEF_LOG_MAX_BYTES   (64UL * 1024UL * 1024UL)
+#endif
+
+// Minimo de espaco livre no cartao para continuar aceitando registros.
+// Menos que isso = fail closed (para de aceitar e reporta; nunca apaga).
+#ifndef HEF_LOG_MIN_FREE_BYTES
+#define HEF_LOG_MIN_FREE_BYTES (2UL * 1024UL * 1024UL)
+#endif
+
+// Reavaliacao da saude do cartao (teste de escrita + espaco livre).
+// O teste escreve um arquivo temporario pequeno e o apaga: a cada 10
+// min isso nao afeta o orcamento de escritas do lote.
+#ifndef HEF_SD_HEALTH_MS
+#define HEF_SD_HEALTH_MS    600000UL
+#endif
+
+// Maximo de arquivos rotacionados rastreados (protecao contra loop de
+// indices). 999 arquivos de 64 MB = ~63 GB, acima de qualquer cartao
+// suportado pelo SPI do ESP32.
+#define HEF_LOG_MAX_FILES   999
+
 // ============================================================
 // IDENTIFICACAO DE NO
 // ============================================================

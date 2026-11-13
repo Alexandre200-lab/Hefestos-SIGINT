@@ -49,3 +49,7 @@
 sdkconfig
 partitions.csv
 flash_args
+
+# Python
+__pycache__/
+*.pyc

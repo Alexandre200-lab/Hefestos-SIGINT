@@ -54,6 +54,7 @@ static uint32_t framesData = 0;
 static uint32_t framesReq = 0;
 static uint32_t lastUtc = 0;
 static uint32_t captureSeq = 0;
+static uint32_t logAppendFails = 0;   // registros recusados pelo log (item 1.6)
 
 // =====================================================================
 // Ring buffer de capturas (RAM)
@@ -145,6 +146,10 @@ static void hefRestart(uint8_t intentKind, uint8_t reason) {
     resetPrefs.putBytes(HEF_NVS_KEY_RESET_INTENT, &intent, sizeof(intent));
 
     if (resetTracker.shouldPersistNow()) persistResetState();
+
+    // Toda a evidencia que ja chegou tem de estar no cartao antes de
+    // sair: o buffer RAM nao sobrevive a um reinicio (item 1.6).
+    if (fieldLog.isOpen()) fieldLog.flush((uint32_t)millis(), true);
 
     Serial.printf("Reiniciando (intencao=%u, causa=%s)...\n",
                   intentKind, hefResetReasonName(reason));
@@ -258,8 +263,10 @@ static void sendResponse(uint8_t req, const String& json) {
 }
 
 static String buildLogInfo() {
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(2048);
     doc["records"] = fieldLog.recordCount();
+    doc["total_records"] = fieldLog.totalRecordCount();
+    doc["seq"] = fieldLog.seq();
     doc["sd"] = sdOk;
     doc["file"] = "HEFLOG.BIN";
     doc["utc"] = lastUtc;
@@ -268,6 +275,39 @@ static String buildLogInfo() {
     char hex[HEF_HASH_LEN * 2 + 1];
     FieldLog::bytesToHexLocal(fieldLog.chainHead(), HEF_HASH_LEN, hex, sizeof(hex));
     doc["chain"] = hex;
+
+    // --- Lote, rotacao e saude do cartao (v5.1.0, item 1.6) ---
+    // A caixa preta reporta a propria operacao de escrita: um cartao
+    // que esta recusando gravacoes (fail closed) ou um buffer que esta
+    // perdendo registros precisa ser visivel ANTES de a evidencia
+    // faltar.
+    doc["pending_bytes"] = (uint32_t)fieldLog.pendingBytes();
+    doc["pending_records"] = fieldLog.pendingRecordCount();
+    doc["flushes"] = fieldLog.flushCount();
+    doc["write_errors"] = fieldLog.writeErrorCount();
+    doc["dropped"] = fieldLog.droppedCount();
+    doc["retries"] = fieldLog.retryCount();
+    doc["append_fails"] = logAppendFails;
+    doc["file_bytes"] = fieldLog.fileBytes();
+    doc["next_index"] = fieldLog.nextFileIndex();
+    doc["archives"] = fieldLog.archiveCount();
+    doc["checkpoints"] = fieldLog.checkpointCount();
+    doc["log_corrupt"] = fieldLog.isCorrupt();
+    doc["log_refusing"] = fieldLog.isRefusing();
+    doc["card_full"] = fieldLog.isCardFull();
+    doc["flush_bytes"] = HEF_LOG_FLUSH_BYTES;
+    doc["flush_ms"] = HEF_LOG_FLUSH_MS;
+    doc["writes_per_day"] = HefLogBatch::estimatedFlushesPerDay(
+        86400, 143, HEF_LOG_FLUSH_BYTES, HEF_LOG_FLUSH_MS);
+
+    const HefSdHealth& h = fieldLog.health();
+    JsonObject hd = doc.createNestedObject("health");
+    hd["mounted"] = h.mounted;
+    hd["writable"] = h.writable;
+    hd["total_bytes"] = h.totalBytes;
+    hd["used_bytes"] = h.usedBytes;
+    hd["free_bytes"] = h.freeBytes;
+    hd["note"] = h.note;
 
     doc["ser_ok"] = serRx.framesOk();
     doc["ser_crc"] = serRx.crcErrors();
@@ -403,7 +443,12 @@ static void onSerialFrame(const HefSerFrame& f, void*) {
 
                 pushCapture(HEF_SER_DATA, text, n);
                 if (sdOk && fieldLog.isOpen()) {
-                    fieldLog.appendText(HEF_SER_DATA, text);
+                    if (!fieldLog.appendText(HEF_SER_DATA, text)) {
+                        // Buffer cheio, cartao recusando (fail closed) ou
+                        // log corrompido. O registro NAO e' perdido em
+                        // silencio: o contador aparece em status/info.
+                        logAppendFails++;
+                    }
                 }
 
                 digitalWrite(N3_LED_GREEN, HIGH);
@@ -450,7 +495,8 @@ static void printHelp() {
     Serial.println("clear          limpa o ring de capturas (RAM)");
     Serial.println("export         exporta o log para JSONL no SD");
     Serial.println("time <unix>    ajusta o relogio UTC");
-    Serial.println("format         apaga HEFLOG.BIN (perde a cadeia)");
+    Serial.println("archive        forca a rotacao do log atual");
+    Serial.println("purge confirm  apaga TODA a evidencia (irreversivel)");
     Serial.println("reboot         reinicia (motivo registrado)");
     Serial.println("resets         causa do reinicio e contadores");
 }
@@ -463,6 +509,25 @@ static void handleConsole(char* line) {
                       nodeId, sdOk ? "ok" : "ausente",
                       fieldLog.isOpen() ? "aberto" : "fechado",
                       fieldLog.recordCount(), capCount);
+        Serial.printf("lote: pendente=%u B (%u reg) flushes=%u erros=%u "
+                      "perdidos=%u falhas_append=%u\n",
+                      (unsigned)fieldLog.pendingBytes(),
+                      fieldLog.pendingRecordCount(),
+                      fieldLog.flushCount(), fieldLog.writeErrorCount(),
+                      fieldLog.droppedCount(), logAppendFails);
+        const HefSdHealth& h = fieldLog.health();
+        Serial.printf("cartao: %s livre=%u KB total=%u KB (%s)\n",
+                      h.writable ? "gravavel" : "NAO gravavel",
+                      (unsigned)(h.freeBytes / 1024),
+                      (unsigned)(h.totalBytes / 1024), h.note);
+        if (fieldLog.isCorrupt()) {
+            Serial.println("ALERTA: cadeia marcada como CORROMPIDA "
+                           "(fail closed: recusando novas escritas)");
+        }
+        if (fieldLog.isRefusing()) {
+            Serial.println("ALERTA: log recusando registros (cartao cheio "
+                           "ou insalubre). Nada e' apagado automaticamente.");
+        }
         Serial.printf("frames: data=%u req=%u crc=%u ovf=%u\n",
                       framesData, framesReq, serRx.crcErrors(), serRx.overflows());
         Serial.printf("utc=%u\n", lastUtc);
@@ -509,16 +574,34 @@ static void handleConsole(char* line) {
         uint32_t u = (uint32_t)strtoul(line + 5, nullptr, 10);
         if (u < 1704067200UL) Serial.println("ERRO: epoch invalido");
         else { lastUtc = u; fieldLog.setTime(u); Serial.println("OK: relogio ajustado"); }
+    } else if (strncmp(line, "archive", 7) == 0) {
+        if (!sdOk || !fieldLog.isOpen()) {
+            Serial.println("ERRO: SD indisponivel");
+        } else if (fieldLog.archive((uint32_t)millis())) {
+            Serial.printf("OK: log rotacionado (proximo indice=%u)\n",
+                          fieldLog.nextFileIndex());
+        } else {
+            Serial.println("ERRO: rotacao falhou (log continua no arquivo atual)");
+        }
+    } else if (strncmp(line, "purge", 5) == 0) {
+        // Exclusao EXPLICITA. O firmware NUNCA apaga evidencia
+        // automaticamente: quando o cartao enche, ele para de aceitar e
+        // reporta (fail closed). Apagar exige o comando e a palavra
+        // "confirm".
+        if (strcmp(line, "purge confirm") != 0) {
+            Serial.println("purge apaga TODA a evidencia (logs, manifesto e");
+            Serial.println("checkpoints) de forma IRREVERSIVEL.");
+            Serial.println("Se tem certeza, digite: purge confirm");
+        } else if (!sdOk) {
+            Serial.println("ERRO: SD indisponivel");
+        } else if (fieldLog.purgeAll()) {
+            Serial.println("OK: evidencia apagada; log vazio recriado");
+        } else {
+            Serial.println("ERRO: purge falhou");
+        }
     } else if (strncmp(line, "format", 6) == 0) {
-        if (!sdOk) { Serial.println("ERRO: SD indisponivel"); return; }
-        if (SD.exists("HEFLOG.BIN")) SD.remove("HEFLOG.BIN");
-        if (SD.exists("HEFLOG.JSONL")) SD.remove("HEFLOG.JSONL");
-        if (SD.exists("HEFLOG.HASH")) SD.remove("HEFLOG.HASH");
-        // `begin()` rele a cadeia do arquivo recem-criado: pode ser
-        // uma operacao longa num SD lento.
-        hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
-        fieldLog.begin(nodeId, "HEFLOG.BIN");
-        Serial.println("OK: log apagado e recriado");
+        Serial.println("Comando 'format' removido. Use 'purge confirm' "
+                       "(apaga TUDO, irreversivel).");
     } else if (strncmp(line, "reboot", 6) == 0) {
         // Reinicio CONTROLADO: a intencao e' gravada antes de sair, para
         // que o proximo boot nao pareca um travamento inexplicado.
@@ -570,6 +653,16 @@ void setup() {
         hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
         if (fieldLog.begin(nodeId, "HEFLOG.BIN")) {
             dbg.log("SD montado; log aberto");
+            // Saude do cartao no boot (item 1.6): teste de escrita/
+            // leitura + espaco livre. Cartao cheio = fail closed.
+            if (!fieldLog.healthCheck()) {
+                dbg.logError("Saude do cartao: teste de escrita FALHOU");
+            } else {
+                const HefSdHealth& h = fieldLog.health();
+                Serial.printf("cartao: %u KB livres de %u KB (%s)\n",
+                              (unsigned)(h.freeBytes / 1024),
+                              (unsigned)(h.totalBytes / 1024), h.note);
+            }
         } else {
             dbg.logError("SD montado, mas o log nao abriu");
         }
@@ -624,6 +717,22 @@ void loop() {
     // Link serial com o Node2
     serRx.feed(node2Serial, onSerialFrame, nullptr);
 
+    // --- Flush do log em LOTES (v5.1.0, item 1.6) ---
+    // O buffer so grava quando o gatilho dispara (4 KB ou 30 s). A
+    // chamada e' barata quando nao ha nada pendente.
+    fieldLog.flush(now);
+
+    // --- Saude do cartao (v5.1.0, item 1.6) ---
+    // Teste de escrita/leitura + espaco livre a cada HEF_SD_HEALTH_MS.
+    // Cartao cheio = fail closed (para de aceitar, NUNCA apaga).
+    static uint32_t lastHealthMs = 0;
+    if (sdOk && (now - lastHealthMs >= HEF_SD_HEALTH_MS)) {
+        lastHealthMs = now;
+        if (!fieldLog.healthCheck()) {
+            dbg.logWarning("Saude do cartao: teste de escrita falhou");
+        }
+    }
+
     // Re-tentativa de SD (a cada 30 s)
     if (!sdOk && (now - lastSdRetryMs) > 30000UL) {
         lastSdRetryMs = now;
@@ -631,6 +740,7 @@ void loop() {
             // Releitura da cadeia: operacao longa possivel.
             hefWatchdogBeginLongOp(hefWatchdogTimeoutS());
             fieldLog.begin(nodeId, "HEFLOG.BIN");
+            fieldLog.healthCheck();
             digitalWrite(N3_LED_RED, LOW);
             dbg.log("SD recuperado");
         }
